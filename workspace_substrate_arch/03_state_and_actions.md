@@ -24,35 +24,48 @@ The model should not have to remember Python locals. It should inspect files and
 
 ## Action Format
 
-Use a single structured action block rather than many language-specific tags:
+The model interacts with the workspace by outputting structured action blocks. Because embedding multi-line code inside JSON strings is notoriously difficult and breaks whitespace, **we exclusively use XML for all actions.**
+
+XML natively preserves formatting, is extremely robust for LLM generation, and provides a unified interface for both simple reads and complex code writes.
+
+### Action Format (XML)
+
+For simple reads or commands, use empty elements with attributes:
 
 ```workspace
-{"tool": "read_file", "path": "_rlm_query_0.txt"}
+<action tool="read_file" path="_rlm_query_0.txt" />
+<action tool="web_search" query="rlm agents architecture" />
 ```
 
-The block may contain either one action object or a list of action objects:
+For actions requiring multi-line strings where whitespace matters (like `write_file`, `edit_file`, `python`), put the content inside the element:
 
 ```workspace
-[
-  {"tool": "read_file", "path": "_rlm_query_0.txt"},
-  {"tool": "read_file", "path": "_rlm_notes/findings.md"}
-]
+<action tool="write_file" path="script.py">
+def process_data():
+    with open("data.txt") as f:
+        return f.read()
+</action>
 ```
 
-Batching is useful when actions are independent reads or simple information-gathering steps. The runtime should execute a block in order by default, with optional parallel execution later for tools declared as safe and read-only. This gives the model an efficient "do these next few things" interface without requiring the runtime to infer dependencies between actions.
+### Execution Semantics
 
-Initial tools:
+We explicitly classify tools to manage batching safely:
+1. **Read-Only Actions** (`read_file`, `list_files`, `web_search`,etc): Can be safely batched by providing multiple `<action>` blocks sequentially. The runtime executes them and may even parallelize them safely under the hood.
+2. **State-Mutating Actions** (`write_file`, `edit_file`, `shell`, `python`, `rlm_query`): Must be executed sequentially. We allow the model to batch them (e.g., scaffolding three files at once in a single generation), but the runtime **MUST halt execution immediately** upon the first error and return the partial result to avoid cascading failures.
 
-- `list_files`: list workspace paths. This should act like `ls` (shallow by default) to prevent context window bloat. The runtime must aggressively filter out noise (e.g., `.git`, `node_modules`, `__pycache__`). For the files it does list, it should include metadata on who created and last modified each file (e.g., which child RLM or tool, backed by a background git repo). Because the listing is shallow, this extra info won't cost too many tokens.
+### Initial tools:
+
+- `list_files`: list workspace paths (shallow by default like `ls`) to prevent context bloat, filtering out noise (`.git`, `__pycache__`). Includes metadata on who created/modified each file.
 - `read_file`: read a bounded file slice.
-- `write_file`: create or overwrite a workspace file.
-- `append_file`: append notes or results.
+- `write_file`: create or completely overwrite a workspace file. Use this for new files or small complete rewrites.
+- `append_file`: append notes or results. Highly recommended for keeping iterative logs/scratchpads without rewriting the whole file.
+- `edit_file`: (Replaces brittle diffs) Search-and-replace block for targeted edits. Avoids line-number drift. Format: `<action tool="edit_file" path="x.py"><search>old</search><replace>new</replace></action>`. **Rule:** The `<search>` block must be a unique substring. If it finds 0 or >1 matches, the tool fails and returns an error unless an `allow_multiple="true"` attribute is provided.
 - `shell`: run a command inside the Docker workspace.
-- `python`: convenience wrapper for running Python inside Docker.
+- `python`: convenience wrapper for running Python inside Docker. **Note:** The runtime injects `llm_query` and `rlm_query` functions into this environment. If the model needs to programmatically construct complex prompts or map over files before calling an LLM, it should write a Python script and call `rlm_query_batched` (or `llm_query_batched` for simpler tasks that don't require RLM base decomposition) directly from Python. (Python is strongly preferred over Bash here because Bash escaping/quoting for multiline prompts and JSON IO is incredibly fragile).
 - `web_search`: host-backed search tool returning compact structured results.
 - `fetch_url`: host-backed URL fetch with bounded text extraction.
-- `llm_query`: plain LM completion through the existing LM handler.
-- `rlm_query`: recursive child RLM call with its own workspace.
+- `llm_query`: plain LM completion for simple string prompts.
+- `rlm_query`: recursive child RLM call for simple string prompts.
 - `final`: submit final answer.
 
 The model should see only short tool descriptions. Full tool schemas should stay in code/tests, not in the base prompt.
