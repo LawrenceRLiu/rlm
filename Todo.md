@@ -11,7 +11,7 @@ Previously we ran a short analysis of RLMs on OOLONG for the more modern models,
 ## How to establish that:
 
 - [ ] Change the substrate from a python based REPL to a generalized workspace with prebuilt tools for web search
-    - [ ] Conduct a high level sketch of how this would work, store it in `./workspace_sketch.md` also analyze the RLM prompt/systems and see if we can simplify the setup with these new changes. Hopefully this would enable us to also explore things at 7-9B parameter scales, which would be very exciting.
+    - [x] Conduct a high level sketch of how this would work, store it in `./workspace_substrate_arch/` (originally `workspace_sketch.md`) also analyze the RLM prompt/systems and see if we can simplify the setup with these new changes. Hopefully this would enable us to also explore things at 7-9B parameter scales, which would be very exciting.
     - [ ] Implement the workspace, and test it on a simple RLM task, such as a simple web search task, or a simple coding task, and see if the model can follow
     - [ ] Benchmark 
         - [ ] For coding: SWE-Bench, Terminal Bench, etc 

@@ -154,14 +154,17 @@ class MyClient(BaseLM):
 
 ## Developing Environments
 
+> **Note**: RLM is migrating from a REPL-based environment substrate to a durable **Workspace Substrate**. For details on the new architecture, please read the documentation in `workspace_substrate_arch/`. Legacy REPL documentation is preserved below during the transition.
+
 Environment implementations live in `rlm/environments/`. Choose the appropriate base class.
 
 ### Environment Pattern
 
 | Pattern | Base Class | When to Use | Key Methods |
 |---------|------------|-------------|-------------|
-| **Non-isolated** | `NonIsolatedEnv` | Local execution, same machine | `setup`, `load_context`, `execute_code` |
-| **Isolated** | `IsolatedEnv` | Cloud sandboxes (Modal, Prime) | `setup`, `load_context`, `execute_code` |
+| **Workspace** | `BaseWorkspaceEnv` | (NEW) Durable file-system action environment | `setup`, `load_context`, `run_action`, `snapshot` |
+| **Non-isolated** | `NonIsolatedEnv` | (LEGACY) Local REPL execution, same machine | `setup`, `load_context`, `execute_code` |
+| **Isolated** | `IsolatedEnv` | (LEGACY) Cloud sandboxes (Modal, Prime) | `setup`, `load_context`, `execute_code` |
 
 ### Requirements
 - Inherit from `NonIsolatedEnv` or `IsolatedEnv` in `rlm/environments/base_env.py`
