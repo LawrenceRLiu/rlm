@@ -4,6 +4,17 @@ This guide covers best practices for contributing to the core Recursive Language
 
 ## Setup
 
+### Repository-specific environment
+
+For this repository, run commands inside the `RLM_substrate` conda environment:
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate RLM_substrate
+```
+
+Install Python packages only after activating that environment. Prefer `uv` where appropriate, or use `python -m pip install ...`; do not use raw `pip install ...` because it may target the wrong environment.
+
 We use `uv` for developing `rlm`.
 ```bash
 # Install uv (first time)
@@ -321,4 +332,3 @@ When building a new isolated environment (e.g., for a new cloud provider):
 5. **Handle state** - Serialize/deserialize execution state between code blocks
 
 See `rlm/environments/modal_repl.py` as the canonical reference implementation.
-
