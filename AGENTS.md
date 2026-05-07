@@ -1,4 +1,4 @@
-# AGENTS.md
+# Instructions for Claude, Codex, Gemini, and other coding agents.
 
 This guide covers best practices for contributing to the core Recursive Language Models `rlm` library and developing new environments (in `rlm/environments/`) and LM clients (in `rlm/clients/`).
 
