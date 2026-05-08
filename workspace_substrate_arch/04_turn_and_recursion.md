@@ -19,10 +19,8 @@ Each RLM turn should have a simple transcript shape:
     I need to inspect the context and current notes.
 
     ```workspace
-    [
-      {"tool": "list_files", "path": "."},
-      {"tool": "read_file", "path": "_rlm_query_0.txt"}
-    ]
+    <action tool="list_files" path="." />
+    <action tool="read_file" path="_rlm_query_0.txt" />
     ```
 
     user/runtime:
@@ -62,6 +60,8 @@ Like the vanilla RLM implementation, the workspace substrate will inevitably acc
 
 This ensures that the model can always use standard file tools (like `read_file`) to recover exact details from earlier in the run if it realizes the summary omitted crucial information, completely avoiding the permanent loss of context.
 
+**Note:** The implementation of this feature can be delayed for a bit. For now we can focus on everything else first.
+
 ## Prompt Shape
 
 The workspace prompt should be much shorter than the current REPL prompt.
@@ -97,9 +97,42 @@ The default should be copy-on-spawn:
 4. Runtime applies simple excludes for obvious junk: `.git`, `.venv`, `node_modules`, caches, build outputs, and oversized binary files.
 5. Runtime writes the child task string to `_rlm_query_0.txt` inside the child's workspace (overwriting the parent's `_rlm_query_0.txt`).
 6. Child RLM runs independently over that snapshot. Because it inherited the file system, the parent doesn't need to pass massive data strings in the `rlm_query` call; it just passes file pointers.
-7. Child returns final answer, trajectory metadata, and optionally a list of produced artifacts. This will be extracted from the `FINAL_VAR` in the child's assistant message and append to the observation.
-8. Parent receives a compact observation containing the child answer and artifact paths.
+7. Child returns its final answer and optionally explicitly defines a list of produced artifacts using the `<action tool="final">` block.
+8. Runtime extracts the requested artifacts and copies them from the child workspace into the parent workspace under `_rlm_artifacts/children/<child_id>/`.
+9. Parent receives a compact observation containing the child answer and the parent-relative paths to the copied artifacts.
 
-The child must not mutate the parent workspace directly. Copying the parent workspace gives the child full context without introducing live shared state. If the parent wants to use child artifacts, the runtime can either copy selected child outputs back into `_rlm_artifacts/children/<child_id>/` or expose a follow-up action such as `import_child_artifact`.
+The child must not mutate the parent workspace directly. Copying the parent workspace gives the child full context without introducing live shared state. The explicit selection of artifacts via the `final` tool guarantees that massive intermediate scratch files or logs are ignored by default.
 
-This default is intentionally simple. Explicit artifact selection can be added later as an optimization when workspaces become too large or when benchmark isolation needs stricter control.
+### Example: Returning Child Artifacts
+
+When a child has finished its task (e.g., compiling a dataset), it issues a `final` action with explicit artifact paths:
+
+    ```workspace
+    <action tool="final">
+        <answer>I have downloaded, cleaned, and compiled the dataset.</answer>
+        <artifact path="_rlm_artifacts/cleaned_data.csv" />
+        <artifact path="src/data_loader.py" />
+    </action>
+    ```
+
+The runtime intercepts this action, halts the child, and copies those exact paths from the child's isolated container to the parent's directory structure under `_rlm_artifacts/children/<child_id>/`.
+
+The parent RLM then receives the following compact observation, avoiding context window bloat:
+
+    user/runtime:
+    Observation: Child RLM completed.
+    Answer: I have downloaded, cleaned, and compiled the dataset.
+    Artifacts imported:
+    - _rlm_artifacts/children/child_42/cleaned_data.csv
+    - _rlm_artifacts/children/child_42/data_loader.py
+
+This mechanism allows pointers to be passed instead of massive text blobs, enabling smooth multi-modal and structured data workflows across recursion depths.
+
+### Maximum Depth Handling
+
+The legacy Python REPL substrate handled maximum recursion depth by silently falling back from `rlm_query` to `llm_query`. In the Workspace Substrate, we adhere to the "fail fast, fail loud" philosophy to prevent unexpected behavior:
+
+1. **System Prompt Omission (Prevention):** When initializing a workspace at `max_depth`, the `rlm_query` tool is dynamically omitted from the system prompt's tool list. The prompt is modified to explicitly state: *"Note: You are at maximum recursion depth. You cannot spawn further child RLMs. You must solve the task directly or use `llm_query`."*
+2. **Runtime Rejection (Correction):** If the model hallucinates a `<action tool="rlm_query">` block, the runtime does **not** silently route it to `llm_query`. Instead, it immediately halts the tool execution and returns a loud observation error: `Error: Maximum recursion depth reached. The 'rlm_query' tool is unavailable.`
+
+This prevents the model from assuming a child is actively doing file-system work (which a plain `llm_query` cannot do) and forces it to adapt its strategy.

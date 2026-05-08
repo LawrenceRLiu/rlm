@@ -53,32 +53,171 @@ We explicitly classify tools to manage batching safely:
 1. **Read-Only Actions** (`read_file`, `list_files`, `web_search`,etc): Can be safely batched by providing multiple `<action>` blocks sequentially. The runtime executes them and may even parallelize them safely under the hood.
 2. **State-Mutating Actions** (`write_file`, `edit_file`, `shell`, `python`, `rlm_query`): Must be executed sequentially. We allow the model to batch them (e.g., scaffolding three files at once in a single generation), but the runtime **MUST halt execution immediately** upon the first error and return the partial result to avoid cascading failures.
 
-### Initial tools:
+## Tool Interface & Definitions
 
-- `list_files`: list workspace paths (shallow by default like `ls`) to prevent context bloat, filtering out noise (`.git`, `__pycache__`). Includes metadata on who created/modified each file.
-- `read_file`: read a bounded file slice.
-- `write_file`: create or completely overwrite a workspace file. Use this for new files or small complete rewrites.
-- `append_file`: append notes or results. Highly recommended for keeping iterative logs/scratchpads without rewriting the whole file.
-- `edit_file`: (Replaces brittle diffs) Search-and-replace block for targeted edits. Avoids line-number drift. Format: `<action tool="edit_file" path="x.py"><search>old</search><replace>new</replace></action>`. **Rule:** The `<search>` block must be a unique substring. If it finds 0 or >1 matches, the tool fails and returns an error unless an `allow_multiple="true"` attribute is provided.
-- `shell`: run a command inside the Docker workspace.
-- `python`: convenience wrapper for running Python inside Docker. **Note:** The runtime injects `llm_query` and `rlm_query` functions into this environment. If the model needs to programmatically construct complex prompts or map over files before calling an LLM, it should write a Python script and call `rlm_query_batched` (or `llm_query_batched` for simpler tasks that don't require RLM base decomposition) directly from Python. (Python is strongly preferred over Bash here because Bash escaping/quoting for multiline prompts and JSON IO is incredibly fragile).
-- `web_search`: host-backed search tool returning compact structured results.
-- `fetch_url`: host-backed URL fetch with bounded text extraction.
-- `llm_query`: plain LM completion for simple string prompts.
-- `rlm_query`: recursive child RLM call for simple string prompts.
-- `final`: submit final answer.
+The workspace provides a set of initial tools to the model. While the model should only see short tool descriptions in its base prompt (with full schemas remaining in code/tests), the actual implementation and capability of these tools are defined below. 
 
-The model should see only short tool descriptions. Full tool schemas should stay in code/tests, not in the base prompt.
+### 1. `list_files`
+- **Description**: Lists workspace paths to prevent context bloat. Filters out noise like `.git` and `__pycache__`.
+- **Arguments**:
+  - `path` (optional): The directory to list. Defaults to the workspace root.
+  - `recursive` (optional): Boolean, whether to perform a deep list. Defaults to `false` (shallow like `ls`).
+- **Behavior**: Returns a JSON-like array of paths and metadata, including who created/modified each file.
+- **Example Usage**:
+  ```workspace
+  <action tool="list_files" path="_rlm_artifacts" recursive="false" />
+  ```
 
-## Web Search
+### 2. `read_file`
+- **Description**: Reads a bounded slice of a file to avoid context window explosion.
+- **Arguments**:
+  - `path` (required): The path to the file.
+  - `start_line` (optional): The 1-indexed line to start reading from. Defaults to 1.
+  - `end_line` (optional): The 1-indexed line to stop reading at. Defaults to bounded max (e.g., 500 lines).
+- **Behavior**: Returns the contents of the specified file slice along with total line count.
+- **Example Usage**:
+  ```workspace
+  <action tool="read_file" path="src/main.py" start_line="10" end_line="50" />
+  ```
 
-Web search should be a first-class host tool, not a Python package the model has to import.
+### 3. `write_file`
+- **Description**: Creates a new file or completely overwrites an existing workspace file. 
+- **Arguments**:
+  - `path` (required): The path to the file.
+  - `content` (implicit text content): The text to write to the file.
+- **Behavior**: Writes the provided content directly to the file, replacing anything that was there. Use this for new files or small complete rewrites.
+- **Example Usage**:
+  ```workspace
+  <action tool="write_file" path="scripts/run.sh">
+  #!/bin/bash
+  echo "Hello World"
+  </action>
+  ```
 
-Recommended behavior:
+### 4. `append_file`
+- **Description**: Appends text to an existing file. Highly recommended for keeping iterative logs or scratchpads without rewriting the whole file.
+- **Arguments**:
+  - `path` (required): The path to the file.
+  - `content` (implicit text content): The text to append to the file.
+- **Behavior**: Adds the content to the end of the file. Creates the file if it does not exist.
+- **Example Usage**:
+  ```workspace
+  <action tool="append_file" path="_rlm_notes/scratch.md">
+  ## New Finding
+  The parser fails on edge case X.
+  </action>
+  ```
 
-- `web_search(query, max_results={n})` returns titles, URLs, snippets, and source metadata. This should be done using the brave API (key will be put in `.env` at the end)
-- `fetch_url(url)` returns bounded extracted text plus page metadata.
-- Observations should be concise by default.
-- Large pages should be saved into `_rlm_artifacts/` and returned as file paths.
+### 5. `edit_file`
+- **Description**: Search-and-replace block for targeted edits. Replaces brittle unified diffs and avoids line-number drift.
+- **Arguments**:
+  - `path` (required): The path to the file.
+  - `allow_multiple` (optional): Boolean, defaults to `false`. If `true`, replaces all occurrences.
+  - `<search>` (child element): The exact substring to find.
+  - `<replace>` (child element): The new substring to replace it with.
+- **Behavior**: **Rule:** The `<search>` block must be a unique substring in the file. If it finds 0 or >1 matches, the tool fails and returns an error unless `allow_multiple="true"` is provided.
+- **Example Usage**:
+  ```workspace
+  <action tool="edit_file" path="src/processor.py" allow_multiple="false">
+  <search>
+  def process_data(data):
+      if not data:
+          return None
+      return data.lower()
+  </search>
+  <replace>
+  def process_data(data):
+      if not data:
+          return None
+      
+      # Now safely strip and lower the data
+      cleaned = data.strip().lower()
+      return cleaned
+  </replace>
+  </action>
+  ```
 
-This keeps web research compatible with Docker while avoiding API keys and scraping logic inside model-generated code.
+### 6. `shell`
+- **Description**: Runs a bash command inside the Docker workspace.
+- **Arguments**:
+  - `command` (implicit text content): The bash command to run.
+- **Behavior**: Executes the command, capturing `stdout`, `stderr`, and the exit code.
+- **Example Usage**:
+  ```workspace
+  <action tool="shell">pytest tests/test_core.py</action>
+  ```
+
+### 7. `python`
+- **Description**: Convenience wrapper for running Python inside Docker.
+- **Arguments**:
+  - `code` (implicit text content): The python script to execute.
+- **Behavior**: Runs the Python code. **Note:** The runtime injects `llm_query` and `rlm_query` functions into this environment. If the model needs to programmatically construct complex prompts or map over files before calling an LLM, it should write a Python script and call `rlm_query_batched` directly from Python. (Python is strongly preferred over Bash for multiline prompts/JSON IO). On the backend we will handle this by extracting the exact queries from the python script and calling the LLM/RLM with it. To the model, this should look just like any other python function.
+- **Example Usage**:
+  ```workspace
+  <action tool="python">
+  import json
+  data = json.loads(open('data.json').read())
+  print(f"Processed {len(data)} items")
+  </action>
+  ```
+
+### 8. `llm_query`
+- **Description**: Plain LM completion for simple string prompts.
+- **Arguments**:
+  - `prompt` (implicit text content): The prompt to send to the LLM.
+- **Behavior**: Returns a direct completion without REPL/action loop iteration.
+- **Example Usage**:
+  ```workspace
+  <action tool="llm_query">Summarize the above error logs.</action>
+  ```
+
+### 9. `rlm_query`
+- **Description**: Recursive child RLM call for tasks requiring multi-step reasoning or file system interaction.
+- **Arguments**:
+  - `prompt` (implicit text content): The prompt to send to the child RLM.
+- **Behavior**: Spawns a child RLM that has its own action loop to complete the task before returning the final answer to the parent.
+- **Example Usage**:
+  ```workspace
+  <action tool="rlm_query">Investigate the root cause of the memory leak in src/engine.py</action>
+  ```
+
+### 10. `final`
+- **Description**: Submit final answer to conclude the task. Can optionally attach file paths to return as artifacts to the caller (either a parent RLM or the human user).
+- **Arguments**:
+  - `answer` (child element or implicit text content): The final response.
+  - `<artifact>` (optional child elements): Explicit file paths to be passed back.
+- **Behavior**: Halts the RLM loop and returns the answer. If this is a child RLM, it copies any specified artifacts back to the parent workspace (under `_rlm_artifacts/children/<child_id>/`). If this is the root RLM, the specified artifacts are surfaced directly to the human user alongside the final text answer.
+- **Example Usage**:
+  ```workspace
+  <action tool="final">
+      <answer>The bug was caused by an off-by-one error. I have fixed it in src/utils.py.</answer>
+      <artifact path="src/utils.py" />
+  </action>
+  ```
+
+---
+
+## Deferred / Disabled Tools
+
+*Note: The following tools are currently disabled. We are focusing on getting the core workspace tools working first, as the engineering and implementation details for web integration need further examination.* Forgoe implementing these for now.
+
+### 11. `web_search` (Disabled)
+- **Description**: Host-backed search tool returning compact structured results. Web search should be a first-class host tool, not a Python package the model has to import. This keeps web research compatible with Docker while avoiding API keys and scraping logic inside model-generated code.
+- **Arguments**:
+  - `query` (required): The search query (can be provided as an attribute or child element).
+  - `max_results` (optional): Int, number of results to return.
+- **Behavior**: Returns titles, URLs, snippets, and source metadata. This should be done using the Brave API (key will be put in `.env` on the host side). Observations should be concise by default.
+- **Example Usage**:
+  ```workspace
+  <action tool="web_search" query="RLM agents architecture" max_results="5" />
+  ```
+
+### 12. `fetch_url` (Disabled)
+- **Description**: Host-backed URL fetch with bounded text extraction.
+- **Arguments**:
+  - `url` (required): The URL to fetch.
+- **Behavior**: Returns bounded extracted text plus page metadata. To handle large pages gracefully, content should be automatically saved into `_rlm_artifacts/` and returned as file paths to prevent context window bloat.
+- **Example Usage**:
+  ```workspace
+  <action tool="fetch_url" url="https://example.com/docs" />
+  ```
