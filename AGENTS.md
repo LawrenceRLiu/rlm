@@ -2,11 +2,14 @@
 
 This guide covers best practices for contributing to the core Recursive Language Models `rlm` library and developing new environments (in `rlm/environments/`) and LM clients (in `rlm/clients/`).
 
+## Current State of the Project:
+Currently we are working on migrating the RLM substrate from a Python REPL to a Workspace Substrate. We have sketched out at a high level what the Workspace Substrate should look like in `workspace_substrate_arch/`. Your job, until I say otherwise, is to help me refine this sketch. Before you make any recommendations please familiarize yourself with current codebase, which is the vanilla RLM with a Python REPL substrate, and the Workspace Substrate design docs. Base all recommendations off first principles.
+
 ## Setup
 
 ### Repository-specific environment
 
-For this repository, run commands inside the `RLM_substrate` conda environment:
+For this repository, run commands inside the `RLM_substrate` conda environment (this is a python 3.12 environment).
 
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"
