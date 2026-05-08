@@ -1,5 +1,4 @@
 # Turn-to-Turn Interface & Recursion
-
 ## Turn-to-Turn Interface
 
 **Note** by turn we mean the internal turns between rounds of the RLM root, not the outer turns between user queries.
@@ -19,14 +18,21 @@ Each RLM turn should have a simple transcript shape:
     I need to inspect the context and current notes.
 
     ```workspace
-    <action tool="list_files" path="." />
+    <action tool="list_directory" path="." />
     <action tool="read_file" path="_rlm_query_0.txt" />
     ```
 
     user/runtime:
     Observation:
-    - list_files: 12 paths. Important paths: _rlm_query_0.txt, _rlm_notes/scratch.md
-    - read_file _rlm_query_0.txt: "Please investigate the error in..."
+    - list_directory [path="."]:
+      [Directory: .]
+      ├── _rlm_query_0.txt (file | created: system | modified: system)
+      ├── _rlm_notes/ (dir | created: system | modified: assistant)
+      ├── src/ (dir | created: user | modified: user)
+      ... (9 other items)
+    - read_file [path="_rlm_query_0.txt"]:
+      [File: _rlm_query_0.txt | Lines: 1-1/1 | Created: system | Modified: system]
+      "Please investigate the error in..."
 
     ====== Turn 2 ======
     assistant:
@@ -44,9 +50,9 @@ Each RLM turn should have a simple transcript shape:
     user/runtime:
     [follow-up observation message]
 
+This transcript gets fed into the next model call, and so on. **IMPORTANT**: We need the model to output something above and below the workspace block. This should naturally be a summary of what the model plans to approach the problem etc, ie it would be able to provided anchoring for the next model call.
 
-
-The observation should be compact and bounded. Large outputs (Ie above a certain hyperparameter number of lines/words/charachters) should be written to `_rlm_artifacts/` and summarized with a file path and a note on the length (in lines or characters). This avoids filling the root message history while preserving inspectable state in the workspace.
+The observation should be compact and bounded. Large outputs (Ie above a certain hyperparameter number of lines/words/charachters) should be written to `_rlm_artifacts/` and summarized with a file path and a note on the length (in lines or characters). This avoids filling the root message history while preserving inspectable state in the workspace. This truncation should operate on a per observation/tool call basis. Ie if the first tool call in the action block returns a large output, that and only that should be truncated, the rest of the tool calls (if they are not as long), should be included fully.
 
 The runtime should reject malformed actions loudly with a parse observation that tells the model exactly what schema failed. This is important for small models. **Note** An interesting alternative would be to use constrained decoding to force the model to output a valid json block.
 

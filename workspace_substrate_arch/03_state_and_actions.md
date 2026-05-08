@@ -22,6 +22,15 @@ The model should not have to remember Python locals. It should inspect files and
 
 **Note** With the `_rlm_` prefix system, I anticipate significantly less chance of "namespace collisions" between user provided files and what RLM needs to use internally. However as a final catch, to prevent unexpected behavior, if there is a clash, then we should immediately throw an error and have the user resolve it.
 
+### File Provenance Metadata
+
+To help the model reason about the workspace without needing to memorize its entire action history, the runtime tracks file provenance. When files are listed or read, they are tagged with `created` and `modified` metadata based on the following roles:
+
+- **`user`**: Files that existed at the start of the current RLM's execution. This includes the initial codebase, human-provided files, and files provided as context from a parent RLM. (From the perspective of any RLM, the caller is always the "user").
+- **`assistant`**: Files created or directly modified by the current RLM using explicit file-system tools (`write_file`, `edit_file`, `append_file`).
+- **`system`**: Files generated indirectly via command execution (`shell` or `python` tools), or internal runtime state files (e.g., `_rlm_query_0.txt`).
+- **`child`**: Artifacts explicitly returned and imported into the workspace from a recursive `rlm_query` call.
+
 ## Action Format
 
 The model interacts with the workspace by outputting structured action blocks. Because embedding multi-line code inside JSON strings is notoriously difficult and breaks whitespace, **we exclusively use XML for all actions.**
@@ -50,23 +59,22 @@ def process_data():
 ### Execution Semantics
 
 We explicitly classify tools to manage batching safely:
-1. **Read-Only Actions** (`read_file`, `list_files`, `web_search`,etc): Can be safely batched by providing multiple `<action>` blocks sequentially. The runtime executes them and may even parallelize them safely under the hood.
+1. **Read-Only Actions** (`read_file`, `list_directory`, `web_search`,etc): Can be safely batched by providing multiple `<action>` blocks sequentially. The runtime executes them and may even parallelize them safely under the hood.
 2. **State-Mutating Actions** (`write_file`, `edit_file`, `shell`, `python`, `rlm_query`): Must be executed sequentially. We allow the model to batch them (e.g., scaffolding three files at once in a single generation), but the runtime **MUST halt execution immediately** upon the first error and return the partial result to avoid cascading failures.
 
 ## Tool Interface & Definitions
 
 The workspace provides a set of initial tools to the model. While the model should only see short tool descriptions in its base prompt (with full schemas remaining in code/tests), the actual implementation and capability of these tools are defined below. 
 
-### 1. `list_files`
+### 1. `list_directory`
 - **Description**: Lists workspace paths to prevent context bloat. Filters out noise like `.git` and `__pycache__`.
 - **Arguments**:
   - `path` (optional): The directory to list. Defaults to the workspace root.
-  - `recursive` (optional): Boolean, whether to perform a deep list. Defaults to `false` (shallow like `ls`).
-- **Behavior**: Returns a JSON-like array of paths and metadata, including who created/modified each file.
+- **Behavior**: Returns a compact, shallow file-tree representation of the directory contents, including inline metadata about who created and last modified each item. Will include all the folders in this directory, but not their contents.
 - **Example Usage**:
   ```workspace
-  <action tool="list_files" path="_rlm_artifacts" recursive="false" />
-  ```
+  <action tool="list_directory" path="_rlm_artifacts" />
+  ```  
 
 ### 2. `read_file`
 - **Description**: Reads a bounded slice of a file to avoid context window explosion.
@@ -74,7 +82,7 @@ The workspace provides a set of initial tools to the model. While the model shou
   - `path` (required): The path to the file.
   - `start_line` (optional): The 1-indexed line to start reading from. Defaults to 1.
   - `end_line` (optional): The 1-indexed line to stop reading at. Defaults to bounded max (e.g., 500 lines).
-- **Behavior**: Returns the contents of the specified file slice along with total line count.
+- **Behavior**: Returns the contents of the specified file slice along with a header containing the total line count and inline metadata (created by, last modified by).
 - **Example Usage**:
   ```workspace
   <action tool="read_file" path="src/main.py" start_line="10" end_line="50" />
