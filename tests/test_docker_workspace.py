@@ -374,3 +374,98 @@ def test_broker_health_reachable(tmp_path: Path) -> None:
         assert r.json()["status"] == "ok"
     finally:
         env.cleanup()
+
+
+def test_rlm_query_end_to_end_with_mock_lm(tmp_path: Path) -> None:
+    """End-to-end recursion: parent → child (mock LM) → artifact pull-back.
+
+    Wires a ``RecursionHandler`` to a real ``DockerWorkspaceEnv`` whose
+    LMHandler is backed by a ``MockLM`` returning a single ``final`` action
+    with one ``<artifact>`` selection. Asserts that:
+      - the child workspace was created at the sibling path,
+      - the explicitly selected artifact was copied into the parent at
+        ``_rlm_artifacts/children/<child_id>/<path>``,
+      - parent provenance for that path is role=``child``,
+      - the returned observation contains the path-mapping block.
+    """
+    from rlm.core.lm_handler import LMHandler
+    from rlm.core.recursion import RecursionHandler
+    from rlm.core.rlm import RLM
+    from tests.mock_lm import MockLM
+
+    child_response = (
+        '<action tool="write_file" path="out/result.txt">child output here</action>\n'
+        '<action tool="final">'
+        "<answer>I solved it; see out/result.txt</answer>"
+        '<artifact path="out/result.txt" />'
+        "</action>"
+    )
+
+    mock = MockLM(responses=[child_response])
+    lm_handler = LMHandler(mock)
+    lm_handler.start()
+
+    cfg = WorkspaceConfig(
+        observation=ObservationConfig(max_observation_chars=4_000),
+        docker=DockerConfig(
+            image=IMAGE_TAG,
+            workspace_root_base=str(tmp_path),
+            broker_port=8080,
+            poll_interval_ms=50,
+            exec_timeout_seconds=15,
+            cleanup_mode="delete",
+        ),
+    )
+    parent_env = DockerWorkspaceEnv(
+        workspace_config=cfg,
+        lm_handler_address=(lm_handler.host, lm_handler.port),
+        depth=0,
+        max_depth=2,
+    )
+    try:
+        parent_env.setup()
+        parent_env.current_turn = 1
+
+        # Stub parent RLM: only reads attributes, never calls completion.
+        parent_rlm = RLM(
+            backend="openai",  # never used; child uses lm_handler directly
+            backend_kwargs={"model_name": "fake"},
+            workspace_config=cfg,
+            depth=0,
+            max_depth=2,
+            max_iterations=3,
+        )
+        handler = RecursionHandler(
+            parent_rlm=parent_rlm, parent_env=parent_env, lm_handler=lm_handler
+        )
+
+        obs = handler.spawn(child_task="please solve subtask X", action_id="t1.a1")
+
+        assert obs.error is None, obs.error
+        assert "Answer: I solved it" in obs.stdout
+        assert "Artifact Mapping:" in obs.stdout
+        assert "out/result.txt -> _rlm_artifacts/children/child_1_1/out/result.txt" in obs.stdout
+
+        # Artifact actually copied into parent.
+        parent_artifact = (
+            parent_env.workspace_root
+            / "_rlm_artifacts"
+            / "children"
+            / "child_1_1"
+            / "out"
+            / "result.txt"
+        )
+        assert parent_artifact.exists()
+        assert parent_artifact.read_text() == "child output here"
+
+        # Parent provenance marks it as `child` role.
+        parent_env.provenance.load()
+        prov = parent_env.provenance.get("_rlm_artifacts/children/child_1_1/out/result.txt")
+        assert prov is not None
+        assert prov.created.role == "child"
+        assert prov.created.action_id == "t1.a1"
+    finally:
+        try:
+            parent_env.cleanup()
+        finally:
+            lm_handler.stop()

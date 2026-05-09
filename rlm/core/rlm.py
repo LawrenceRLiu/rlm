@@ -131,6 +131,9 @@ class RLM:
         self._last_error: str | None = None
         self._best_partial_answer: str | None = None
         self._completion_start_time: float | None = None
+        # Captured at the moment a `final` action fires; read by the parent's
+        # RecursionHandler to selectively pull artifacts back into its workspace.
+        self._last_final_artifacts: list[str] = []
 
         # Log run metadata once if a logger / verbose is attached.
         if self.logger or verbose:
@@ -190,6 +193,44 @@ class RLM:
         condition. Returns a single ``RLMChatCompletion`` whose
         ``response`` is the final answer string.
         """
+        with self._spawn_completion_context(prompt) as (lm_handler, env):
+            self._wire_recursion(env=env, lm_handler=lm_handler)
+            return self._run_loop(
+                prompt=prompt,
+                root_prompt=root_prompt,
+                lm_handler=lm_handler,
+                env=env,
+            )
+
+    def _wire_recursion(self, *, env: DockerWorkspaceEnv, lm_handler: LMHandler) -> None:
+        """Attach a ``RecursionHandler`` if this RLM is allowed to recurse.
+
+        At ``depth >= max_depth`` the handler is left unset so the action
+        dispatch + broker poller both fall through to the loud "max depth
+        reached" error path.
+        """
+        if self.depth >= self.max_depth:
+            return
+        # Local import to break the rlm <-> recursion <-> docker_workspace
+        # circular import cycle.
+        from rlm.core.recursion import RecursionHandler
+
+        env.recursion_handler = RecursionHandler(
+            parent_rlm=self, parent_env=env, lm_handler=lm_handler
+        )
+
+    def _run_loop(
+        self,
+        *,
+        prompt: str | dict[str, Any] | list[Any],
+        root_prompt: str | None,
+        lm_handler: LMHandler,
+        env: DockerWorkspaceEnv,
+    ) -> RLMChatCompletion:
+        """Turn-based workspace loop. Reused by the public ``completion()``
+        entry and by ``RecursionHandler`` (which provisions ``lm_handler`` /
+        ``env`` itself for child runs).
+        """
         time_start = time.perf_counter()
         self._completion_start_time = time_start
 
@@ -198,79 +239,80 @@ class RLM:
         self._last_error = None
         self._best_partial_answer = None
         self._cumulative_cost = 0.0
+        self._last_final_artifacts = []
         if self.logger:
             self.logger.clear_iterations()
 
-        with self._spawn_completion_context(prompt) as (lm_handler, env):
-            system_prompt = build_workspace_system_prompt(
-                depth=self.depth,
-                max_depth=self.max_depth,
-                custom_system_prompt=self.custom_system_prompt,
-            )
-            initial_user = build_workspace_initial_user_prompt(root_prompt=root_prompt)
-            message_history: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": initial_user},
-            ]
+        system_prompt = build_workspace_system_prompt(
+            depth=self.depth,
+            max_depth=self.max_depth,
+            custom_system_prompt=self.custom_system_prompt,
+        )
+        initial_user = build_workspace_initial_user_prompt(root_prompt=root_prompt)
+        message_history: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": initial_user},
+        ]
 
-            try:
-                for i in range(self.max_iterations):
-                    self._check_timeout(i, time_start)
-                    if self.on_iteration_start:
-                        try:
-                            self.on_iteration_start(self.depth, i + 1)
-                        except Exception:
-                            pass
+        try:
+            for i in range(self.max_iterations):
+                self._check_timeout(i, time_start)
+                if self.on_iteration_start:
+                    try:
+                        self.on_iteration_start(self.depth, i + 1)
+                    except Exception:
+                        pass
 
-                    env.current_turn = i + 1
-                    iteration = self._completion_turn(
-                        iteration_idx=i + 1,
-                        message_history=message_history,
+                env.current_turn = i + 1
+                iteration = self._completion_turn(
+                    iteration_idx=i + 1,
+                    message_history=message_history,
+                    lm_handler=lm_handler,
+                    env=env,
+                )
+
+                self._check_iteration_limits(iteration, i, lm_handler)
+
+                # Surface a best-partial-answer for graceful stop returns.
+                if iteration.response and iteration.response.strip():
+                    self._best_partial_answer = iteration.response
+
+                if self.logger:
+                    self.logger.log_iteration(iteration)
+                if self.on_iteration_complete and iteration.iteration_time is not None:
+                    try:
+                        self.on_iteration_complete(self.depth, i + 1, iteration.iteration_time)
+                    except Exception:
+                        pass
+
+                if iteration.final_answer is not None:
+                    self._last_final_artifacts = _final_artifacts_from_iteration(iteration)
+                    return self._build_completion(
+                        prompt=prompt,
+                        response=iteration.final_answer,
                         lm_handler=lm_handler,
-                        env=env,
+                        time_start=time_start,
                     )
 
-                    self._check_iteration_limits(iteration, i, lm_handler)
+                # Append turn record to history for the next prompt.
+                message_history.extend(format_workspace_iteration(iteration))
 
-                    # Surface a best-partial-answer for graceful stop returns.
-                    if iteration.response and iteration.response.strip():
-                        self._best_partial_answer = iteration.response
+        except KeyboardInterrupt:
+            self.verbose.print_limit_exceeded("cancelled", "User interrupted execution")
+            raise CancellationError(
+                partial_answer=self._best_partial_answer,
+                message="Execution cancelled by user (Ctrl+C)",
+            ) from None
 
-                    if self.logger:
-                        self.logger.log_iteration(iteration)
-                    if self.on_iteration_complete and iteration.iteration_time is not None:
-                        try:
-                            self.on_iteration_complete(self.depth, i + 1, iteration.iteration_time)
-                        except Exception:
-                            pass
-
-                    if iteration.final_answer is not None:
-                        return self._build_completion(
-                            prompt=prompt,
-                            response=iteration.final_answer,
-                            lm_handler=lm_handler,
-                            time_start=time_start,
-                        )
-
-                    # Append turn record to history for the next prompt.
-                    message_history.extend(format_workspace_iteration(iteration))
-
-            except KeyboardInterrupt:
-                self.verbose.print_limit_exceeded("cancelled", "User interrupted execution")
-                raise CancellationError(
-                    partial_answer=self._best_partial_answer,
-                    message="Execution cancelled by user (Ctrl+C)",
-                ) from None
-
-            # max_iterations reached without a `final` action: ask the model
-            # one last time for an answer based on what it has gathered.
-            final_answer = self._default_answer(message_history, lm_handler)
-            return self._build_completion(
-                prompt=prompt,
-                response=final_answer,
-                lm_handler=lm_handler,
-                time_start=time_start,
-            )
+        # max_iterations reached without a `final` action: ask the model
+        # one last time for an answer based on what it has gathered.
+        final_answer = self._default_answer(message_history, lm_handler)
+        return self._build_completion(
+            prompt=prompt,
+            response=final_answer,
+            lm_handler=lm_handler,
+            time_start=time_start,
+        )
 
     # =========================================================================
     # One turn
@@ -561,6 +603,17 @@ class RLM:
         del exc_type, exc_val, exc_tb
         self.close()
         return False
+
+
+def _final_artifacts_from_iteration(iteration: WorkspaceIteration) -> list[str]:
+    """Pull the ``final_artifacts`` list off whichever observation in ``iteration``
+    carried the terminal ``final_answer``. Returns ``[]`` if none did (which
+    shouldn't happen in practice — ``iteration.final_answer`` and a final-
+    carrying observation are written together in ``_completion_turn``)."""
+    for obs in iteration.observations:
+        if obs.final_answer is not None:
+            return list(obs.final_artifacts)
+    return []
 
 
 # Re-export for callers that previously used ``UsageSummary`` from this module.
