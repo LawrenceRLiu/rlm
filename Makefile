@@ -1,6 +1,10 @@
 .PHONY: help install install-dev install-modal run-all \
         quickstart docker-repl lm-repl modal-repl \
+        build-image rebuild-image \
         lint format test check
+
+# Workspace image tag. Override with `make build-image IMAGE_TAG=foo:bar`.
+IMAGE_TAG ?= rlm-workspace:0.1.0
 
 help:
 	@echo "RLM Examples Makefile"
@@ -16,6 +20,10 @@ help:
 	@echo "  make docker-repl    - Run docker_repl_example.py (needs Docker)"
 	@echo "  make lm-repl        - Run lm_in_repl.py (needs PORTKEY_API_KEY)"
 	@echo "  make modal-repl     - Run modal_repl_example.py (needs Modal)"
+	@echo ""
+	@echo "Workspace image:"
+	@echo "  make build-image    - Build the workspace Docker image (tag: $(IMAGE_TAG))"
+	@echo "  make rebuild-image  - Rebuild without cache"
 	@echo ""
 	@echo "Development:"
 	@echo "  make lint           - Run ruff linter"
@@ -54,5 +62,11 @@ format: install-dev
 
 test: install-dev
 	uv run pytest
+
+build-image:
+	docker build -t $(IMAGE_TAG) -f docker/workspace.Dockerfile docker
+
+rebuild-image:
+	docker build --no-cache -t $(IMAGE_TAG) -f docker/workspace.Dockerfile docker
 
 check: lint format test
