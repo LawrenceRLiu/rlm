@@ -12,6 +12,8 @@ from rlm.environments.base_env import (
     parse_tool_entry,
     validate_custom_tools,
 )
+from rlm.environments.base_workspace import BaseWorkspaceEnv
+from rlm.environments.docker_workspace import DockerWorkspaceEnv, ExecResult
 from rlm.environments.local_repl import LocalREPL
 
 
@@ -27,6 +29,9 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "BaseEnv",
+    "BaseWorkspaceEnv",
+    "DockerWorkspaceEnv",
+    "ExecResult",
     "IPythonREPL",
     "LocalREPL",
     "RESERVED_TOOL_NAMES",
