@@ -40,7 +40,7 @@ Host responsibilities:
 - Create a per-completion workspace directory.
 - Start a Docker container with that directory mounted as the working directory.
 - Dispatch shell/python actions into the container.
-- Dispatch web and LM actions from the host, not from ad hoc model-written Python.
+- Dispatch web actions from the host. LM actions executed from within Python scripts require an internal HTTP broker to proxy requests to the host securely.
 - Capture stdout, stderr, exit code, wall time, modified files, and any tool-specific metadata.
 
 Container responsibilities:

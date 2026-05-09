@@ -31,11 +31,17 @@ To help the model reason about the workspace without needing to memorize its ent
 - **`system`**: Files generated indirectly via command execution (`shell` or `python` tools), or internal runtime state files (e.g., `_rlm_query_0.txt`).
 - **`child`**: Artifacts explicitly returned and imported into the workspace from a recursive `rlm_query` call.
 
+**Tracking Mechanism:** The runtime implements this by taking a fast directory snapshot (recording file paths, sizes, and `mtime` modification timestamps) *before* and *after* each action is executed. 
+- If a file's `mtime` changes during the execution of an explicit file tool (e.g., `write_file`), the runtime tags it as `assistant`.
+- If a file's `mtime` changes during the execution of a `shell` or `python` command, the runtime assumes the tool generated/modified it and tags it as `system`.
+
 ## Action Format
 
 The model interacts with the workspace by outputting structured action blocks. Because embedding multi-line code inside JSON strings is notoriously difficult and breaks whitespace, **we exclusively use XML for all actions.**
 
 XML natively preserves formatting, is extremely robust for LLM generation, and provides a unified interface for both simple reads and complex code writes.
+
+**Parsing Strategy (Important):** Standard XML parsers will crash if the assistant writes code containing unescaped characters like `<` or `&` (e.g., `if a < b:`). Therefore, the host-side parser must NOT be a strict XML parser. It must be a **tolerant, regex-based extractor** that simply finds the `<action ...>` opening tag and the `</action>` closing tag, and extracts the raw string between them. This prevents parsing failures when handling raw Python, Bash, or HTML files.
 
 ### Action Format (XML)
 
@@ -59,7 +65,7 @@ def process_data():
 ### Execution Semantics
 
 We explicitly classify tools to manage batching safely:
-1. **Read-Only Actions** (`read_file`, `list_directory`, `web_search`,etc): Can be safely batched by providing multiple `<action>` blocks sequentially. The runtime executes them and may even parallelize them safely under the hood.
+1. **Read-Only Actions** (`read_file`, `list_directory`, `web_search`,etc): Can be safely batched by providing multiple `<action>` blocks sequentially. The runtime executes them and may even parallelize them safely under the hood. **If a read-only action fails (e.g., file not found), the runtime does NOT halt.** It simply records the error for that specific tool call and continues executing the remaining read-only actions in the batch.
 2. **State-Mutating Actions** (`write_file`, `edit_file`, `shell`, `python`, `rlm_query`): Must be executed sequentially. We allow the model to batch them (e.g., scaffolding three files at once in a single generation), but the runtime **MUST halt execution immediately** upon the first error and return the partial result to avoid cascading failures.
 
 ## Tool Interface & Definitions
@@ -159,7 +165,9 @@ The workspace provides a set of initial tools to the model. While the model shou
 - **Description**: Convenience wrapper for running Python inside Docker.
 - **Arguments**:
   - `code` (implicit text content): The python script to execute.
-- **Behavior**: Runs the Python code. **Note:** The runtime injects `llm_query` and `rlm_query` functions into this environment. If the model needs to programmatically construct complex prompts or map over files before calling an LLM, it should write a Python script and call `rlm_query_batched` directly from Python. (Python is strongly preferred over Bash for multiline prompts/JSON IO). On the backend we will handle this by extracting the exact queries from the python script and calling the LLM/RLM with it. To the model, this should look just like any other python function.
+- **Behavior**: Runs the Python code.
+  - **HTTP Broker Requirement:** Because the Python script runs inside an isolated Docker container without API keys, this requires an HTTP Broker running inside the container (polled by the host) to proxy the LLM requests securely.
+  - **Batching & Concurrency:** When a script calls `rlm_query_batched` with many prompts, the runtime enforces a top-level hyperparameter (`MAX_CONCURRENT_RLMS`, e.g., N=5). It will spin up N child workspaces at a time, wait for them to finish, and then spin up the next N, accepting the wall-time slowdown to prevent host resource exhaustion.
 - **Example Usage**:
   ```workspace
   <action tool="python">
@@ -168,6 +176,15 @@ The workspace provides a set of initial tools to the model. While the model shou
   print(f"Processed {len(data)} items")
   </action>
   ```
+
+#### 7.1. Python Injected Functions
+
+The runtime injects the following helper functions into the Python namespace so the model can programmatically construct prompts or map over files:
+
+- `def llm_query(prompt: str) -> str:` Plain string-in, string-out LLM completion.
+- `def rlm_query(prompt: str) -> str:` Spawns a child workspace. Exported artifacts are saved to `_rlm_artifacts/children/child_{turn}_{idx}/`. Returns the exact structured observation string (containing the child's text answer and the artifact path mapping table) so the Python script can read the answer and locate the files.
+- `def llm_query_batched(prompts: list[str]) -> list[str]:` Executes `llm_query` over a list of strings. Returns a list of string responses in the same order.
+- `def rlm_query_batched(prompts: list[str]) -> list[str]:` Executes `rlm_query` over a list of strings. Returns a list of structured observation strings in the same order.
 
 ### 8. `llm_query`
 - **Description**: Plain LM completion for simple string prompts.

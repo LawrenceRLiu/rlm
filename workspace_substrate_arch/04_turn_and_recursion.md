@@ -109,30 +109,38 @@ The default should be copy-on-spawn:
 
 The child must not mutate the parent workspace directly. Copying the parent workspace gives the child full context without introducing live shared state. The explicit selection of artifacts via the `final` tool guarantees that massive intermediate scratch files or logs are ignored by default.
 
+**Note on Performance (Future Work):** While a naive `cp` with excludes is the default for MVP, copying massive directories (like datasets) is slow and I/O intensive. Future iterations of the workspace substrate should leverage **Docker OverlayFS**. By providing a read-only bind mount of the parent workspace (Lower layer) and an empty directory for the child (Upper layer), we can achieve instant, zero-copy child spawning with perfect isolation (Copy-on-Write).
+
 ### Example: Returning Child Artifacts
 
 When a child has finished its task (e.g., compiling a dataset), it issues a `final` action with explicit artifact paths:
 
     ```workspace
     <action tool="final">
-        <answer>I have downloaded, cleaned, and compiled the dataset.</answer>
+        <answer>I have downloaded, cleaned, and compiled the dataset. You can find it at _rlm_artifacts/cleaned_data.csv.</answer>
         <artifact path="_rlm_artifacts/cleaned_data.csv" />
         <artifact path="src/data_loader.py" />
     </action>
     ```
 
-The runtime intercepts this action, halts the child, and copies those exact paths from the child's isolated container to the parent's directory structure under `_rlm_artifacts/children/<child_id>/`.
+The runtime intercepts this action, halts the child, and copies those exact paths from the child's isolated container to the parent's directory structure under `_rlm_artifacts/children/<child_id>/` (where `<child_id>` follows the format `child_{turn_count}_{idx}`, we will construct this <child_id> on the fly by just seeing for the latest turn, how many children have already been recorded, and doing the last one + 1)
 
-The parent RLM then receives the following compact observation, avoiding context window bloat:
+**Handling Path Invalidation:** Because the child writes its `answer` from the perspective of its own workspace, it will frequently reference the original paths (e.g., `_rlm_artifacts/cleaned_data.csv`). If the parent tries to read that exact path, it will read its own stale version of the file (or the file won't exist). To solve this without using brittle regex string replacements on the LLM's output, the runtime injects a **Path Mapping Table** into the parent's observation. This will be constructed on the fly from the artifact paths returned by the child and their new locations in the parent workspace. 
 
-    user/runtime:
+The parent RLM receives the following compact observation that wraps around the child's answer and the path mappings:
+```
+user/runtime:
     Observation: Child RLM completed.
-    Answer: I have downloaded, cleaned, and compiled the dataset.
-    Artifacts imported:
-    - _rlm_artifacts/children/child_42/cleaned_data.csv
-    - _rlm_artifacts/children/child_42/data_loader.py
+    
+    Answer: <child answer, example: I have downloaded, cleaned, and compiled the dataset. You can find it at _rlm_artifacts/cleaned_data.csv.> 
+    
+    [Runtime Note: The child's exported files have been safely isolated. Translate any paths mentioned in the answer above using this mapping:]
+    Artifact Mapping:
+    - _rlm_artifacts/cleaned_data.csv -> _rlm_artifacts/children/child_3_0/cleaned_data.csv
+    - src/data_loader.py -> _rlm_artifacts/children/child_3_0/data_loader.py
+```
 
-This mechanism allows pointers to be passed instead of massive text blobs, enabling smooth multi-modal and structured data workflows across recursion depths.
+This mechanism allows pointers to be passed instead of massive text blobs, keeping the parent's workspace safe from destructive overwrites while providing the LLM with explicitly clear path resolution logic.
 
 ### Maximum Depth Handling
 
