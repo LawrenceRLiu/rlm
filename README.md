@@ -28,12 +28,14 @@
 </p>
 
 ## Overview
-Recursive Language Models (RLMs) are a task-agnostic inference paradigm for language models (LMs) to handle near-infinite length contexts by enabling the LM to *programmatically* examine, decompose, and recursively call itself over its input. RLMs replace the canonical `llm.completion(prompt, model)` call with a `rlm.completion(prompt, model)` call. RLMs offload the context as a variable in a REPL environment that the LM can interact with and launch sub-LM calls inside of.
+Recursive Language Models (RLMs) are a task-agnostic inference paradigm for language models (LMs) to handle near-infinite length contexts by enabling the LM to *programmatically* examine, decompose, and recursively call itself over its input. RLMs replace the canonical `llm.completion(prompt, model)` call with a `rlm.completion(prompt, model)` call.
 
-This repository provides an extensible inference engine for using RLMs around standard API-based and local LLMs. The initial experiments and idea were proposed in a [blogpost](https://alexzhang13.github.io/blog/2025/rlm/) in 2025, with expanded results in an [arXiv preprint](https://arxiv.org/abs/2512.24601).
+This repository provides an extensible inference engine for RLMs built on the **Workspace Substrate** architecture — a Docker-backed execution environment with durable file-system memory. Unlike REPL-based approaches, the workspace substrate preserves state across actions via mounted directories and git snapshots, enabling reliable multi-turn reasoning and artifact management.
+
+The initial experiments and idea were proposed in a [blogpost](https://alexzhang13.github.io/blog/2025/rlm/) in 2025, with expanded results in an [arXiv preprint](https://arxiv.org/abs/2512.24601).
 
 > [!NOTE]
-> This repository contains inference code for RLMs with support for various sandbox environments. Open-source contributions are welcome. This repository is maintained by the authors of the paper from the MIT OASYS lab.
+> This is a working fork of the RLM substrate, maintained by Lawrence Liu (UCLA) with the workspace substrate architecture implementation. The codebase is actively developed and not yet fully tested in production. Open-source contributions are welcome.
 
 ## Quick Setup
 You can try out RLMs quickly by installing from PyPi:
@@ -41,18 +43,23 @@ You can try out RLMs quickly by installing from PyPi:
 pip install rlms
 ```
 
-The default RLM client uses a REPL environment that runs on the host process through Python `exec` calls. It uses the same virtual environment as the host process (i.e. it will have access to the same dependencies), but with some limitations in its available global modules. As an example, we can call RLM completions using GPT-5-nano:
+> [!IMPORTANT]
+> **Docker is required.** The workspace substrate runs code in an isolated Docker container. [Install Docker Desktop](https://docs.docker.com/desktop/setup/install/) before proceeding.
+
+The RLM client uses a workspace environment that runs inside Docker. It provides durable, file-system based memory and supports structured tool calls (file operations, code execution, recursive child RLMs). As an example, we can call RLM completions using Claude 3.5 Sonnet:
 ```python
 from rlm import RLM
 
 rlm = RLM(
-    backend="openai",
-    backend_kwargs={"model_name": "gpt-5-nano"},
+    backend="anthropic",
+    backend_kwargs={"model_name": "claude-3-5-sonnet-20241022"},
     verbose=True,  # For printing to console with rich, disabled by default.
 )
 
-print(rlm.completion("Print me the first 100 powers of two, each on a newline.").response)
+print(rlm.completion("Analyze the first 100 primes and write the results to a file.").response)
 ```
+
+See `workspace_substrate_arch/` in the repository for detailed architecture documentation.
 
 <details>
 <summary><b>Manual Setup</b></summary>
@@ -61,64 +68,73 @@ Set up the dependencies with `uv` (or your virtual environment of choice):
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv init && uv venv --python 3.12  # change version as needed
-uv pip install -e .
+uv sync --group dev --group test
 ```
 
 This project includes a `Makefile` to simplify common tasks.
 
 - `make install`: Install base dependencies.
-- `make check`: Run linter, formatter, and tests.
-
-To run a quick test, the following will run an RLM query with the OpenAI client using your environment variable `OPENAI_API_KEY` (feel free to change this). This will generate console output as well as a log which you can use with the visualizer to explore the trajectories.
-```bash
-make quickstart
-```
+- `make install-dev`: Install dev and test dependencies.
+- `make build-image`: Build the workspace Docker image.
+- `make lint`: Run ruff linter.
+- `make format`: Run ruff formatter.
+- `make test`: Run pytest.
+- `make check`: Run lint + format + test.
 
 </details>
 
-## REPL Environments
-We support two types of REPL environments -- isolated, and non-isolated. Non-isolated environments (default) run code execution on the same machine as the RLM (e.g. through `exec`), which is pretty reasonable for some local low-risk tasks, like simple benchmarking, but can be problematic if the prompts or tool calls can interact with malicious users. Fully isolated environments use cloud-based sandboxes (e.g. Prime Sandboxes, [Modal Sandboxes](https://modal.com/docs/guide/sandboxes)) to run code generated by the RLM, ensuring complete isolation from the host process. Environments can be added, but we natively support the following: `local` (default), `ipython`, `docker`, `modal`, `prime`, `daytona`, `e2b`.
+## Workspace Substrate
+The RLM runtime operates inside a **Docker container with a mounted workspace directory**. This provides:
+
+- **Durable memory**: Files in the workspace survive across iterations
+- **Git snapshots**: One commit per turn tracks changes and enables rollback
+- **Structured actions**: The LM emits `<action>` XML blocks for file ops, code execution, and recursive calls
+- **Isolation**: Code execution is sandboxed; malicious payloads are contained
+- **File provenance**: Role-based tagging (`user`, `assistant`, `system`, `child`) tracks which tool created/modified each file
+- **Recursive support**: Child RLM instances get a copy-on-spawn snapshot of the parent workspace
+
+### Configuration
+The workspace environment is configured via `WorkspaceConfig`, with sub-configs for parsing, observation handling, recursion, and Docker:
 
 ```python
+from rlm import RLM
+from rlm.core.config import WorkspaceConfig, DockerConfig, RecursionConfig
+
 rlm = RLM(
-    environment="...", # "local", "ipython", "docker", "modal", "prime", "daytona", "e2b"
-    environment_kwargs={...},
+    backend="anthropic",
+    backend_kwargs={"model_name": "claude-3-5-sonnet-20241022"},
+    workspace_config=WorkspaceConfig(
+        docker=DockerConfig(
+            image="rlm-workspace:0.1.0",
+            workspace_root_base="~/.rlm/workspaces",
+            exec_timeout_seconds=300,
+            cleanup_mode="keep",  # or "tar" / "delete"
+        ),
+        recursion=RecursionConfig(
+            max_concurrent_subcalls=5,
+        ),
+    ),
+    verbose=True,
 )
 ```
 
-### Local Environments
-The default `local` environment `LocalREPL` runs in the same process as the RLM itself, with specified global and local namespaces for minimal security. Using this REPL is generally safe, but should not be used for production settings. It also shares the same virtual environment (e.g. Conda or uv) as the host process.
-
-#### IPython (*requires `pip install 'rlms[ipython]'`*)
-`IPythonREPL` runs cells inside a real IPython session — either in-process (default) or in a separate `ipykernel` subprocess. Subprocess mode adds hard `cell_timeout` enforcement and full namespace isolation from the RLM host. See the [IPythonREPL docs](https://alexzhang13.github.io/rlm/environments/ipython) for details.
-
-#### Docker <img src="https://github.com/docker.png" alt="Docker" height="20" style="vertical-align: middle;"/> (*requires [Docker installed](https://docs.docker.com/desktop/setup/install/)*)
-We also support a Docker-based environment called `DockerREPL` that launches the REPL environment as a Docker image. By default, we use the `python:3.11-slim` image, but the user can specify custom images as well.
-
-### Isolated Environments
-We support several different REPL environments that run on separate, cloud-based machines. Whenever a recursive sub-call is made in these instances, it is requested from the host process.
-
-#### Modal Sandboxes <img src="https://github.com/modal-labs.png" alt="Modal" height="20" style="vertical-align: middle;"/>
-To use [Modal Sandboxes](https://modal.com/docs/guide/sandboxes) as the REPL environment, you need to install and authenticate your Modal account.
+### Building the Docker Image
+Before running RLM, build the workspace image:
 ```bash
-uv add modal  # add modal library
-modal setup   # authenticate account
+make build-image
+# or with a custom tag:
+make build-image IMAGE_TAG=my-workspace:latest
 ```
 
-#### Prime Intellect Sandboxes <img src="https://github.com/PrimeIntellect-ai.png" alt="Prime Intellect" height="20" style="vertical-align: middle;"/>
-> [!NOTE]
-> **Prime Intellect Sandboxes** are currently a beta feature. See the [documentation](https://docs.primeintellect.ai/sandboxes/overview) for more information. We noticed slow runtimes when using these sandboxes, which is currently an open issue.
+The image is based on `python:3.11-slim` with pre-installed scientific/utility libraries (NumPy, Pandas, SciPy, Matplotlib, etc.). See `docker/workspace.Dockerfile` for the full manifest.
 
 
-To use [Prime Sandboxes](https://docs.primeintellect.ai/sandboxes/sdk), install the SDK and set your API key:
-```bash
-uv pip install -e ".[prime]"
-export PRIME_API_KEY=...
-```
+### Supported LM Backends
+The workspace substrate works with any LM backend supported by the RLM client library. We currently support:
+- **API-based**: OpenAI (GPT-4, o1, etc.), Anthropic (Claude), Google (Gemini), Portkey, OpenRouter
+- **Local models**: vLLM (via OpenAI-compatible interface), or any model behind an OpenAI API-compatible server
 
-
-### Model Providers
-We currently support most major clients (OpenAI, Anthropic), as well as the router platforms (OpenRouter, Portkey). For local models, we recommend using vLLM (which interfaces with the [OpenAI client](https://github.com/alexzhang13/rlm/blob/main/rlm/clients/openai.py)). To view or add support for more clients, start by looking at [`rlm/clients/`](https://github.com/alexzhang13/rlm/tree/main/rlm/clients).
+For detailed client implementations and to add support for more backends, see [`rlm/clients/`](https://github.com/alexzhang13/rlm/tree/main/rlm/clients).
 
 ## Relevant Reading
 * **[Dec '25]** [Recursive Language Models arXiv](https://arxiv.org/abs/2512.24601)
