@@ -3,7 +3,13 @@
 This guide covers best practices for contributing to the core Recursive Language Models `rlm` library and developing new environments (in `rlm/environments/`) and LM clients (in `rlm/clients/`).
 
 ## Current State of the Project:
-Currently we are working on migrating the RLM substrate from a Python REPL to a Workspace Substrate. We have sketched out at a high level what the Workspace Substrate should look like in `workspace_substrate_arch/`. Your job, until I say otherwise, is to help me refine this sketch. Before you make any recommendations please familiarize yourself with current codebase, which is the vanilla RLM with a Python REPL substrate, and the Workspace Substrate design docs. Base all recommendations off first principles.
+The RLM substrate has been migrated from the legacy Python REPL to a durable
+**Workspace Substrate** backed by a Docker container. The action surface is
+XML `<action>` blocks parsed by `rlm/utils/action_parser.py`; "memory" lives
+in workspace files (with per-turn git snapshots and a `_rlm_state/provenance.json`
+sidecar). Architecture notes are in `workspace_substrate_arch/`. The only
+supported environment is `DockerWorkspaceEnv` — all REPL substrates (local,
+ipython, modal, prime, daytona, e2b, the old Docker REPL) have been removed.
 
 ## Setup
 
@@ -155,186 +161,72 @@ class MyClient(BaseLM):
 - **Hardcode**: Default base URLs, reasonable defaults
 - **Arguments**: Essential customization via `__init__()`
 
-## Developing Environments
+## Workspace Substrate
 
-> **Note**: RLM is migrating from a REPL-based environment substrate to a durable **Workspace Substrate**. For details on the new architecture, please read the documentation in `workspace_substrate_arch/`. Legacy REPL documentation is preserved below during the transition.
+The only supported environment is `DockerWorkspaceEnv` (`rlm/environments/docker_workspace.py`),
+which inherits from `BaseWorkspaceEnv` (`rlm/environments/base_workspace.py`).
 
-Environment implementations live in `rlm/environments/`. Choose the appropriate base class.
-
-### Environment Pattern
-
-| Pattern | Base Class | When to Use | Key Methods |
-|---------|------------|-------------|-------------|
-| **Workspace** | `BaseWorkspaceEnv` | (NEW) Durable file-system action environment | `setup`, `load_context`, `run_action`, `snapshot` |
-| **Non-isolated** | `NonIsolatedEnv` | (LEGACY) Local REPL execution, same machine | `setup`, `load_context`, `execute_code` |
-| **Isolated** | `IsolatedEnv` | (LEGACY) Cloud sandboxes (Modal, Prime) | `setup`, `load_context`, `execute_code` |
-
-### Requirements
-- Inherit from `NonIsolatedEnv` or `IsolatedEnv` in `rlm/environments/base_env.py`
-- Implement all abstract methods: `setup`, `load_context`, `execute_code`
-- Return `REPLResult` from `execute_code`
-- Handle `lm_handler_address` for LM calls via `llm_query()` and `rlm_query()`
-- Implement `cleanup()` for resource management
-- Register environment in `rlm/environments/__init__.py`
-
-### Key Implementation Details
-- `setup()`: Initialize globals, locals, and helper functions
-- `load_context()`: Make context available as `context` variable
-- `execute_code()`: Execute code, capture stdout/stderr, return `REPLResult`
-- Always provide `llm_query`, `llm_query_batched`, `rlm_query`, and `rlm_query_batched` functions in environment globals
-
-### State Management
-Environments must provide these globals to executed code:
-- `context`: The loaded context payload
-- `llm_query(prompt, model=None)`: Plain single LM completion (no REPL, no iteration)
-- `llm_query_batched(prompts, model=None)`: Batched plain LM completions
-- `rlm_query(prompt, model=None)`: Recursive child RLM call (own REPL + iteration). Falls back to `llm_query` at max depth.
-- `rlm_query_batched(prompts, model=None)`: Batched recursive child RLM calls
-- `FINAL_VAR(variable_name)`: For returning final answers
-- `SHOW_VARS()`: For listing available variables
-
-### Example Structure
-```python
-from rlm.environments.base_env import NonIsolatedEnv
-from rlm.core.types import REPLResult
-
-class MyEnvironment(NonIsolatedEnv):
-    def __init__(self, lm_handler_address: tuple[str, int] | None = None, 
-                 context_payload: dict | list | str | None = None, **kwargs):
-        super().__init__(**kwargs)
-        self.lm_handler_address = lm_handler_address
-        self.setup()
-        if context_payload:
-            self.load_context(context_payload)
-            
-    def setup(self):
-        # Initialize execution namespace
-        
-    def load_context(self, context_payload: dict | list | str):
-        # Make context available to executed code
-        
-    def execute_code(self, code: str) -> REPLResult:
-        # Execute code and return REPLResult
-        
-    def cleanup(self):
-        # Clean up resources
-```
-
-### Checklist
-- Guidelines here are followed
-- Environment works with basic RLM completion calls
-- `cleanup()` properly releases all resources
-- Sub-LM calls work via `llm_query()` and `rlm_query()`
-- Reserved names (`llm_query`, `rlm_query`, `context`, `history`, `FINAL_VAR`, `SHOW_VARS`) are restored after each execution
-
-## Architecture: Environment ↔ LM Handler Communication
-
-Understanding how environments communicate with the LM Handler is essential for developing new environments.
-
-### Overview
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Host Machine                                                       │
-│  ┌─────────────┐       Socket (TCP)        ┌──────────────────────┐ │
-│  │   RLM       │◄──────────────────────────►  LMHandler           │ │
-│  │  (main)     │                           │  (ThreadingTCPServer)│ │
-│  └─────────────┘                           └──────────────────────┘ │
-│        │                                            ▲               │
-│        ▼                                            │               │
-│  ┌─────────────┐       Socket (TCP)                 │               │
-│  │ LocalREPL   │────────────────────────────────────┘               │
-│  │ (exec code) │  llm_query() / rlm_query() → LM calls               │
-│  └─────────────┘                                                    │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-### Socket Protocol (Non-Isolated Environments)
-
-Non-isolated environments like `LocalREPL` communicate directly with the `LMHandler` via TCP sockets using a length-prefixed JSON protocol:
-
-**Protocol Format**: `4-byte big-endian length prefix + UTF-8 JSON payload`
+### Contract
 
 ```python
-# Sending a message (from rlm/core/comms_utils.py)
-def socket_send(sock: socket.socket, data: dict) -> None:
-    payload = json.dumps(data).encode("utf-8")
-    sock.sendall(struct.pack(">I", len(payload)) + payload)
+class BaseWorkspaceEnv(ABC):
+    def setup(self) -> None: ...
+    def load_context(self, context_payload) -> None: ...
+    def run_action(self, action: WorkspaceAction) -> WorkspaceObservation: ...
+    def snapshot(self, turn: int) -> WorkspaceSnapshot: ...
+    def cleanup(self) -> None: ...
 ```
 
-**Request Flow**:
-1. Environment's `llm_query(prompt)` or `rlm_query(prompt)` is called during code execution
-2. For `llm_query`: creates `LMRequest` and calls `send_lm_request(address, request)`. For `rlm_query`: invokes `subcall_fn` to spawn a child RLM (or falls back to `llm_query` at max depth).
-3. Opens TCP connection to `LMHandler` at `(host, port)`
-4. Sends length-prefixed JSON request
-5. `LMHandler` processes via `LMRequestHandler.handle()`
-6. Returns `LMResponse` with `RLMChatCompletion` or error
+### Configuration
 
-**Key Components**:
-- `LMHandler` (`rlm/core/lm_handler.py`): Multi-threaded TCP server wrapping LM clients
-- `LMRequest` / `LMResponse` (`rlm/core/comms_utils.py`): Typed request/response dataclasses
-- `send_lm_request()` / `send_lm_request_batched()`: Helper functions for socket communication
+All workspace knobs live on a composed `WorkspaceConfig` dataclass tree
+(`rlm/core/config.py`): `ParseConfig`, `ObservationConfig`, `RecursionConfig`,
+`DockerConfig`. Pass it via `RLM(workspace_config=...)`. Environment
+variables are reserved for secrets only.
 
-### HTTP Broker Pattern (Isolated Environments)
+### Action Surface
 
-Isolated environments (Modal, Prime) cannot directly connect to the host's socket server. They use an HTTP broker pattern:
+The model emits XML `<action tool="...">...</action>` elements. The parser
+in `rlm/utils/action_parser.py` is a tag-pair scanner (not strict XML) that
+handles raw `<` / `&` / nested `<action>` inside bodies. The 10 v0.1 tools
+live under `rlm/workspace_tools/`:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  Host Machine                                                               │
-│  ┌─────────┐    Socket    ┌────────────┐    HTTP Poll    ┌────────────────┐ │
-│  │   RLM   │◄────────────►│  LMHandler │◄────────────────│   ModalREPL    │ │
-│  └─────────┘              └────────────┘                 │  (poller)      │ │
-│                                                          └────────────────┘ │
-│                                                                  │          │
-│                                                          HTTP (tunnel)      │
-│                                                                  │          │
-└──────────────────────────────────────────────────────────────────┼──────────┘
-                                                                   │
-┌──────────────────────────────────────────────────────────────────┼──────────┐
-│  Cloud Sandbox (Modal/Prime)                                     ▼          │
-│  ┌─────────────┐     HTTP (localhost)     ┌─────────────────────────────┐   │
-│  │ Exec Script │◄────────────────────────►│   Broker Server (Flask)     │   │
-│  │ (exec code) │     /enqueue, etc.       │   - /enqueue (submit req)   │   │
-│  └─────────────┘                          │   - /pending (poll reqs)    │   │
-│                                           │   - /respond (return resp)  │   │
-│                                           └─────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+`list_directory`, `read_file`, `write_file`, `append_file`, `edit_file`,
+`shell`, `python`, `llm_query`, `rlm_query`, `final`.
 
-**How It Works**:
+Read-only tool failures do **not** halt the rest of the turn; mutating tool
+failures halt the rest of the batch. Per-call observations above
+`observation.max_observation_chars` are spilled to
+`_rlm_artifacts/_observations/` and replaced with a summary path.
 
-1. **Sandbox Setup**: Environment creates a cloud sandbox with an HTTP broker server running inside
-2. **Tunnel Exposure**: Broker server is exposed via encrypted tunnel (e.g., Modal's `encrypted_ports`)
-3. **Code Execution**: When `llm_query()` is called inside sandbox, it POSTs to `http://localhost:8080/enqueue`
-4. **Request Queuing**: Broker queues the request and blocks waiting for response
-5. **Host Polling**: `ModalREPL` on host polls `{tunnel_url}/pending` for new requests
-6. **LM Forwarding**: Host forwards requests to `LMHandler` via socket, gets response
-7. **Response Delivery**: Host POSTs response to `{tunnel_url}/respond`
-8. **Unblocking**: Broker unblocks the original `/enqueue` call with the response
+### Recursion (`rlm_query`)
 
-**Broker Endpoints**:
-| Endpoint | Method | Purpose |
-|----------|--------|---------|
-| `/enqueue` | POST | Submit LLM request from sandbox code (blocks until response) |
-| `/pending` | GET | Get list of pending requests (called by host poller) |
-| `/respond` | POST | Submit response for a request ID (called by host poller) |
-| `/health` | GET | Health check |
+Implemented in `rlm/workspace_tools/rlm_query.py` with the spawn machinery
+in `rlm/core/recursion.py`. Each child gets its own copy-on-spawn workspace
+(excludes `.git`, `_rlm_state/snapshots`, `_rlm_artifacts/children`, files
+larger than `recursion.copy_on_spawn_max_file_bytes`). At `depth ==
+max_depth` the system prompt omits `rlm_query`; if the model emits one
+anyway, the runtime returns a loud error observation. Children export
+artifacts explicitly via `<artifact path="..."/>` children of `final`; the
+runtime copies *only those* into the parent's
+`_rlm_artifacts/children/<child_id>/` and includes a path-mapping table in
+the parent's observation.
 
-**Key Implementation Details**:
-- Broker runs as a Flask server inside the sandbox
-- Uses `threading.Event` for request/response synchronization
-- Poller thread on host runs in background with 100ms polling interval
-- State persistence via `dill` serialization to `/tmp/rlm_state.dill`
+### Container ↔ Host Transport
 
-### Implementing a New Isolated Environment
+`DockerWorkspaceEnv` runs the workspace container with the broker
+(`rlm/environments/_broker.py`, also embedded in the image at
+`docker/workspace_image/rlm_workspace/broker.py`) as PID 1. The host
+poller forwards `/pending` requests to `LMHandler` over its TCP socket
+and posts responses back to `/respond`. In-container code uses the
+`rlm_workspace.client` module (preimported into `python` action bodies)
+which exposes `llm_query`, `llm_query_batched`, `rlm_query`,
+`rlm_query_batched` (no `model=` argument — the parent's configured
+model is used everywhere).
 
-When building a new isolated environment (e.g., for a new cloud provider):
+### Logging & Visualization
 
-1. **Create broker server** - Flask/HTTP server with `/enqueue`, `/pending`, `/respond` endpoints
-2. **Expose tunnel** - Use provider's tunnel/port forwarding to expose broker to host
-3. **Implement poller** - Background thread on host to poll and forward requests
-4. **Build exec script** - Script that runs inside sandbox with `llm_query()` calling broker
-5. **Handle state** - Serialize/deserialize execution state between code blocks
-
-See `rlm/environments/modal_repl.py` as the canonical reference implementation.
+`RLMLogger.log(WorkspaceIteration)` writes one JSONL line per turn (plus
+a `type:"metadata"` header) under `log_dir/`. The Next.js visualizer in
+`visualizer/` consumes that file directly: types in
+`visualizer/src/lib/types.ts` mirror the Python `to_dict` schemas 1:1.

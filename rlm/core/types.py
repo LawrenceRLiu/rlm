@@ -12,7 +12,7 @@ ClientBackend = Literal[
     "azure_openai",
     "gemini",
 ]
-EnvironmentType = Literal["local", "ipython", "docker", "modal", "prime", "daytona", "e2b"]
+EnvironmentType = Literal["docker"]
 
 
 def _serialize_value(value: Any) -> Any:
@@ -158,72 +158,6 @@ class RLMChatCompletion:
             metadata=data.get("metadata"),
             reasoning_content=data.get("reasoning_content"),
         )
-
-
-@dataclass
-class REPLResult:
-    stdout: str
-    stderr: str
-    locals: dict
-    execution_time: float
-    llm_calls: list["RLMChatCompletion"]
-    final_answer: str | None = None
-
-    def __init__(
-        self,
-        stdout: str,
-        stderr: str,
-        locals: dict,
-        execution_time: float = None,
-        rlm_calls: list["RLMChatCompletion"] = None,
-        final_answer: str | None = None,
-    ):
-        self.stdout = stdout
-        self.stderr = stderr
-        self.locals = locals
-        self.execution_time = execution_time
-        self.rlm_calls = rlm_calls or []
-        self.final_answer = final_answer
-
-    def __str__(self):
-        return f"REPLResult(stdout={self.stdout}, stderr={self.stderr}, locals={self.locals}, execution_time={self.execution_time}, rlm_calls={len(self.rlm_calls)})"
-
-    def to_dict(self):
-        return {
-            "stdout": self.stdout,
-            "stderr": self.stderr,
-            "locals": {k: _serialize_value(v) for k, v in self.locals.items()},
-            "execution_time": self.execution_time,
-            "rlm_calls": [call.to_dict() for call in self.rlm_calls],
-            "final_answer": self.final_answer,
-        }
-
-
-@dataclass
-class CodeBlock:
-    code: str
-    result: REPLResult
-
-    def to_dict(self):
-        return {"code": self.code, "result": self.result.to_dict()}
-
-
-@dataclass
-class RLMIteration:
-    prompt: str | dict[str, Any]
-    response: str
-    code_blocks: list[CodeBlock]
-    final_answer: str | None = None
-    iteration_time: float | None = None
-
-    def to_dict(self):
-        return {
-            "prompt": self.prompt,
-            "response": self.response,
-            "code_blocks": [code_block.to_dict() for code_block in self.code_blocks],
-            "final_answer": self.final_answer,
-            "iteration_time": self.iteration_time,
-        }
 
 
 ########################################################

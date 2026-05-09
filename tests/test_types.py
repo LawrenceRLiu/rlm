@@ -1,12 +1,9 @@
 """Tests for core types."""
 
 from rlm.core.types import (
-    CodeBlock,
     ModelUsageSummary,
     QueryMetadata,
-    REPLResult,
     RLMChatCompletion,
-    RLMIteration,
     RLMMetadata,
     UsageSummary,
     _serialize_value,
@@ -90,73 +87,6 @@ class TestUsageSummary:
         assert summary.model_usage_summaries["gpt-4"].total_calls == 2
 
 
-class TestREPLResult:
-    """Tests for REPLResult."""
-
-    def test_basic_creation(self):
-        result = REPLResult(stdout="output", stderr="", locals={"x": 1})
-        assert result.stdout == "output"
-        assert result.stderr == ""
-        assert result.locals == {"x": 1}
-
-    def test_to_dict(self):
-        result = REPLResult(stdout="hello", stderr="", locals={"num": 42}, execution_time=0.5)
-        d = result.to_dict()
-        assert d["stdout"] == "hello"
-        assert d["locals"]["num"] == 42
-        assert d["execution_time"] == 0.5
-
-    def test_str_representation(self):
-        result = REPLResult(stdout="test", stderr="", locals={})
-        s = str(result)
-        assert "REPLResult" in s
-        assert "stdout=test" in s
-
-
-class TestCodeBlock:
-    """Tests for CodeBlock."""
-
-    def test_to_dict(self):
-        result = REPLResult(stdout="3", stderr="", locals={"x": 3})
-        block = CodeBlock(code="x = 1 + 2", result=result)
-        d = block.to_dict()
-        assert d["code"] == "x = 1 + 2"
-        assert d["result"]["stdout"] == "3"
-
-
-class TestRLMIteration:
-    """Tests for RLMIteration."""
-
-    def test_basic_creation(self):
-        iteration = RLMIteration(prompt="test prompt", response="test response", code_blocks=[])
-        assert iteration.prompt == "test prompt"
-        assert iteration.final_answer is None
-
-    def test_with_final_answer(self):
-        iteration = RLMIteration(
-            prompt="test",
-            response="FINAL(42)",
-            code_blocks=[],
-            final_answer=("FINAL", "42"),
-        )
-        assert iteration.final_answer == ("FINAL", "42")
-
-    def test_to_dict(self):
-        result = REPLResult(stdout="", stderr="", locals={})
-        block = CodeBlock(code="pass", result=result)
-        iteration = RLMIteration(
-            prompt="p",
-            response="r",
-            code_blocks=[block],
-            iteration_time=1.5,
-        )
-        d = iteration.to_dict()
-        assert d["prompt"] == "p"
-        assert d["response"] == "r"
-        assert len(d["code_blocks"]) == 1
-        assert d["iteration_time"] == 1.5
-
-
 class TestRLMChatCompletion:
     """Tests for RLMChatCompletion."""
 
@@ -210,7 +140,7 @@ class TestRLMMetadata:
             max_iterations=10,
             backend="openai",
             backend_kwargs={"api_key": "secret"},
-            environment_type="local",
+            environment_type="docker",
             environment_kwargs={},
         )
         d = meta.to_dict()
