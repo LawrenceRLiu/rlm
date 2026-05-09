@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Literal
 
@@ -212,6 +212,116 @@ class RLMIteration:
             "prompt": self.prompt,
             "response": self.response,
             "code_blocks": [code_block.to_dict() for code_block in self.code_blocks],
+            "final_answer": self.final_answer,
+            "iteration_time": self.iteration_time,
+        }
+
+
+########################################################
+########   Types for Workspace Substrate       #########
+########################################################
+
+# Provenance roles for files in the workspace. ``user`` = pre-existed the run
+# (root task, user-supplied context, parent files visible to a child).
+# ``assistant`` = direct write by a host-side file tool. ``system`` = touched by
+# a script the assistant ran (shell/python). ``child`` = brought back from a
+# child RLM via rlm_query artifact selection.
+ProvenanceRole = Literal["user", "assistant", "system", "child"]
+
+
+@dataclass
+class WorkspaceAction:
+    """A single ``<action>`` element extracted from an LM response."""
+
+    tool: str
+    args: dict[str, Any]
+    body: str | None  # element body (for write_file/python/etc.); None for self-closing
+    raw: str  # original tag-pair fragment, for replay/debugging
+
+    def to_dict(self) -> dict:
+        return {
+            "tool": self.tool,
+            "args": self.args,
+            "body": self.body,
+            "raw": self.raw,
+        }
+
+
+@dataclass
+class WorkspaceObservation:
+    """Result of executing one ``WorkspaceAction``."""
+
+    tool: str
+    stdout: str = ""
+    stderr: str = ""
+    data: dict[str, Any] | None = None
+    artifacts: list[str] = field(default_factory=list)
+    execution_time: float | None = None
+    rlm_calls: list["RLMChatCompletion"] = field(default_factory=list)
+    final_answer: str | None = None
+    final_artifacts: list[str] = field(default_factory=list)
+    error: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "tool": self.tool,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "data": self.data,
+            "artifacts": list(self.artifacts),
+            "execution_time": self.execution_time,
+            "rlm_calls": [c.to_dict() for c in self.rlm_calls],
+            "final_answer": self.final_answer,
+            "final_artifacts": list(self.final_artifacts),
+            "error": self.error,
+        }
+
+
+@dataclass
+class WorkspaceSnapshot:
+    """Per-turn git snapshot of the workspace."""
+
+    turn: int
+    commit_sha: str
+    changed_files: list[str]
+    workspace_root: str
+
+    def to_dict(self) -> dict:
+        return {
+            "turn": self.turn,
+            "commit_sha": self.commit_sha,
+            "changed_files": list(self.changed_files),
+            "workspace_root": self.workspace_root,
+        }
+
+
+@dataclass
+class WorkspaceIteration:
+    """One turn of the workspace RLM loop."""
+
+    iteration: int
+    timestamp: str
+    prompt: list[dict[str, Any]]  # full message history sent to LM
+    response: str  # raw LM response (prose + actions)
+    reasoning: str | None  # backend reasoning channel content, if any
+    parse_attempts: list[dict[str, Any]] = field(default_factory=list)
+    actions: list[WorkspaceAction] = field(default_factory=list)
+    observations: list[WorkspaceObservation] = field(default_factory=list)
+    snapshot: WorkspaceSnapshot | None = None
+    final_answer: str | None = None
+    iteration_time: float | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "iteration": self.iteration,
+            "timestamp": self.timestamp,
+            "prompt": self.prompt,
+            "response": self.response,
+            "reasoning": self.reasoning,
+            "parse_attempts": list(self.parse_attempts),
+            "actions": [a.to_dict() for a in self.actions],
+            "observations": [o.to_dict() for o in self.observations],
+            "snapshot": self.snapshot.to_dict() if self.snapshot else None,
             "final_answer": self.final_answer,
             "iteration_time": self.iteration_time,
         }

@@ -71,3 +71,15 @@ class CancellationError(Exception):
     def __init__(self, partial_answer: str | None = None, message: str | None = None):
         self.partial_answer = partial_answer
         super().__init__(message or "Execution cancelled by user")
+
+
+class ActionParseError(Exception):
+    """Raised when the workspace action parser cannot extract a well-formed,
+    schema-valid <action> from an LM response after exhausting retries.
+
+    ``fragment`` carries the offending input substring for debugging.
+    """
+
+    def __init__(self, message: str, fragment: str | None = None):
+        self.fragment = fragment
+        super().__init__(message)
