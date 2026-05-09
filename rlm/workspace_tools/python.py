@@ -22,24 +22,37 @@ SPEC = ToolSpec(
     body_required=True,
 )
 
-# Wrapper: makes the in-container client helpers available without imports in
-# the user script. The `from rlm_workspace.client import *` line picks up
-# llm_query / llm_query_batched / rlm_query / rlm_query_batched.
+# Wrapper preamble: makes the in-container client helpers available in the
+# script's globals without requiring an explicit import. Sits above the body
+# in the materialised tempfile.
 _WRAPPER_PREAMBLE = (
     "from rlm_workspace.client import llm_query, llm_query_batched, rlm_query, rlm_query_batched\n"
 )
+
+# Tempfile location relative to workspace root. Lives under _rlm_state so it
+# is excluded from provenance diffing (the env's provenance excludes always
+# union in _rlm_state). Kept on disk after exec for debuggability — they
+# disappear when the workspace is cleaned up.
+_TMP_REL_DIR = "_rlm_state/_tmp"
 
 
 def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObservation:
     start = time.perf_counter()
     body = action.body or ""
-    script = _WRAPPER_PREAMBLE + body
+
+    action_id = env.current_action_id or "unknown"
+    rel_tmp = f"{_TMP_REL_DIR}/python_{action_id}.py"
+    tmp_path = env.workspace_root / rel_tmp
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path.write_text(_WRAPPER_PREAMBLE + body, encoding="utf-8")
 
     excludes = env.workspace_config.recursion.copy_on_spawn_excludes
     before = env.snapshot_paths_for_provenance(excludes)
 
+    # Container has the workspace mounted at /workspace; reference the script
+    # via its in-container path.
     result = env.exec_in_container(
-        ["python", "-c", script],
+        ["python", f"/workspace/{rel_tmp}"],
         timeout=env.workspace_config.docker.exec_timeout_seconds,
     )
 

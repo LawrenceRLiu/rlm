@@ -19,16 +19,26 @@ SPEC = ToolSpec(
     body_required=True,
 )
 
+# Tempfile location relative to workspace root. Lives under _rlm_state so it
+# is excluded from provenance diffing.
+_TMP_REL_DIR = "_rlm_state/_tmp"
+
 
 def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObservation:
     start = time.perf_counter()
     body = action.body or ""
 
+    action_id = env.current_action_id or "unknown"
+    rel_tmp = f"{_TMP_REL_DIR}/shell_{action_id}.sh"
+    tmp_path = env.workspace_root / rel_tmp
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path.write_text(body, encoding="utf-8")
+
     excludes = env.workspace_config.recursion.copy_on_spawn_excludes
     before = env.snapshot_paths_for_provenance(excludes)
 
     result = env.exec_in_container(
-        ["bash", "-lc", body],
+        ["bash", f"/workspace/{rel_tmp}"],
         timeout=env.workspace_config.docker.exec_timeout_seconds,
     )
 

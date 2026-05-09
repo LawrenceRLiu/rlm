@@ -134,6 +134,113 @@ def test_shell_action_records_system_provenance(tmp_path: Path) -> None:
         env.cleanup()
 
 
+def test_python_action_runs_and_captures_stdout(tmp_path: Path) -> None:
+    env = _make_env(tmp_path)
+    try:
+        env.setup()
+        env.current_turn = 3
+        action = WorkspaceAction(
+            tool="python",
+            args={},
+            body="import sys\nprint('py-out')\nprint('py-err', file=sys.stderr)\n",
+            raw='<action tool="python">...</action>',
+        )
+        obs = env.run_action(action)
+        assert obs.error is None, (obs.error, obs.stderr)
+        assert "py-out" in obs.stdout
+        assert "py-err" in obs.stderr
+        assert obs.data is not None and obs.data["exit_code"] == 0
+        # The materialised script lives under _rlm_state/_tmp and is excluded
+        # from provenance diffs (so it does NOT appear in changed_paths).
+        script = env.workspace_root / "_rlm_state" / "_tmp" / "python_t3.a1.py"
+        assert script.exists()
+        assert "from rlm_workspace.client import" in script.read_text()
+        assert obs.artifacts == []
+    finally:
+        env.cleanup()
+
+
+def test_python_action_records_system_provenance_for_writes(tmp_path: Path) -> None:
+    env = _make_env(tmp_path)
+    try:
+        env.setup()
+        env.current_turn = 4
+        action = WorkspaceAction(
+            tool="python",
+            args={},
+            body=(
+                "from pathlib import Path\n"
+                "Path('_rlm_notes/py_out.txt').write_text('hi from python')\n"
+            ),
+            raw="",
+        )
+        obs = env.run_action(action)
+        assert obs.error is None, (obs.error, obs.stderr)
+        assert (env.workspace_root / "_rlm_notes" / "py_out.txt").exists()
+        env.provenance.load()
+        prov = env.provenance.get("_rlm_notes/py_out.txt")
+        assert prov is not None
+        assert prov.created.role == "system"
+        assert prov.created.action_id == "t4.a1"
+    finally:
+        env.cleanup()
+
+
+def test_python_action_helpers_preimported(tmp_path: Path) -> None:
+    """The `llm_query` / `rlm_query` helpers must be in the script's globals
+    without needing an explicit import. We don't actually call them here
+    (no LM handler wired); we just verify they resolve as callables."""
+    env = _make_env(tmp_path)
+    try:
+        env.setup()
+        env.current_turn = 5
+        action = WorkspaceAction(
+            tool="python",
+            args={},
+            body=(
+                "for name in ('llm_query', 'llm_query_batched', "
+                "'rlm_query', 'rlm_query_batched'):\n"
+                "    assert callable(globals()[name]), name\n"
+                "print('helpers-ok')\n"
+            ),
+            raw="",
+        )
+        obs = env.run_action(action)
+        assert obs.error is None, (obs.error, obs.stderr)
+        assert "helpers-ok" in obs.stdout
+    finally:
+        env.cleanup()
+
+
+def test_python_action_timeout_enforced(tmp_path: Path) -> None:
+    cfg = WorkspaceConfig(
+        observation=ObservationConfig(max_observation_chars=4_000),
+        docker=DockerConfig(
+            image=IMAGE_TAG,
+            workspace_root_base=str(tmp_path),
+            broker_port=8080,
+            poll_interval_ms=50,
+            exec_timeout_seconds=2,
+            cleanup_mode="delete",
+        ),
+    )
+    env = DockerWorkspaceEnv(workspace_config=cfg)
+    try:
+        env.setup()
+        env.current_turn = 6
+        action = WorkspaceAction(
+            tool="python",
+            args={},
+            body="import time\nfor i in range(20):\n    time.sleep(1)\n",
+            raw="",
+        )
+        obs = env.run_action(action)
+        assert obs.error is not None
+        assert "timeout" in obs.error.lower()
+    finally:
+        env.cleanup()
+
+
 def test_snapshot_produces_commit(tmp_path: Path) -> None:
     env = _make_env(tmp_path)
     try:
