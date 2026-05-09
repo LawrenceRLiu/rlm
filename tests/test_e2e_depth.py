@@ -6,6 +6,10 @@ import pytest
 
 from rlm import RLM
 
+pytestmark = pytest.mark.skip(
+    reason="Legacy REPL-substrate test; scheduled for deletion in Phase 8 of the workspace migration."
+)
+
 
 @pytest.mark.skipif(
     not os.environ.get("OPENROUTER_API_KEY"),

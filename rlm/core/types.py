@@ -119,13 +119,19 @@ class RLMChatCompletion:
     """Record of a single LLM call made from within the environment."""
 
     root_model: str
-    prompt: str | dict[str, Any]
+    # Workspace substrate may pass a list of context chunks (one per
+    # ``_rlm_query_<N>.txt`` slot); legacy REPL-substrate paths used
+    # ``str`` or ``dict[str, Any]``.
+    prompt: str | dict[str, Any] | list[Any]
     response: str
     usage_summary: UsageSummary
     execution_time: float
     metadata: dict | None = (
         None  # Full trajectory (run_metadata + iterations) when logger captures it
     )
+    # Backend reasoning-channel content (e.g., Anthropic extended thinking, OpenAI
+    # reasoning, Gemini thinking). None when the backend does not surface it.
+    reasoning_content: str | None = None
 
     def to_dict(self):
         out = {
@@ -137,6 +143,8 @@ class RLMChatCompletion:
         }
         if self.metadata is not None:
             out["metadata"] = self.metadata
+        if self.reasoning_content is not None:
+            out["reasoning_content"] = self.reasoning_content
         return out
 
     @classmethod
@@ -148,6 +156,7 @@ class RLMChatCompletion:
             usage_summary=UsageSummary.from_dict(data.get("usage_summary")),
             execution_time=data.get("execution_time"),
             metadata=data.get("metadata"),
+            reasoning_content=data.get("reasoning_content"),
         )
 
 

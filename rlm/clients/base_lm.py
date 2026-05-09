@@ -17,6 +17,10 @@ class BaseLM(ABC):
         self.model_name = model_name
         self.timeout = timeout
         self.kwargs = kwargs
+        # Backend reasoning-channel content from the last completion() call,
+        # if the subclass populates it. Defaults to None for backends that
+        # do not surface a separate reasoning channel.
+        self._last_reasoning_content: str | None = None
 
     @abstractmethod
     def completion(self, prompt: str | dict[str, Any]) -> str:
@@ -35,3 +39,14 @@ class BaseLM(ABC):
     def get_last_usage(self) -> ModelUsageSummary:
         """Get the last cost summary of the model."""
         raise NotImplementedError
+
+    def get_last_reasoning_content(self) -> str | None:
+        """Reasoning-channel content from the most recent ``completion()`` call.
+
+        Subclasses that have access to a backend reasoning channel (Anthropic
+        extended thinking, OpenAI reasoning, Gemini thinking, etc.) should
+        store it on ``self._last_reasoning_content`` from inside their
+        ``completion()`` / ``acompletion()`` implementations. Backends without
+        a separate reasoning channel can leave the default of ``None``.
+        """
+        return self._last_reasoning_content

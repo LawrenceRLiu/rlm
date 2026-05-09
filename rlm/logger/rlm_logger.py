@@ -10,7 +10,7 @@ import os
 import uuid
 from datetime import datetime
 
-from rlm.core.types import RLMIteration, RLMMetadata
+from rlm.core.types import RLMIteration, RLMMetadata, WorkspaceIteration
 
 
 class RLMLogger:
@@ -56,8 +56,13 @@ class RLMLogger:
                 json.dump(entry, f)
                 f.write("\n")
 
-    def log(self, iteration: RLMIteration) -> None:
-        """Capture one iteration (and optionally append to file)."""
+    def log(self, iteration: RLMIteration | WorkspaceIteration) -> None:
+        """Capture one iteration (and optionally append to file).
+
+        Accepts either a legacy ``RLMIteration`` (REPL substrate) or the new
+        ``WorkspaceIteration`` (workspace substrate). Both support
+        ``to_dict()``; the schema differs but the logger is content-agnostic.
+        """
         self._iteration_count += 1
         entry = {
             "type": "iteration",
@@ -71,6 +76,10 @@ class RLMLogger:
             with open(self.log_file_path, "a") as f:
                 json.dump(entry, f)
                 f.write("\n")
+
+    def log_iteration(self, iteration: WorkspaceIteration) -> None:
+        """Workspace-substrate alias for ``log()``. See plan Phase 4."""
+        self.log(iteration)
 
     def clear_iterations(self) -> None:
         """Reset iterations for the next completion (trajectory is per completion)."""

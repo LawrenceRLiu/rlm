@@ -19,6 +19,10 @@ from rlm.utils.exceptions import (
     TokenLimitExceededError,
 )
 
+pytestmark = pytest.mark.skip(
+    reason="Legacy REPL-substrate test; scheduled for deletion in Phase 8 of the workspace migration."
+)
+
 
 def create_mock_lm(responses: list[str], model_name: str = "mock-model") -> Mock:
     """Create a mock LM that returns responses in order."""

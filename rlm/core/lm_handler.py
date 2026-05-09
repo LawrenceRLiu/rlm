@@ -69,6 +69,7 @@ class LMRequestHandler(StreamRequestHandler):
         model_usage = client.get_last_usage()
         root_model = request.model or client.model_name
         usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
+        reasoning = client.get_last_reasoning_content()
         return LMResponse.success_response(
             chat_completion=RLMChatCompletion(
                 root_model=root_model,
@@ -76,6 +77,7 @@ class LMRequestHandler(StreamRequestHandler):
                 response=content,
                 usage_summary=usage_summary,
                 execution_time=end_time - start_time,
+                reasoning_content=reasoning,
             )
         )
 
@@ -207,6 +209,16 @@ class LMHandler:
     def completion(self, prompt: str, model: str | None = None) -> str:
         """Direct completion call (for main process use)."""
         return self.get_client(model).completion(prompt)
+
+    def completion_with_reasoning(self, prompt, model: str | None = None) -> tuple[str, str | None]:
+        """Direct completion call returning ``(response, reasoning_content)``.
+
+        ``reasoning_content`` is the backend reasoning channel for the most
+        recent call, or ``None`` if the backend doesn't surface one.
+        """
+        client = self.get_client(model)
+        content = client.completion(prompt)
+        return content, client.get_last_reasoning_content()
 
     def __enter__(self):
         self.start()

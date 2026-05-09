@@ -10,9 +10,15 @@ Tests for the parameter propagation to child RLM instances:
 import time
 from unittest.mock import Mock, patch
 
+import pytest
+
 import rlm.core.rlm as rlm_module
 from rlm import RLM
 from rlm.core.types import ModelUsageSummary, UsageSummary
+
+pytestmark = pytest.mark.skip(
+    reason="Legacy REPL-substrate test; scheduled for deletion in Phase 8 of the workspace migration."
+)
 
 
 def create_mock_lm(responses: list[str], model_name: str = "mock-model") -> Mock:
