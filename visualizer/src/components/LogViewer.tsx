@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button';
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from '@/components/ui/resizable';
 import { StatsCard } from './StatsCard';
 import { TrajectoryPanel } from './TrajectoryPanel';
-import { ExecutionPanel } from './ExecutionPanel';
+import { ActionPanel } from './ActionPanel';
 import { IterationTimeline } from './IterationTimeline';
 import { ThemeToggle } from './ThemeToggle';
 import { RLMLogFile } from '@/lib/types';
@@ -122,8 +122,8 @@ export function LogViewer({ logFile, onBack }: LogViewerProps) {
               variant="cyan"
             />
             <StatsCard
-              label="Code"
-              value={metadata.totalCodeBlocks}
+              label="Actions"
+              value={metadata.totalActions}
               icon="⟨⟩"
               variant="green"
             />
@@ -132,6 +132,12 @@ export function LogViewer({ logFile, onBack }: LogViewerProps) {
               value={metadata.totalSubLMCalls}
               icon="◇"
               variant="magenta"
+            />
+            <StatsCard
+              label="Retries"
+              value={metadata.totalParseRetries}
+              icon="↻"
+              variant={metadata.totalParseRetries > 0 ? 'yellow' : 'cyan'}
             />
             <StatsCard
               label="Exec"
@@ -166,12 +172,10 @@ export function LogViewer({ logFile, onBack }: LogViewerProps) {
 
           <ResizableHandle withHandle className="bg-border hover:bg-primary/30 transition-colors" />
 
-          {/* Right Panel - Code Execution & Sub-LM Calls */}
+          {/* Right Panel - Actions, Snapshot, Meta */}
           <ResizablePanel defaultSize={50} minSize={20} maxSize={80}>
             <div className="h-full bg-background">
-              <ExecutionPanel
-                iteration={iterations[selectedIteration] || null}
-              />
+              <ActionPanel iteration={iterations[selectedIteration] || null} />
             </div>
           </ResizablePanel>
         </ResizablePanelGroup>

@@ -8,7 +8,7 @@ import { FileUploader } from './FileUploader';
 import { LogViewer } from './LogViewer';
 import { AsciiRLM } from './AsciiGlobe';
 import { ThemeToggle } from './ThemeToggle';
-import { parseLogFile, extractContextVariable } from '@/lib/parse-logs';
+import { parseLogFile, extractContextPreview } from '@/lib/parse-logs';
 import { RLMLogFile } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
@@ -44,8 +44,8 @@ export function Dashboard() {
             if (!response.ok) continue;
             const content = await response.text();
             const parsed = parseLogFile(fileName, content);
-            const contextVar = extractContextVariable(parsed.iterations);
-            
+            const contextVar = extractContextPreview(parsed.iterations);
+
             previews.push({
               fileName,
               contextPreview: contextVar,

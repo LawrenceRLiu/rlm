@@ -1,38 +1,78 @@
-// Types matching the RLM log format
+// Types matching the workspace-substrate JSONL log schema.
+// These mirror the Python dataclasses in `rlm/core/types.py`.
+
+export interface ModelUsageSummary {
+  total_calls: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cost?: number | null;
+}
+
+export interface UsageSummary {
+  model_usage_summaries: Record<string, ModelUsageSummary>;
+  total_cost?: number | null;
+}
 
 export interface RLMChatCompletion {
-  prompt: string | Record<string, unknown>;
+  root_model: string;
+  prompt: string | Record<string, unknown> | unknown[];
   response: string;
-  prompt_tokens: number;
-  completion_tokens: number;
+  usage_summary: UsageSummary;
   execution_time: number;
+  metadata?: Record<string, unknown> | null;
+  reasoning_content?: string | null;
 }
 
-export interface REPLResult {
+export type ProvenanceRole = 'user' | 'assistant' | 'system' | 'child';
+
+export interface WorkspaceAction {
+  tool: string;
+  args: Record<string, unknown>;
+  body: string | null;
+  raw: string;
+}
+
+export interface WorkspaceObservation {
+  tool: string;
   stdout: string;
   stderr: string;
-  locals: Record<string, unknown>;
-  execution_time: number;
+  data: Record<string, unknown> | null;
+  artifacts: string[];
+  execution_time: number | null;
   rlm_calls: RLMChatCompletion[];
+  final_answer: string | null;
+  final_artifacts: string[];
+  error: string | null;
 }
 
-export interface CodeBlock {
-  code: string;
-  result: REPLResult;
+export interface WorkspaceSnapshot {
+  turn: number;
+  commit_sha: string;
+  changed_files: string[];
+  workspace_root: string;
 }
 
-export interface RLMIteration {
+export interface ParseAttempt {
+  response: string;
+  error: string;
+}
+
+export interface WorkspaceIteration {
   type?: string;
   iteration: number;
   timestamp: string;
   prompt: Array<{ role: string; content: string }>;
   response: string;
-  code_blocks: CodeBlock[];
-  final_answer: string | [string, string] | null;
+  reasoning: string | null;
+  parse_attempts: ParseAttempt[];
+  actions: WorkspaceAction[];
+  observations: WorkspaceObservation[];
+  snapshot: WorkspaceSnapshot | null;
+  final_answer: string | null;
   iteration_time: number | null;
 }
 
-// Metadata saved at the start of a log file about RLM configuration
+// Run-level metadata persisted in the first JSONL line.
 export interface RLMConfigMetadata {
   root_model: string | null;
   max_depth: number | null;
@@ -44,29 +84,39 @@ export interface RLMConfigMetadata {
   other_backends: string[] | null;
 }
 
-export interface RLMLogFile {
-  fileName: string;
-  filePath: string;
-  iterations: RLMIteration[];
-  metadata: LogMetadata;
-  config: RLMConfigMetadata;
-}
-
 export interface LogMetadata {
   totalIterations: number;
-  totalCodeBlocks: number;
+  totalActions: number;
   totalSubLMCalls: number;
+  totalParseRetries: number;
   contextQuestion: string;
   finalAnswer: string | null;
+  finalArtifacts: string[];
   totalExecutionTime: number;
   hasErrors: boolean;
 }
 
-export function extractFinalAnswer(answer: string | [string, string] | null): string | null {
-  if (!answer) return null;
-  if (Array.isArray(answer)) {
-    return answer[1];
-  }
-  return answer;
+export interface RLMLogFile {
+  fileName: string;
+  filePath: string;
+  iterations: WorkspaceIteration[];
+  metadata: LogMetadata;
+  config: RLMConfigMetadata;
 }
 
+// Pair an action with its corresponding observation (same index).
+export interface ActionObservationPair {
+  index: number;
+  action: WorkspaceAction;
+  observation: WorkspaceObservation | null;
+}
+
+export function pairActionsWithObservations(
+  iteration: WorkspaceIteration,
+): ActionObservationPair[] {
+  return iteration.actions.map((action, idx) => ({
+    index: idx,
+    action,
+    observation: iteration.observations[idx] ?? null,
+  }));
+}

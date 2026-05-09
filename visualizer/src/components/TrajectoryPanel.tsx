@@ -3,10 +3,10 @@
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
-import { RLMIteration, extractFinalAnswer } from '@/lib/types';
+import { WorkspaceIteration } from '@/lib/types';
 
 interface TrajectoryPanelProps {
-  iterations: RLMIteration[];
+  iterations: WorkspaceIteration[];
   selectedIteration: number;
   onSelectIteration: (index: number) => void;
 }
@@ -88,9 +88,9 @@ export function TrajectoryPanel({
           </div>
         </div>
         <div className="flex gap-2">
-          {currentIteration?.code_blocks.length > 0 && (
+          {currentIteration?.actions && currentIteration.actions.length > 0 && (
             <Badge variant="secondary" className="text-[10px]">
-              {currentIteration.code_blocks.length} code
+              {currentIteration.actions.length} action{currentIteration.actions.length !== 1 ? 's' : ''}
             </Badge>
           )}
           {currentIteration?.final_answer && (
@@ -194,8 +194,8 @@ export function TrajectoryPanel({
                   </div>
                 </div>
                 <div className="bg-background/80 rounded-lg p-4 border border-emerald-500/30">
-                  <p className="text-[15px] font-medium text-foreground leading-relaxed">
-                    {extractFinalAnswer(currentIteration.final_answer)}
+                  <p className="text-[15px] font-medium text-foreground leading-relaxed whitespace-pre-wrap">
+                    {currentIteration.final_answer}
                   </p>
                 </div>
               </div>
