@@ -264,12 +264,20 @@ class RLM:
                         pass
 
                 env.current_turn = i + 1
-                iteration = self._completion_turn(
-                    iteration_idx=i + 1,
-                    message_history=message_history,
-                    lm_handler=lm_handler,
-                    env=env,
-                )
+                try:
+                    iteration = self._completion_turn(
+                        iteration_idx=i + 1,
+                        message_history=message_history,
+                        lm_handler=lm_handler,
+                        env=env,
+                    )
+                except ActionParseError as exc:
+                    # _completion_turn attaches a partial iteration so the
+                    # failed turn (with all parse_attempts) is still logged.
+                    partial = getattr(exc, "iteration", None)
+                    if partial is not None and self.logger:
+                        self.logger.log_iteration(partial)
+                    raise
 
                 self._check_iteration_limits(iteration, i, lm_handler)
 
@@ -330,10 +338,32 @@ class RLM:
         iter_start = time.perf_counter()
         timestamp = datetime.now().isoformat()
 
-        response, reasoning, actions, parse_attempts = self._call_lm_with_parse_retry(
-            lm_handler=lm_handler,
-            messages=list(message_history),
-        )
+        try:
+            response, reasoning, actions, parse_attempts = self._call_lm_with_parse_retry(
+                lm_handler=lm_handler,
+                messages=list(message_history),
+            )
+        except ActionParseError as exc:
+            # Build a partial iteration so the failed turn is visible in the
+            # log. The exception's `parse_attempts`/`last_response`/
+            # `last_reasoning` attributes are populated by
+            # `_call_lm_with_parse_retry` before raising.
+            partial = WorkspaceIteration(
+                iteration=iteration_idx,
+                timestamp=timestamp,
+                prompt=list(message_history),
+                response=getattr(exc, "last_response", ""),
+                reasoning=getattr(exc, "last_reasoning", None),
+                parse_attempts=getattr(exc, "parse_attempts", []),
+                actions=[],
+                observations=[],
+                snapshot=None,
+                final_answer=None,
+                iteration_time=time.perf_counter() - iter_start,
+                error=str(exc),
+            )
+            exc.iteration = partial  # type: ignore[attr-defined]
+            raise
 
         observations = self._dispatch_actions(env=env, actions=actions)
         snapshot = env.snapshot(turn=iteration_idx)
@@ -391,6 +421,11 @@ class RLM:
                 )
                 if attempt >= retry_budget:
                     exc.args = (f"Action parse failed after {retry_budget} retries: {exc.args[0]}",)
+                    # Surface the per-attempt history + last raw response so
+                    # `_completion_turn` can build a partial iteration record.
+                    exc.parse_attempts = list(attempts)  # type: ignore[attr-defined]
+                    exc.last_response = response  # type: ignore[attr-defined]
+                    exc.last_reasoning = reasoning  # type: ignore[attr-defined]
                     raise
 
                 feedback = build_parse_retry_message(str(exc), exc.fragment)

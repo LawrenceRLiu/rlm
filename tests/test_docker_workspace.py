@@ -446,6 +446,18 @@ def test_rlm_query_end_to_end_with_mock_lm(tmp_path: Path) -> None:
         assert "Artifact Mapping:" in obs.stdout
         assert "out/result.txt -> _rlm_artifacts/children/child_1_1/out/result.txt" in obs.stdout
 
+        # Child trajectory rides on obs.rlm_calls (visualizer drill-down path).
+        # The full per-turn record is in rlm_calls[0].metadata.iterations.
+        assert len(obs.rlm_calls) == 1
+        child_rc = obs.rlm_calls[0]
+        assert child_rc.metadata is not None
+        assert "iterations" in child_rc.metadata
+        assert len(child_rc.metadata["iterations"]) >= 1
+        # The child emitted write_file then final, so the last iteration carries
+        # the final answer.
+        last = child_rc.metadata["iterations"][-1]
+        assert last["final_answer"] is not None and "I solved it" in last["final_answer"]
+
         # Artifact actually copied into parent.
         parent_artifact = (
             parent_env.workspace_root

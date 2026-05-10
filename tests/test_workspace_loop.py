@@ -253,3 +253,85 @@ class TestActionDispatch:
         observations = rlm._dispatch_actions(env=env, actions=actions)
         assert len(observations) == 1  # broke after final
         assert observations[0].final_answer == "done"
+
+
+# ---------------------------------------------------------------------------
+# Failed iteration is logged when parse retries are exhausted
+# ---------------------------------------------------------------------------
+
+
+class TestFailedIterationLogging:
+    """When parse retries exhaust, the partial iteration must reach the log."""
+
+    def _rlm(self, retries: int = 2) -> RLM:
+        cfg = WorkspaceConfig()
+        cfg.parse.max_action_parse_retries = retries
+        return RLM(
+            backend="openai",
+            backend_kwargs={"model_name": "fake"},
+            workspace_config=cfg,
+        )
+
+    def test_completion_turn_attaches_partial_iteration(self):
+        """`_completion_turn` builds a WorkspaceIteration on parse-fail and
+        attaches it to the raised ActionParseError."""
+        rlm = self._rlm(retries=2)
+        bad = "no actions here"
+        handler = _mock_lm_handler([(bad, None), (bad, None), (bad, "thought")])
+        env = MagicMock()  # never reached — exception fires before dispatch
+
+        with pytest.raises(ActionParseError) as ei:
+            rlm._completion_turn(
+                iteration_idx=7,
+                message_history=[{"role": "user", "content": "x"}],
+                lm_handler=handler,
+                env=env,
+            )
+
+        partial = getattr(ei.value, "iteration", None)
+        assert isinstance(partial, WorkspaceIteration)
+        assert partial.iteration == 7
+        assert partial.error is not None
+        assert "after 2 retries" in partial.error
+        # Initial try + 2 retries = 3 attempts, all logged.
+        assert len(partial.parse_attempts) == 3
+        assert partial.actions == []
+        assert partial.observations == []
+        # Last raw response + reasoning carried through.
+        assert partial.response == bad
+        assert partial.reasoning == "thought"
+        # Env never dispatched.
+        env.run_action.assert_not_called()
+
+    def test_run_loop_logs_partial_then_reraises(self):
+        """`_run_loop` catches the exception, logs the partial iteration via
+        `self.logger.log_iteration`, then re-raises."""
+        from rlm.logger import RLMLogger
+
+        cfg = WorkspaceConfig()
+        cfg.parse.max_action_parse_retries = 1
+        logger = RLMLogger(log_dir=None)
+        rlm = RLM(
+            backend="openai",
+            backend_kwargs={"model_name": "fake"},
+            workspace_config=cfg,
+            logger=logger,
+        )
+
+        bad = "no actions here"
+        handler = _mock_lm_handler([(bad, None), (bad, None)])
+
+        # Stub env: only attribute access during _run_loop pre-amble.
+        env = MagicMock()
+        env.current_turn = 0
+
+        with pytest.raises(ActionParseError):
+            rlm._run_loop(prompt="x", root_prompt=None, lm_handler=handler, env=env)
+
+        traj = logger.get_trajectory()
+        assert traj is not None
+        assert len(traj["iterations"]) == 1
+        logged = traj["iterations"][0]
+        assert logged["error"] is not None
+        assert len(logged["parse_attempts"]) == 2
+        assert logged["actions"] == []

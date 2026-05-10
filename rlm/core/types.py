@@ -253,6 +253,7 @@ class WorkspaceIteration:
     snapshot: WorkspaceSnapshot | None = None
     final_answer: str | None = None
     iteration_time: float | None = None
+    error: str | None = None  # set when this turn aborted (e.g. parse-retry exhausted)
 
     def to_dict(self) -> dict:
         return {
@@ -267,6 +268,7 @@ class WorkspaceIteration:
             "snapshot": self.snapshot.to_dict() if self.snapshot else None,
             "final_answer": self.final_answer,
             "iteration_time": self.iteration_time,
+            "error": self.error,
         }
 
 

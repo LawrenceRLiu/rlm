@@ -13,13 +13,21 @@ export interface UsageSummary {
   total_cost?: number | null;
 }
 
+// Trajectory carried by an RLMChatCompletion.metadata when the completion
+// represents a full RLM run (e.g. an `rlm_query` child). Mirrors the shape
+// returned by `RLMLogger.get_trajectory()` in Python.
+export interface ChildTrajectoryMetadata {
+  run_metadata?: RLMConfigMetadata;
+  iterations?: WorkspaceIteration[];
+}
+
 export interface RLMChatCompletion {
   root_model: string;
   prompt: string | Record<string, unknown> | unknown[];
   response: string;
   usage_summary: UsageSummary;
   execution_time: number;
-  metadata?: Record<string, unknown> | null;
+  metadata?: ChildTrajectoryMetadata | null;
   reasoning_content?: string | null;
 }
 
@@ -70,6 +78,10 @@ export interface WorkspaceIteration {
   snapshot: WorkspaceSnapshot | null;
   final_answer: string | null;
   iteration_time: number | null;
+  // Set when the turn aborted before any actions were dispatched (e.g.
+  // parse-retry exhaustion). When non-null, `actions` and `observations`
+  // are empty and `parse_attempts` carries the failed responses.
+  error?: string | null;
 }
 
 // Run-level metadata persisted in the first JSONL line.

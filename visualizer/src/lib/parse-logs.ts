@@ -66,6 +66,7 @@ export function parseJSONL(content: string): ParsedJSONL {
         snapshot: parsed.snapshot ?? null,
         final_answer: parsed.final_answer ?? null,
         iteration_time: parsed.iteration_time ?? null,
+        error: parsed.error ?? null,
       };
       iterations.push(iter);
     } catch (e) {
@@ -126,6 +127,7 @@ export function computeMetadata(iterations: WorkspaceIteration[]): LogMetadata {
   for (const iter of iterations) {
     totalActions += iter.actions.length;
     totalParseRetries += iter.parse_attempts.length;
+    if (iter.error) hasErrors = true;
 
     if (iter.iteration_time != null) {
       totalExecutionTime += iter.iteration_time;

@@ -10,6 +10,7 @@ import { TrajectoryPanel } from './TrajectoryPanel';
 import { ActionPanel } from './ActionPanel';
 import { IterationTimeline } from './IterationTimeline';
 import { ThemeToggle } from './ThemeToggle';
+import { DrillStackProvider } from './DrillStack';
 import { RLMLogFile } from '@/lib/types';
 
 interface LogViewerProps {
@@ -46,6 +47,7 @@ export function LogViewer({ logFile, onBack }: LogViewerProps) {
   }, [goToPrevious, goToNext, onBack]);
 
   return (
+    <DrillStackProvider rootLabel={logFile.fileName}>
     <div className="h-screen flex flex-col overflow-hidden bg-background">
       {/* Top Bar - Compact header */}
       <header className="border-b border-border bg-card/80 backdrop-blur-sm">
@@ -196,5 +198,6 @@ export function LogViewer({ logFile, onBack }: LogViewerProps) {
         </div>
       </div>
     </div>
+    </DrillStackProvider>
   );
 }

@@ -21,6 +21,12 @@ function getIterationStats(iteration: WorkspaceIteration) {
     if (obs.rlm_calls) totalSubCalls += obs.rlm_calls.length;
   }
 
+  // A turn that aborted before action dispatch (e.g. parse-retry exhausted)
+  // surfaces as `iteration.error`. This must be visible in the timeline even
+  // though there are no observations to drive the per-obs `hasError` above.
+  const failed = iteration.error != null && iteration.error.length > 0;
+  if (failed) hasError = true;
+
   const iterTime = iteration.iteration_time ?? 0;
   const promptText = iteration.prompt.map((m) => m.content).join('');
   const estimatedInputTokens = Math.round(promptText.length / 4);
@@ -33,6 +39,7 @@ function getIterationStats(iteration: WorkspaceIteration) {
     parseRetries: iteration.parse_attempts.length,
     execTime: iterTime,
     hasError,
+    failed,
     hasFinal: iteration.final_answer !== null,
     inputTokens: estimatedInputTokens,
     outputTokens: estimatedOutputTokens,
@@ -129,7 +136,12 @@ export function IterationTimeline({
                           FINAL
                         </Badge>
                       )}
-                      {stats.hasError && (
+                      {stats.failed && (
+                        <Badge variant="destructive" className="text-[9px] px-1 py-0 h-4">
+                          FAILED
+                        </Badge>
+                      )}
+                      {!stats.failed && stats.hasError && (
                         <Badge variant="destructive" className="text-[9px] px-1 py-0 h-4">
                           ERR
                         </Badge>

@@ -12,6 +12,7 @@ import {
 import { cn } from '@/lib/utils';
 import { ActionObservationPair } from '@/lib/types';
 import { CodeWithLineNumbers } from './CodeWithLineNumbers';
+import { useDrillDepth, useDrillStack } from './DrillStack';
 
 interface ActionCardProps {
   pair: ActionObservationPair;
@@ -83,6 +84,14 @@ function formatArgs(args: Record<string, unknown>): string {
 export function ActionCard({ pair }: ActionCardProps) {
   const [isOpen, setIsOpen] = useState(true);
   const { action, observation, index } = pair;
+  const drillStack = useDrillStack();
+  // The depth this card is rendered at: 0 for the root LogViewer, N for
+  // an action inside a frame at depth N. When the user clicks a drill
+  // button, `push(frame, drillDepth)` truncates the stack to the
+  // current depth before adding the new leaf — i.e. opening a sibling
+  // sub-call at the same depth automatically collapses any deeper view
+  // that was open from the previous sibling. One path at a time.
+  const drillDepth = useDrillDepth();
   const style = toolStyle(action.tool);
 
   const hasError = !!observation?.error || !!observation?.stderr;
@@ -273,15 +282,51 @@ export function ActionCard({ pair }: ActionCardProps) {
                           0,
                         )
                       : 0;
+                    // Child trajectories from `rlm_query` carry the per-turn
+                    // record on `metadata.iterations`. `llm_query` calls
+                    // (single LLM round-trip) leave it null/empty.
+                    const childIterations = call.metadata?.iterations ?? [];
+                    const hasChildTrajectory = childIterations.length > 0;
+                    // Build a stable label for the breadcrumb. Prefer the
+                    // child_id stored on the parent observation (set by
+                    // RecursionHandler) and fall back to the model name.
+                    const childIdRaw = observation.data?.child_id;
+                    const childId =
+                      typeof childIdRaw === 'string' ? childIdRaw : `sub-${i + 1}`;
+                    const drillLabel = `${childId} (${call.root_model})`;
+
                     return (
                       <div
                         key={i}
                         className="border border-fuchsia-500/30 dark:border-fuchsia-400/30 rounded-lg p-3 bg-background"
                       >
                         <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
-                          <Badge className="bg-fuchsia-500 text-white dark:bg-fuchsia-400 dark:text-fuchsia-950 text-xs">
-                            sub-call #{i + 1}
-                          </Badge>
+                          <div className="flex items-center gap-2">
+                            <Badge className="bg-fuchsia-500 text-white dark:bg-fuchsia-400 dark:text-fuchsia-950 text-xs">
+                              sub-call #{i + 1}
+                            </Badge>
+                            {hasChildTrajectory && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-[10px] border-fuchsia-500/40 text-fuchsia-600 dark:text-fuchsia-400 hover:bg-fuchsia-500/10"
+                                onClick={() =>
+                                  drillStack.push(
+                                    {
+                                      label: drillLabel,
+                                      iterations: childIterations,
+                                      config: call.metadata?.run_metadata ?? null,
+                                    },
+                                    drillDepth,
+                                  )
+                                }
+                                title="Drill into the child's per-turn trajectory"
+                              >
+                                Open trajectory ({childIterations.length} iter
+                                {childIterations.length !== 1 ? 's' : ''}) ↗
+                              </Button>
+                            )}
+                          </div>
                           <div className="flex gap-2 text-xs text-muted-foreground font-mono">
                             <span>{inputTokens} in</span>
                             <span>•</span>

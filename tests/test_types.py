@@ -6,6 +6,7 @@ from rlm.core.types import (
     RLMChatCompletion,
     RLMMetadata,
     UsageSummary,
+    WorkspaceIteration,
     _serialize_value,
 )
 
@@ -118,6 +119,38 @@ class TestRLMChatCompletion:
         assert d["metadata"] == trajectory
         c2 = RLMChatCompletion.from_dict(d)
         assert c2.metadata == trajectory
+
+
+class TestWorkspaceIteration:
+    """Tests for WorkspaceIteration error field + to_dict shape."""
+
+    def test_error_defaults_to_none_and_serializes(self):
+        it = WorkspaceIteration(
+            iteration=1,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="hi",
+            reasoning=None,
+        )
+        assert it.error is None
+        d = it.to_dict()
+        assert d["error"] is None
+
+    def test_error_field_serializes(self):
+        it = WorkspaceIteration(
+            iteration=2,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="malformed",
+            reasoning=None,
+            parse_attempts=[
+                {"attempt": 1, "response": "x", "error": "no action", "fragment": None}
+            ],
+            error="Action parse failed after 2 retries: no action",
+        )
+        d = it.to_dict()
+        assert d["error"] == "Action parse failed after 2 retries: no action"
+        assert len(d["parse_attempts"]) == 1
 
 
 class TestQueryMetadata:

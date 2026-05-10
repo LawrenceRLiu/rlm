@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 from rlm.core.types import WorkspaceObservation
 from rlm.environments.docker_workspace import DockerWorkspaceEnv
+from rlm.logger import RLMLogger
 
 if TYPE_CHECKING:
     from rlm.core.lm_handler import LMHandler
@@ -181,7 +182,11 @@ class RecursionHandler:
                 max_tokens=self.parent_rlm.max_tokens,
                 max_errors=self.parent_rlm.max_errors,
                 custom_system_prompt=self.parent_rlm.custom_system_prompt,
-                logger=None,
+                # In-memory logger so the child's iterations are exposed via
+                # `result.metadata` (consumed below into the parent's
+                # observation `rlm_calls`). No on-disk JSONL — child trajectory
+                # rides inline in the parent's log.
+                logger=RLMLogger(log_dir=None),
                 verbose=False,
             )
 
@@ -223,11 +228,12 @@ class RecursionHandler:
                 data={
                     "child_id": child_id,
                     "depth": child_rlm.depth,
-                    "iterations": (
-                        result.metadata.get("iterations", []) if result.metadata else []
-                    ),
                     "usage": result.usage_summary.to_dict() if result.usage_summary else {},
                 },
+                # Full child trajectory rides on `result.metadata.iterations`.
+                # Same shape `llm_query` uses, so the visualizer renders both
+                # via `ActionCard`'s "Sub-LM Calls" path without branching.
+                rlm_calls=[result],
                 execution_time=result.execution_time,
             )
         finally:

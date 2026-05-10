@@ -88,6 +88,11 @@ export function ActionPanel({ iteration }: ActionPanelProps) {
               Final
             </Badge>
           )}
+          {iteration.error && (
+            <Badge variant="destructive" className="text-xs">
+              Failed turn
+            </Badge>
+          )}
         </div>
       </div>
 
@@ -116,6 +121,35 @@ export function ActionPanel({ iteration }: ActionPanelProps) {
               <div className="p-4 space-y-4">
                 {pairs.length > 0 ? (
                   pairs.map((p) => <ActionCard key={p.index} pair={p} />)
+                ) : iteration.error ? (
+                  <Card className="border-red-500/40 bg-red-500/5 dark:border-red-400/40 dark:bg-red-400/5">
+                    <CardContent className="p-6">
+                      <div className="flex items-start gap-3 mb-3">
+                        <div className="w-8 h-8 rounded-lg bg-red-500/15 border border-red-500/30 flex items-center justify-center flex-shrink-0">
+                          <span className="text-red-600 dark:text-red-400 text-sm">!</span>
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold text-red-700 dark:text-red-300">
+                            Turn aborted
+                          </p>
+                          <p className="text-xs text-muted-foreground mt-0.5">
+                            The model never produced a parseable action this turn. No
+                            actions were dispatched.
+                          </p>
+                        </div>
+                      </div>
+                      <pre className="code-block p-3 mt-2 overflow-x-auto whitespace-pre-wrap text-xs font-mono text-red-700 dark:text-red-300 border border-red-500/20 rounded bg-background/40">
+                        {iteration.error}
+                      </pre>
+                      {retryCount > 0 && (
+                        <p className="text-[11px] text-muted-foreground mt-3">
+                          {retryCount} parse attempt{retryCount !== 1 ? 's' : ''} captured —
+                          see the <span className="font-mono">Meta</span> tab for the raw
+                          responses.
+                        </p>
+                      )}
+                    </CardContent>
+                  </Card>
                 ) : (
                   <Card className="border-dashed">
                     <CardContent className="p-8 text-center">
