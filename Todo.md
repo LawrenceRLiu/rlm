@@ -15,7 +15,9 @@ Previously we ran a short analysis of RLMs on OOLONG for the more modern models,
     - [ ] Implement the workspace, and test it on a simple RLM task, such as a simple web search task, or a simple coding task, and see if the model can follow
     - [ ] Benchmark 
         - [ ] For coding: SWE-Bench, Terminal Bench, etc 
-            - [ ] Needs composite docker image support, amongst other things. See `./workspace_substrate_arch/dev/benchmark_compatibility_todos.md`
+            - [x] **Terminal-Bench 2.0 / Harbor wired up.** Substrate validation passing on 3 Harbor demo tasks (hello-world, hello-alpine, hello-workdir) end-to-end with gemma-4-31b. Shared composite-image build helper + per-benchmark runner pattern, `pre_cleanup_callback` hook in `RLM.completion()` for grader invocation. See `workspace_substrate_arch/08_benchmark_support.md` (architecture) and `workspace_substrate_arch/dev/terminal_bench_integration.md` (dev doc + validation evidence).
+            - [ ] SWE-Bench. Composite-image helper already supports it (the `eval/common/composite_image.py` API is benchmark-agnostic by design); needs a SWE-Bench-specific runner (repo seeding, image-name `__→_1776_` sanitization, host-side `git diff` extraction, `predictions.jsonl` writer). Gap analysis still current: `workspace_substrate_arch/dev/benchmark_compatibility_todos.md`.
+            - [ ] Composite docker image support. **Done** as part of the Terminal-Bench work — see `eval/common/composite_image.py` + `eval/common/Dockerfile.composite.template`. Split-interpreter design (broker on uv-managed Python 3.11; project python untouched) lets the same helper layer the broker onto any benchmark's base image.
         - [ ] For web search: WebArena, ToDO: find the deep research benchmarks etc. 
         - [ ] For math: AIME 2025 (search disabled), and maybe some other ones 
 

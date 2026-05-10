@@ -1,0 +1,47 @@
+FROM ${BASE_IMAGE}
+
+# --- Broker layer ---------------------------------------------------------
+# Install uv to bootstrap an isolated Python 3.11 for the broker. The base
+# image's project python is left alone so we don't perturb pinned project
+# dependencies.
+RUN if ! command -v curl >/dev/null 2>&1; then \
+        (apt-get update && apt-get install -y --no-install-recommends curl ca-certificates) \
+        || (apk add --no-cache curl ca-certificates) \
+        || true; \
+    fi && \
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Private Python 3.11 venv just for the broker.
+# `--seed` puts pip into the venv so `/opt/broker/bin/pip` exists.
+RUN /root/.local/bin/uv python install 3.11 \
+ && /root/.local/bin/uv venv /opt/broker --python 3.11 --seed \
+ && /opt/broker/bin/pip install --no-cache-dir flask
+
+# Drop the rlm_workspace package on a path importable by every python in the
+# container.
+COPY rlm_workspace /opt/rlm_workspace/rlm_workspace
+ENV PYTHONPATH=/opt/rlm_workspace
+
+# Project python (if any) needs `requests` to call the broker over
+# localhost HTTP. Best-effort: some benchmark base images (e.g. ubuntu:24.04)
+# ship without any python interpreter, in which case the `<action tool="python">`
+# tool is unavailable at runtime — but the `shell` and file tools still work.
+RUN (python -m pip install --no-cache-dir requests 2>/dev/null) \
+ || (python3 -m pip install --no-cache-dir requests 2>/dev/null) \
+ || echo "[composite] no project python with pip found; <action tool=python> will be unavailable"
+
+ENV RLM_BROKER_PORT=8080
+EXPOSE 8080
+
+# Reset any inherited ENTRYPOINT so the broker is PID 1. Some benchmark base
+# images set ENTRYPOINT to start task-specific services (web servers,
+# daemons) — those side-effects are lost here. Tasks that depend on a
+# pre-running entrypoint service are not supported by this composite layer.
+ENTRYPOINT []
+
+# Broker runs as PID 1; the agent's <action tool="shell"> / "python" bodies
+# are dispatched via `docker exec`, so the container's own CMD is the broker.
+# Script-form (not `-m rlm_workspace.broker`) so we skip the package's
+# `__init__.py`, which eager-imports the client side (needs `requests`,
+# which lives in the project python's environment, not the broker venv).
+CMD ["/opt/broker/bin/python", "/opt/rlm_workspace/rlm_workspace/broker.py"]

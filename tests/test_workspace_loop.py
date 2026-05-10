@@ -7,6 +7,7 @@ prompt construction can be exercised in isolation.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -15,6 +16,8 @@ import pytest
 from rlm.core.config import WorkspaceConfig
 from rlm.core.rlm import RLM
 from rlm.core.types import (
+    RLMChatCompletion,
+    UsageSummary,
     WorkspaceAction,
     WorkspaceIteration,
     WorkspaceObservation,
@@ -335,3 +338,228 @@ class TestFailedIterationLogging:
         assert logged["error"] is not None
         assert len(logged["parse_attempts"]) == 2
         assert logged["actions"] == []
+
+
+# ---------------------------------------------------------------------------
+# pre_cleanup_callback wiring
+# ---------------------------------------------------------------------------
+
+
+class TestPreCleanupCallback:
+    """The callback hook runs after the agent loop, before env.cleanup().
+
+    These tests exercise only the wiring in ``RLM.completion`` itself; the
+    underlying container start/stop is mocked out so the test stays in-process.
+    """
+
+    def _stub_completion(self) -> RLMChatCompletion:
+        return RLMChatCompletion(
+            root_model="fake",
+            prompt="x",
+            response="done",
+            usage_summary=UsageSummary(model_usage_summaries={}),
+            execution_time=0.0,
+        )
+
+    def _rlm_with_stubbed_context(
+        self,
+        env: Any,
+        cleanup_calls: list[str],
+    ) -> RLM:
+        """Build an RLM whose ``_spawn_completion_context`` yields ``env`` and
+        whose ``_run_loop`` returns a stub completion. Cleanup is recorded
+        into ``cleanup_calls``.
+        """
+        rlm = RLM(backend="openai", backend_kwargs={"model_name": "fake"})
+
+        @contextmanager
+        def fake_context(prompt):  # noqa: ARG001
+            try:
+                yield (MagicMock(), env)
+            finally:
+                cleanup_calls.append("cleanup")
+
+        rlm._spawn_completion_context = fake_context  # type: ignore[assignment]
+        rlm._wire_recursion = MagicMock()  # type: ignore[assignment]
+        rlm._run_loop = MagicMock(return_value=self._stub_completion())  # type: ignore[assignment]
+        return rlm
+
+    def test_callback_fires_with_env_and_attaches_result(self) -> None:
+        env = MagicMock(name="env")
+        cleanup_calls: list[str] = []
+        rlm = self._rlm_with_stubbed_context(env, cleanup_calls)
+        seen_envs: list[Any] = []
+
+        def grade(e):
+            seen_envs.append(e)
+            return {"exit_code": 0, "passed": True}
+
+        result = rlm.completion("solve me", pre_cleanup_callback=grade)
+
+        assert seen_envs == [env]
+        assert result.pre_cleanup_result == {"exit_code": 0, "passed": True}
+        # Cleanup must have run after callback returned.
+        assert cleanup_calls == ["cleanup"]
+
+    def test_callback_runs_before_cleanup(self) -> None:
+        """Order: callback first, then cleanup."""
+        env = MagicMock(name="env")
+        events: list[str] = []
+        rlm = RLM(backend="openai", backend_kwargs={"model_name": "fake"})
+
+        @contextmanager
+        def fake_context(prompt):  # noqa: ARG001
+            try:
+                yield (MagicMock(), env)
+            finally:
+                events.append("cleanup")
+
+        rlm._spawn_completion_context = fake_context  # type: ignore[assignment]
+        rlm._wire_recursion = MagicMock()  # type: ignore[assignment]
+        rlm._run_loop = MagicMock(return_value=self._stub_completion())  # type: ignore[assignment]
+
+        def grade(_env):
+            events.append("callback")
+            return None
+
+        rlm.completion("x", pre_cleanup_callback=grade)
+        assert events == ["callback", "cleanup"]
+
+    def test_no_callback_means_no_field_set(self) -> None:
+        env = MagicMock(name="env")
+        cleanup_calls: list[str] = []
+        rlm = self._rlm_with_stubbed_context(env, cleanup_calls)
+        result = rlm.completion("x")
+        assert result.pre_cleanup_result is None
+        assert cleanup_calls == ["cleanup"]
+
+    def test_callback_exception_still_runs_cleanup(self) -> None:
+        env = MagicMock(name="env")
+        events: list[str] = []
+        rlm = RLM(backend="openai", backend_kwargs={"model_name": "fake"})
+
+        @contextmanager
+        def fake_context(prompt):  # noqa: ARG001
+            try:
+                yield (MagicMock(), env)
+            finally:
+                events.append("cleanup")
+
+        rlm._spawn_completion_context = fake_context  # type: ignore[assignment]
+        rlm._wire_recursion = MagicMock()  # type: ignore[assignment]
+        rlm._run_loop = MagicMock(return_value=self._stub_completion())  # type: ignore[assignment]
+
+        def grade(_env):
+            events.append("callback")
+            raise RuntimeError("grader blew up")
+
+        with pytest.raises(RuntimeError, match="grader blew up"):
+            rlm.completion("x", pre_cleanup_callback=grade)
+
+        # Cleanup must still have happened.
+        assert events == ["callback", "cleanup"]
+
+    def test_callback_return_serialized_in_to_dict(self) -> None:
+        """pre_cleanup_result is round-tripped through to_dict (used by logger)."""
+        env = MagicMock(name="env")
+        cleanup_calls: list[str] = []
+        rlm = self._rlm_with_stubbed_context(env, cleanup_calls)
+        result = rlm.completion(
+            "x",
+            pre_cleanup_callback=lambda _e: {"exit_code": 0, "stdout": "ok"},
+        )
+        d = result.to_dict()
+        assert d["pre_cleanup_result"] == {"exit_code": 0, "stdout": "ok"}
+
+    def test_callback_fires_on_max_iterations_exhaustion(self) -> None:
+        """When the loop exits via the default-answer fallback (no ``final``
+        action emitted), the callback should still fire — the contract is
+        that any *return* from ``_run_loop`` triggers the callback.
+        """
+        env = MagicMock(name="env")
+        events: list[str] = []
+        rlm = RLM(backend="openai", backend_kwargs={"model_name": "fake"})
+
+        @contextmanager
+        def fake_context(prompt):  # noqa: ARG001
+            try:
+                yield (MagicMock(), env)
+            finally:
+                events.append("cleanup")
+
+        # _run_loop returns a stub completion that simulates the max-iter
+        # fallback path (response carries the LM-generated default answer
+        # rather than a final-action answer; from the callback's POV the
+        # two are indistinguishable, which is the point).
+        fallback = RLMChatCompletion(
+            root_model="fake",
+            prompt="x",
+            response="(default answer after max_iterations)",
+            usage_summary=UsageSummary(model_usage_summaries={}),
+            execution_time=0.0,
+        )
+        rlm._spawn_completion_context = fake_context  # type: ignore[assignment]
+        rlm._wire_recursion = MagicMock()  # type: ignore[assignment]
+        rlm._run_loop = MagicMock(return_value=fallback)  # type: ignore[assignment]
+
+        def grade(_env):
+            events.append("callback")
+            return "graded"
+
+        result = rlm.completion("x", pre_cleanup_callback=grade)
+
+        assert events == ["callback", "cleanup"]
+        assert result.pre_cleanup_result == "graded"
+        assert result.response.startswith("(default answer")
+
+    def test_callback_does_not_fire_when_loop_raises(self) -> None:
+        """If ``_run_loop`` raises (parse-retry exhaustion, cancellation,
+        budget/timeout/error-threshold/token-limit), the callback must NOT
+        fire — we don't grade a crashed agent. Cleanup still runs.
+        """
+        env = MagicMock(name="env")
+        events: list[str] = []
+        rlm = RLM(backend="openai", backend_kwargs={"model_name": "fake"})
+
+        @contextmanager
+        def fake_context(prompt):  # noqa: ARG001
+            try:
+                yield (MagicMock(), env)
+            finally:
+                events.append("cleanup")
+
+        class LoopBlewUp(RuntimeError):
+            pass
+
+        rlm._spawn_completion_context = fake_context  # type: ignore[assignment]
+        rlm._wire_recursion = MagicMock()  # type: ignore[assignment]
+        rlm._run_loop = MagicMock(side_effect=LoopBlewUp("agent crashed"))  # type: ignore[assignment]
+
+        def grade(_env):
+            events.append("callback")  # must not get here
+            return "should-not-be-attached"
+
+        with pytest.raises(LoopBlewUp, match="agent crashed"):
+            rlm.completion("x", pre_cleanup_callback=grade)
+
+        # Callback did NOT fire, cleanup DID.
+        assert events == ["cleanup"]
+
+    def test_callback_not_called_for_recursion_children(self) -> None:
+        """Children spawned via ``RecursionHandler`` go through ``_run_loop``
+        directly, not the public ``completion()`` entry, so the parent's
+        callback wiring is unreachable from a child run. This is a
+        structural property of how recursion is plumbed; we capture it as
+        a regression guard.
+        """
+        # Confirm the public completion() entry is the only place the
+        # callback is invoked, by introspecting the source. (We can't easily
+        # spin up a real recursion subprocess in a unit test without
+        # Docker.)
+        import inspect
+
+        from rlm.core import rlm as rlm_module
+
+        src = inspect.getsource(rlm_module.RLM)
+        # Exactly one invocation of `pre_cleanup_callback` (in `completion`).
+        assert src.count("pre_cleanup_callback(env)") == 1

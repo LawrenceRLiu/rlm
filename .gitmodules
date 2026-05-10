@@ -1,0 +1,3 @@
+[submodule "third_party/harbor"]
+	path = third_party/harbor
+	url = https://github.com/laude-institute/harbor.git

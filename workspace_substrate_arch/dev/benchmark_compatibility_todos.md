@@ -1,4 +1,20 @@
-# Analysis: What's needed to run RLM on SWE-Bench
+# Analysis: What's needed to run RLM on SWE-Bench / Terminal-Bench / AIME
+
+## Status (2026-05-10)
+
+This was an analysis-only doc. Implementation has now started:
+
+| Benchmark | Status | Pointer |
+|---|---|---|
+| **Terminal-Bench 2.0 (Harbor)** | wired up, validated on 3 demo tasks | [`terminal_bench_integration.md`](terminal_bench_integration.md) |
+| SWE-Bench | analysis still current; not built | this doc, SWE-Bench section below |
+| AIME 2025 | not built | this doc, AIME section below |
+
+Architecture overview of the shared benchmark-support layer (composite-image helper, pre-cleanup callback, runner pattern) is in [`../08_benchmark_support.md`](../08_benchmark_support.md).
+
+The Terminal-Bench section of this doc (Gaps T1–T5) was written assuming TB 2.0 / Harbor; that's the version actually built. **All gaps in that section are now closed** — see [`terminal_bench_integration.md`](terminal_bench_integration.md) for the implementation. The SWE-Bench section (Gaps 1–8) is unchanged and remains an open work item.
+
+One factual correction worth flagging for the SWE-Bench plan: the **broker port is `RLM_BROKER_PORT`-configurable** (default 8080), not hard-coded. The composite-image substrate-side change description below was written before this was verified — it doesn't change the design, but `client.py`'s URL construction reads the env var rather than hard-coding `:8080`. Second correction: SWE-Bench's per-instance image tags **sanitize `__` → `_1776_`** (Docker Hub disallows `__` in tag names) — the caller of `build_composite()` must apply this before invoking docker.
 
 ## Context
 
@@ -318,6 +334,14 @@ Aider).
 
 # Terminal-Bench
 
+> **Status: DONE (TB 2.0 / Harbor).** This section's gap analysis is now closed;
+> the integration and validation are documented in
+> [`terminal_bench_integration.md`](terminal_bench_integration.md). What follows
+> is the original analysis for context — gap-by-gap closure notes appear inline
+> below each subsection. The TB 1.x section was written before the
+> TB 1.x → TB 2.0 / Harbor distinction was clear; **Harbor** is what we built
+> against, not the tmux-keystroke 1.x harness.
+
 Terminal-Bench (laude-institute/terminal-bench) is ~80–100 terminal tasks. Each
 task ships as a directory with a `Dockerfile` (defining the environment), an
 `instruction.md` (the goal handed to the agent), and a `tests/` directory plus
@@ -335,6 +359,14 @@ a shell, no other tools needed") is a strict subset of what RLM offers.
 
 ### Gap T1 — Per-task image, same as SWE-Bench (Gap 2) *(blocking)*
 
+> **CLOSED.** Implemented as a shared, benchmark-agnostic helper in
+> `eval/common/composite_image.py` — caller supplies `base_image` and
+> `output_tag`; broker layer (split-interpreter design with uv-managed
+> Python 3.11) is identical for every benchmark. TB-specific caller in
+> `eval/terminal_bench/runner.py` builds the task's base image from its
+> own `environment/Dockerfile`, then calls `build_composite(...)`.
+> Composite Dockerfile template at `eval/common/Dockerfile.composite.template`.
+
 Each Terminal-Bench task has its own `Dockerfile`. Same fix as SWE-Bench:
 build composite images that add the broker to the task's base image, and
 override `DockerConfig.image` per run. The composite-build pipeline is largely
@@ -345,6 +377,12 @@ is hand-rolled. So the composite step is `FROM <task_image> + COPY broker
 + CMD broker` per task. Build is ~5–30s per task; cache aggressively.
 
 ### Gap T2 — Tool surface mismatch *(soft, but worth thinking about)*
+
+> **DECIDED: option A** (leave all tools enabled). For the substrate-validation
+> goal, exercising the full toolbox is what we want. The runner's prompt
+> framing tells the agent the host-side file tools (`read_file`/`write_file`/
+> `edit_file`) operate on `/workspace` and won't reach the task's workdir, so
+> the agent naturally falls back to `shell` for grader-visible work.
 
 Terminal-Bench official harness exposes only a tmux/shell to the agent. The
 RLM substrate also exposes `read_file`, `write_file`, `edit_file`, `python`,
@@ -365,6 +403,16 @@ apples.
 
 ### Gap T3 — Result extraction *(easy)*
 
+> **CLOSED via pre-cleanup callback on `RLM.completion()`.** New parameter
+> `pre_cleanup_callback: Callable[[DockerWorkspaceEnv], Any] | None` fires
+> after the agent loop returns but before `env.cleanup()`. Its return value
+> attaches to the result as `pre_cleanup_result`. The TB runner's grader
+> follows the Harbor-canonical contract: `docker cp tests/` into the live
+> container, `bash /tests/test.sh`, read `/logs/verifier/reward.txt`. Works
+> for both pytest-bootstrap and pure-shell tasks. See `rlm/core/rlm.py`
+> docstring for the callback's full contract (incl. what it does NOT do —
+> e.g. doesn't fire on `_run_loop` exceptions).
+
 Terminal-Bench grades by running the task's `run-tests.sh` *after the agent
 declares done*. So:
 
@@ -380,11 +428,23 @@ the harness call `env.exec_in_container(...)` (already public:
 
 ### Gap T4 — Batch harness (shared with SWE-Bench)
 
+> **CLOSED for TB (single-task / sequential).** `eval/terminal_bench/runner.py`
+> accepts `--tasks <path>...` and runs each sequentially, writing
+> `result.json` per task + an aggregate `summary.jsonl`. No parallelism yet
+> (3-task validation didn't need it). SWE-Bench runner not built.
+
 Same shape: iterate tasks, call `RLM.completion(instruction)`, run grader,
 record pass/fail. Should share most code with the SWE-Bench runner. Lighter
 disk footprint than SWE-Bench (no big repo clones).
 
 ### Gap T5 — Timeout / turn budget tuning
+
+> **CLOSED for the validated tasks.** Runner reads `agent.timeout_sec` and
+> `verifier.timeout_sec` from each `task.toml` and wires them into
+> `DockerConfig.exec_timeout_seconds` + the grader callback's timeout
+> respectively. `max_iterations` is a CLI flag (`--max-iterations`, default 30).
+> The 3 validated tasks ran in ≤11s wall and ≤15 iterations; tuning may be
+> needed for harder TB 2.0 tasks.
 
 Terminal-Bench tasks vary from 30 seconds to ~10 minutes. Default
 `exec_timeout_seconds=300` may need bumping for long-running tasks; default
@@ -392,6 +452,9 @@ Terminal-Bench tasks vary from 30 seconds to ~10 minutes. Default
 tasks.
 
 ## What I'd build, in order
+
+> **DONE for TB 2.0 / Harbor.** All three steps below were built; results in
+> [`terminal_bench_integration.md`](terminal_bench_integration.md).
 
 1. PoC: pick 3 tasks across difficulty tiers, build composite images by
    hand, run RLM, verify graders fire.

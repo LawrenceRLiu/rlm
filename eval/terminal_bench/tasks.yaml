@@ -1,0 +1,21 @@
+# Hand-picked Harbor / Terminal-Bench 2.0 tasks for substrate validation.
+#
+# These are intentionally three "easy" demos that exercise different
+# substrate properties rather than three difficulty tiers:
+#
+#   hello-world    → trivial file write on ubuntu:24.04
+#   hello-alpine   → same task on alpine:3.22 (tests apk fallback in the
+#                    composite Dockerfile's curl install)
+#   hello-workdir  → checks pwd; tests substrate behaviour when the task
+#                    expects a custom workdir (set via task.toml, which our
+#                    runner surfaces in the prompt but the substrate's bind
+#                    mount doesn't honour at the container level)
+#
+# To exercise harder TB 2.0 tasks, point --tasks at paths under
+# https://github.com/laude-institute/terminal-bench-2 (or vendor that repo
+# the same way Harbor is vendored under third_party/).
+
+tasks:
+  - third_party/harbor/examples/tasks/hello-world
+  - third_party/harbor/examples/tasks/hello-alpine
+  - third_party/harbor/examples/tasks/hello-workdir

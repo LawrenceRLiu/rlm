@@ -132,6 +132,10 @@ class RLMChatCompletion:
     # Backend reasoning-channel content (e.g., Anthropic extended thinking, OpenAI
     # reasoning, Gemini thinking). None when the backend does not surface it.
     reasoning_content: str | None = None
+    # Return value of the pre-cleanup callback (if any) passed to
+    # ``RLM.completion``. Arbitrary type — caller-defined. None when no
+    # callback was supplied (or the callback returned None).
+    pre_cleanup_result: Any = None
 
     def to_dict(self):
         out = {
@@ -145,6 +149,8 @@ class RLMChatCompletion:
             out["metadata"] = self.metadata
         if self.reasoning_content is not None:
             out["reasoning_content"] = self.reasoning_content
+        if self.pre_cleanup_result is not None:
+            out["pre_cleanup_result"] = _serialize_value(self.pre_cleanup_result)
         return out
 
     @classmethod
@@ -157,6 +163,7 @@ class RLMChatCompletion:
             execution_time=data.get("execution_time"),
             metadata=data.get("metadata"),
             reasoning_content=data.get("reasoning_content"),
+            pre_cleanup_result=data.get("pre_cleanup_result"),
         )
 
 

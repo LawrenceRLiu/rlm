@@ -188,19 +188,68 @@ class RLM:
         self,
         prompt: str | dict[str, Any] | list[Any],
         root_prompt: str | None = None,
+        pre_cleanup_callback: Callable[[DockerWorkspaceEnv], Any] | None = None,
     ) -> RLMChatCompletion:
         """Run the workspace loop on ``prompt`` until a final answer or a stop
         condition. Returns a single ``RLMChatCompletion`` whose
         ``response`` is the final answer string.
+
+        ``pre_cleanup_callback`` (optional): a one-shot hook that runs after
+        the agent loop returns cleanly, but **before** the container is
+        torn down. It receives the still-live ``DockerWorkspaceEnv`` and its
+        return value is attached to the result as ``pre_cleanup_result``.
+        Use this to run external graders (benchmark harnesses), extract
+        artifacts from the live container, etc.
+
+        When the callback runs (and does not):
+
+        - **Fires** when the loop produces a ``final`` action.
+        - **Fires** when the loop returns after exhausting ``max_iterations``
+          (the default-answer fallback path).
+        - **Does NOT fire** when the loop raises — e.g.,
+          ``ActionParseError`` after retry exhaustion, ``CancellationError``
+          on Ctrl+C, ``BudgetExceededError`` / ``TimeoutExceededError`` /
+          ``ErrorThresholdExceededError`` / ``TokenLimitExceededError``.
+          The container is still torn down (the context manager's
+          ``finally`` runs ``env.cleanup()``), but the grader is skipped.
+          Rationale: a crashed agent's workspace is not in a state we trust
+          to grade. Callers who want exception-time post-processing should
+          wrap their own ``try/finally`` around ``completion()``.
+
+        Limitations of the callback:
+
+        - **One-shot only.** Fires at most once after the loop ends. No
+          per-turn or streaming variant.
+        - **Synchronous.** Cleanup waits on the callback to return.
+          Long-running graders extend container lifetime.
+        - **Not for iterative / oracle-feedback benchmarks.** A protocol of
+          ``agent → grade → agent revises → re-grade`` needs the env to
+          persist across multiple ``completion()`` calls; the callback is
+          the wrong shape for that. (Externalizing env construction would
+          be the right fix; not implemented.)
+        - **Not for post-completion notebook inspection.** Same reason —
+          env is destroyed after callback returns.
+        - **Outer completion only.** Child ``rlm_query`` completions go
+          through ``_run_loop`` directly, not the public ``completion``
+          entry, so the callback is not propagated to them.
+        - **Exception propagation.** A callback exception does not abort
+          cleanup (the container still gets torn down), but the exception
+          propagates to the caller of ``completion`` after cleanup runs.
         """
         with self._spawn_completion_context(prompt) as (lm_handler, env):
             self._wire_recursion(env=env, lm_handler=lm_handler)
-            return self._run_loop(
+            result = self._run_loop(
                 prompt=prompt,
                 root_prompt=root_prompt,
                 lm_handler=lm_handler,
                 env=env,
             )
+            if pre_cleanup_callback is not None:
+                # If this raises, the enclosing context manager's finally
+                # still runs env.cleanup(); the exception then propagates
+                # to the caller (after cleanup has completed).
+                result.pre_cleanup_result = pre_cleanup_callback(env)
+            return result
 
     def _wire_recursion(self, *, env: DockerWorkspaceEnv, lm_handler: LMHandler) -> None:
         """Attach a ``RecursionHandler`` if this RLM is allowed to recurse.

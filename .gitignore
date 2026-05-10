@@ -216,3 +216,7 @@ __marimo__/
 
 
 _setup_runs/
+
+*jsonl
+
+eval/**/results/*
