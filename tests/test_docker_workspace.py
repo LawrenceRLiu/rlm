@@ -684,3 +684,132 @@ def test_python_rlm_query_batched_populates_rlm_calls(tmp_path: Path) -> None:
             env.cleanup()
         finally:
             lm_handler.stop()
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn snapshot SHAs are distinct + ordered
+# ---------------------------------------------------------------------------
+
+
+def test_multi_turn_snapshots_are_distinct_and_ordered(tmp_path: Path) -> None:
+    """Three turns each produce a distinct git commit SHA, and the visible
+    git log lists them parent-chained newest-first."""
+    env = _make_env(tmp_path)
+    try:
+        env.setup()
+        shas: list[str] = []
+        for turn in (1, 2, 3):
+            env.current_turn = turn
+            env.run_action(
+                WorkspaceAction(
+                    tool="write_file",
+                    args={"path": f"_rlm_notes/turn_{turn}.txt"},
+                    body=f"turn {turn} content",
+                    raw="",
+                )
+            )
+            snap = env.snapshot(turn=turn)
+            shas.append(snap.commit_sha)
+
+        # All three SHAs are distinct.
+        assert len(set(shas)) == 3, f"expected 3 distinct SHAs; got {shas}"
+
+        # `git log` newest-first lists "turn 3", "turn 2", "turn 1", "turn 0".
+        log = (
+            subprocess.run(
+                ["git", "-C", str(env.workspace_root), "log", "--format=%s"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            .stdout.strip()
+            .splitlines()
+        )
+        assert log[:4] == ["turn 3", "turn 2", "turn 1", "turn 0"]
+    finally:
+        env.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Max-depth: rlm_query at the depth ceiling returns the loud error
+# ---------------------------------------------------------------------------
+
+
+def test_max_depth_rlm_query_returns_loud_error(tmp_path: Path) -> None:
+    """An ``<action tool="rlm_query">`` emitted from a parent already at
+    ``depth == max_depth`` must produce a structured error observation,
+    not silently spawn a child. ``RecursionHandler`` is intentionally not
+    wired in this scenario; the action falls through to the
+    handler-is-None branch in ``rlm_query.execute``."""
+    env = _make_env(tmp_path, depth=2, max_depth=2)
+    # No recursion handler wired (RLM._wire_recursion would normally do this,
+    # but we skip wiring at depth==max_depth, mirroring production).
+    assert env.recursion_handler is None
+    try:
+        env.setup()
+        env.current_turn = 1
+        action = WorkspaceAction(
+            tool="rlm_query",
+            args={},
+            body="please solve subtask",
+            raw='<action tool="rlm_query">please solve subtask</action>',
+        )
+        obs = env.run_action(action)
+        assert obs.error is not None
+        assert "Maximum recursion depth" in obs.error
+        assert "rlm_query" in obs.error
+    finally:
+        env.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# In-container python helpers reject a `model=` kwarg
+# ---------------------------------------------------------------------------
+
+
+def test_python_llm_query_rejects_model_kwarg(tmp_path: Path) -> None:
+    """The in-container ``llm_query`` helper takes no ``model=`` argument —
+    the model is configured once on the host. Calling
+    ``llm_query("hi", model="x")`` from inside a python action must surface
+    a ``TypeError`` (caught and printed by the script, or visible in stderr
+    with a non-zero exit code).
+
+    This locks in the design-doc invariant from
+    ``workspace_substrate_arch/02_core_architecture.md`` ("no ``model=``
+    argument — the parent's configured model is used everywhere")."""
+    from rlm.core.lm_handler import LMHandler
+    from tests.mock_lm import MockLM
+
+    mock = MockLM(response_fn=lambda p: "echo")
+    lm_handler = LMHandler(mock)
+    lm_handler.start()
+    env = _make_env(tmp_path, lm_handler_address=(lm_handler.host, lm_handler.port))
+    try:
+        env.setup()
+        env.current_turn = 1
+        action = WorkspaceAction(
+            tool="python",
+            args={},
+            body=(
+                "try:\n"
+                "    llm_query('hi', model='gpt-4o')\n"
+                "    print('UNEXPECTED-NO-ERROR')\n"
+                "except TypeError as e:\n"
+                "    print(f'GOT-TYPEERROR: {e}')\n"
+            ),
+            raw="",
+        )
+        obs = env.run_action(action)
+        printed_typeerror = "GOT-TYPEERROR" in obs.stdout
+        stderr_typeerror = (
+            "TypeError" in obs.stderr and obs.data is not None and obs.data.get("exit_code") != 0
+        )
+        assert printed_typeerror or stderr_typeerror, (
+            f"Expected TypeError when calling llm_query(..., model=...); "
+            f"got stdout={obs.stdout!r} stderr={obs.stderr!r}"
+        )
+    finally:
+        try:
+            env.cleanup()
+        finally:
+            lm_handler.stop()

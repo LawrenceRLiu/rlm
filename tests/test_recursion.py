@@ -297,5 +297,208 @@ class TestSpawnViaBrokerBatched:
         assert out["responses"] == ["Error: kaboom", "ok"]
 
 
+# ---------------------------------------------------------------------------
+# Selective artifact export: only paths listed in <artifact path="..."/> copy.
+# ---------------------------------------------------------------------------
+
+
+class TestSelectiveArtifactExport:
+    def _build_handler_with_envs(self, parent_root: Path, child_root: Path):
+        from rlm.core.recursion import RecursionHandler
+
+        cfg = WorkspaceConfig()
+
+        # A minimally-equipped parent env: the parts ``_copy_artifacts_to_parent``
+        # touches are workspace_root, provenance, current_turn.
+        parent_prov = ProvenanceStore(parent_root / "_rlm_state" / "provenance.json")
+        parent_prov.load()
+        parent_env = MagicMock()
+        parent_env.workspace_root = parent_root
+        parent_env.provenance = parent_prov
+        parent_env.current_turn = 1
+
+        child_env = MagicMock()
+        child_env.workspace_root = child_root
+
+        parent_rlm = MagicMock()
+        parent_rlm.workspace_config = cfg
+
+        handler = RecursionHandler(
+            parent_rlm=parent_rlm, parent_env=parent_env, lm_handler=MagicMock()
+        )
+        return handler, parent_env, child_env
+
+    def test_only_listed_artifacts_are_copied(self, tmp_path: Path) -> None:
+        # Set up a child workspace with 5 files, but list only 2 in final_artifacts.
+        parent_root = tmp_path / "parent"
+        (parent_root / "_rlm_state").mkdir(parents=True)
+        child_root = tmp_path / "child"
+        child_root.mkdir()
+        for name in ("a.txt", "b.txt", "c.txt", "d.txt", "e.txt"):
+            (child_root / name).write_text(name, encoding="utf-8")
+
+        handler, parent_env, child_env = self._build_handler_with_envs(parent_root, child_root)
+
+        mapping = handler._copy_artifacts_to_parent(
+            child_env=child_env,
+            child_id="child_1_1",
+            final_artifacts=["a.txt", "c.txt"],
+            action_id="t1.a1",
+        )
+        # Only the two listed files were copied.
+        dest_root = parent_root / "_rlm_artifacts" / "children" / "child_1_1"
+        assert (dest_root / "a.txt").exists()
+        assert (dest_root / "c.txt").exists()
+        for skipped in ("b.txt", "d.txt", "e.txt"):
+            assert not (dest_root / skipped).exists()
+        # Mapping reflects only what was copied.
+        assert set(mapping.keys()) == {"a.txt", "c.txt"}
+        # Provenance for copied artifacts is role=child.
+        for child_rel in ("a.txt", "c.txt"):
+            prov = parent_env.provenance.get(f"_rlm_artifacts/children/child_1_1/{child_rel}")
+            assert prov is not None and prov.created.role == "child"
+
+    def test_nonexistent_artifact_silently_skipped(self, tmp_path: Path) -> None:
+        parent_root = tmp_path / "parent"
+        (parent_root / "_rlm_state").mkdir(parents=True)
+        child_root = tmp_path / "child"
+        child_root.mkdir()
+        (child_root / "real.txt").write_text("hello", encoding="utf-8")
+
+        handler, parent_env, child_env = self._build_handler_with_envs(parent_root, child_root)
+        mapping = handler._copy_artifacts_to_parent(
+            child_env=child_env,
+            child_id="child_1_1",
+            final_artifacts=["real.txt", "ghost.txt"],
+            action_id=None,
+        )
+        # Real file copied; ghost silently skipped (no exception).
+        assert "real.txt" in mapping
+        assert "ghost.txt" not in mapping
+
+    def test_path_traversal_in_artifact_blocked(self, tmp_path: Path) -> None:
+        """An artifact path that escapes the child workspace is silently
+        skipped — defense in depth against a misbehaving model."""
+        parent_root = tmp_path / "parent"
+        (parent_root / "_rlm_state").mkdir(parents=True)
+        child_root = tmp_path / "child"
+        child_root.mkdir()
+        # File outside the child workspace.
+        (tmp_path / "outside.txt").write_text("secret", encoding="utf-8")
+
+        handler, _, child_env = self._build_handler_with_envs(parent_root, child_root)
+        mapping = handler._copy_artifacts_to_parent(
+            child_env=child_env,
+            child_id="child_1_1",
+            final_artifacts=["../outside.txt"],
+            action_id=None,
+        )
+        assert mapping == {}
+        assert (
+            not (parent_root / "_rlm_artifacts" / "children" / "child_1_1").exists()
+            or not (
+                parent_root / "_rlm_artifacts" / "children" / "child_1_1" / "outside.txt"
+            ).exists()
+        )
+
+
+# ---------------------------------------------------------------------------
+# Path-mapping observation: 0 / 1 / N artifact variants
+# ---------------------------------------------------------------------------
+
+
+class TestPathMappingMatrix:
+    def test_zero_artifacts(self):
+        from rlm.core.recursion import _format_path_mapping_observation
+
+        out = _format_path_mapping_observation(child_answer="done", mapping={})
+        assert "Answer: done" in out
+        assert "no artifacts" in out
+        assert "Artifact Mapping" not in out
+
+    def test_one_artifact(self):
+        from rlm.core.recursion import _format_path_mapping_observation
+
+        out = _format_path_mapping_observation(
+            child_answer="done", mapping={"x.txt": "_rlm_artifacts/children/c1/x.txt"}
+        )
+        assert "Artifact Mapping:" in out
+        assert "- x.txt -> _rlm_artifacts/children/c1/x.txt" in out
+
+    def test_many_artifacts_preserve_order(self):
+        from rlm.core.recursion import _format_path_mapping_observation
+
+        # Python 3.7+ dicts preserve insertion order; the formatter iterates
+        # the dict directly, so the output reflects that order.
+        mapping = {f"f{i}.txt": f"_rlm_artifacts/children/c1/f{i}.txt" for i in range(5)}
+        out = _format_path_mapping_observation(child_answer="ok", mapping=mapping)
+        # Each artifact appears, in the order we inserted them.
+        idx = 0
+        for i in range(5):
+            line = f"- f{i}.txt -> _rlm_artifacts/children/c1/f{i}.txt"
+            new_idx = out.find(line, idx)
+            assert new_idx != -1, f"missing line for f{i}: {out!r}"
+            idx = new_idx
+
+
+# ---------------------------------------------------------------------------
+# spawn_via_broker_batched: max_concurrent_subcalls cap
+# ---------------------------------------------------------------------------
+
+
+class TestBatchedConcurrencyCap:
+    def test_concurrent_workers_bounded_by_config(self):
+        """Even with N tasks, no more than ``max_concurrent_subcalls`` run
+        in parallel."""
+        import threading
+        import time as _time
+
+        from rlm.core.recursion import RecursionHandler
+        from rlm.core.types import WorkspaceObservation
+
+        cfg = WorkspaceConfig(recursion=RecursionConfig(max_concurrent_subcalls=2))
+        parent_rlm = MagicMock()
+        parent_rlm.workspace_config = cfg
+        handler = RecursionHandler(
+            parent_rlm=parent_rlm, parent_env=MagicMock(), lm_handler=MagicMock()
+        )
+
+        in_flight = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def slow_spawn(child_task: str, action_id):
+            nonlocal in_flight, peak
+            with lock:
+                in_flight += 1
+                peak = max(peak, in_flight)
+            try:
+                _time.sleep(0.05)
+                return WorkspaceObservation(tool="rlm_query", stdout=f"a:{child_task}")
+            finally:
+                with lock:
+                    in_flight -= 1
+
+        handler.spawn = MagicMock(side_effect=slow_spawn)  # type: ignore[method-assign]
+        out = handler.spawn_via_broker_batched(
+            child_tasks=[f"t{i}" for i in range(8)], action_id=None
+        )
+        assert len(out["responses"]) == 8
+        # Peak concurrency must not exceed the configured cap.
+        assert peak <= 2, f"peak concurrency {peak} exceeded cap 2"
+
+    def test_batched_zero_tasks_is_empty_response(self):
+        from rlm.core.recursion import RecursionHandler
+
+        cfg = WorkspaceConfig()
+        parent_rlm = MagicMock()
+        parent_rlm.workspace_config = cfg
+        handler = RecursionHandler(
+            parent_rlm=parent_rlm, parent_env=MagicMock(), lm_handler=MagicMock()
+        )
+        out = handler.spawn_via_broker_batched(child_tasks=[], action_id=None)
+        assert out == {"responses": []}
+
+
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])

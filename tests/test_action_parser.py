@@ -183,3 +183,76 @@ def test_parse_final_body_missing_answer_raises():
 def test_parse_final_body_artifact_missing_path_raises():
     with pytest.raises(ActionParseError):
         parse_final_body("<answer>ok</answer><artifact />")
+
+
+# ---------------------------------------------------------------------------
+# Additional edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_self_closing_and_paired_preserve_order():
+    """A response with a self-closing then paired then self-closing keeps order."""
+    text = (
+        '<action tool="list_directory" />\n'
+        '<action tool="write_file" path="a.txt">hello</action>\n'
+        '<action tool="read_file" path="a.txt" />'
+    )
+    actions = parse(text)
+    assert [a.tool for a in actions] == ["list_directory", "write_file", "read_file"]
+    assert actions[1].body == "hello"
+
+
+def test_adjacent_actions_with_no_whitespace_between():
+    """Two actions back-to-back with no separator must both parse."""
+    text = '<action tool="list_directory" /><action tool="read_file" path="x.txt" />'
+    actions = parse(text)
+    assert len(actions) == 2
+    assert actions[0].tool == "list_directory"
+    assert actions[1].args["path"] == "x.txt"
+
+
+def test_stray_close_tag_inside_body_closes_outer():
+    """The parser is a tag-pair scanner that depth-counts nested *openings*,
+    not closings. A stray ``</action>`` inside a body (e.g. inside a code
+    string literal) will therefore close the outer action prematurely; this
+    is the documented behavior. Lock it in so a future "fix" doesn't silently
+    change semantics for already-trained agents.
+    """
+    # Body literally contains "</action>" — outer should close at the first
+    # one, leaving "leftover</action>" as a parse-failure tail.
+    text = '<action tool="shell">echo "</action>" leftover</action>'
+    actions = parse(text)
+    # First action's body ends at the first </action>; the rest is unparsed
+    # text after it, which contains no further valid <action> openings, so
+    # parse() returns the single first action. The trailing "leftover</action>"
+    # is harmless prose to the scanner.
+    assert len(actions) == 1
+    assert actions[0].body == 'echo "'
+
+
+def test_edit_file_allow_multiple_attribute_parses():
+    """The optional ``allow_multiple`` attribute on edit_file is recognized."""
+    body = "<search>x</search><replace>y</replace>"
+    text = f'<action tool="edit_file" path="a.py" allow_multiple="true">{body}</action>'
+    actions = parse(text)
+    assert actions[0].args == {"path": "a.py", "allow_multiple": "true"}
+    s, r = parse_edit_file_body(actions[0].body)
+    assert s == "x" and r == "y"
+
+
+def test_single_quoted_attribute_values_not_supported():
+    """The attribute regex only matches double-quoted values. Single-quoted
+    values yield a missing-required-attribute error. This locks in current
+    behavior; if support is added later, change this test deliberately."""
+    text = "<action tool='list_directory' />"
+    # Whole tag is unrecognized because the `tool` attr did not parse.
+    with pytest.raises(ActionParseError):
+        parse(text)
+
+
+def test_action_tag_is_case_insensitive():
+    """``<ACTION>``/``<Action>`` are accepted (the open regex is IGNORECASE)."""
+    text = '<ACTION tool="list_directory" />'
+    actions = parse(text)
+    assert len(actions) == 1
+    assert actions[0].tool == "list_directory"
