@@ -91,6 +91,12 @@ class RecursionHandler:
     def spawn_via_broker(self, child_task: str, action_id: str | None) -> dict[str, Any]:
         """In-container ``rlm_query`` helper entry. Returns broker response payload."""
         obs = self.spawn(child_task=child_task, action_id=action_id)
+        # Surface the child trajectory(ies) — already on ``obs.rlm_calls`` from
+        # ``_spawn_one`` — into the parent env's ledger so the python tool's
+        # observation can include them. The XML rlm_query path sets
+        # ``rlm_calls`` directly on its observation; this is the equivalent
+        # for the python-action / broker path.
+        self.parent_env._append_broker_ledger(action_id, list(obs.rlm_calls))
         if obs.error:
             return {"error": obs.error}
         return {"response": obs.stdout}
@@ -101,6 +107,7 @@ class RecursionHandler:
         """In-container ``rlm_query_batched`` helper. Bounded thread pool."""
         max_concurrent = self.parent_rlm.workspace_config.recursion.max_concurrent_subcalls
         responses: list[str] = [""] * len(child_tasks)
+        chat_completions: list = []
         with ThreadPoolExecutor(max_workers=max(1, max_concurrent)) as ex:
             future_to_idx = {
                 ex.submit(self.spawn, task, action_id): idx for idx, task in enumerate(child_tasks)
@@ -113,6 +120,8 @@ class RecursionHandler:
                     responses[idx] = f"Error: Recursion spawn failed: {exc}"
                     continue
                 responses[idx] = f"Error: {obs.error}" if obs.error else obs.stdout
+                chat_completions.extend(obs.rlm_calls)
+        self.parent_env._append_broker_ledger(action_id, chat_completions)
         return {"responses": responses}
 
     # ------------------------------------------------------------------

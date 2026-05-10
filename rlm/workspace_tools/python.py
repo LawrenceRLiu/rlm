@@ -64,12 +64,18 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
     for path in removed:
         env.provenance.remove(path)
 
+    # Drain any RLMChatCompletions that broker workers captured while this
+    # action's script was running (one-per ``llm_query`` / ``rlm_query``,
+    # N-per ``*_batched``). Thread-safe pop; safe-no-op if action_id is None.
+    captured_calls = env.drain_broker_ledger(env.current_action_id)
+
     obs = WorkspaceObservation(
         tool=SPEC.name,
         stdout=result.stdout,
         stderr=result.stderr,
         data={"exit_code": result.exit_code, "changed_paths": changed, "removed_paths": removed},
         artifacts=changed,
+        rlm_calls=captured_calls,
         execution_time=time.perf_counter() - start,
     )
     if result.timed_out:

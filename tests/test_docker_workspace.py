@@ -481,3 +481,206 @@ def test_rlm_query_end_to_end_with_mock_lm(tmp_path: Path) -> None:
             parent_env.cleanup()
         finally:
             lm_handler.stop()
+
+
+# ---------------------------------------------------------------------------
+# Visibility: broker calls from inside a python action populate
+# ``observation.rlm_calls``. Closes the gap documented in Todo.md
+# "Visibility follow-ups (2026-05-09)".
+# ---------------------------------------------------------------------------
+
+
+def _wire_recursion_handler(parent_env: DockerWorkspaceEnv, lm_handler) -> None:
+    """Build a stub parent RLM and attach a RecursionHandler to ``parent_env``.
+
+    Mirrors the pattern in ``test_rlm_query_end_to_end_with_mock_lm``: the
+    parent RLM's completion path is never invoked (the LM call originates
+    from the child via the shared lm_handler), so ``backend="openai"`` /
+    ``model_name="fake"`` is fine.
+    """
+    from rlm.core.recursion import RecursionHandler
+    from rlm.core.rlm import RLM
+
+    parent_rlm = RLM(
+        backend="openai",
+        backend_kwargs={"model_name": "fake"},
+        workspace_config=parent_env.workspace_config,
+        depth=0,
+        max_depth=2,
+        max_iterations=3,
+    )
+    parent_env.recursion_handler = RecursionHandler(
+        parent_rlm=parent_rlm, parent_env=parent_env, lm_handler=lm_handler
+    )
+
+
+def test_python_llm_query_populates_rlm_calls(tmp_path: Path) -> None:
+    """A ``llm_query`` from inside a python action surfaces its
+    RLMChatCompletion in ``obs.rlm_calls`` (visualizer drill-down)."""
+    from rlm.core.lm_handler import LMHandler
+    from tests.mock_lm import MockLM
+
+    mock = MockLM(response_fn=lambda p: f"resp:{p}" if isinstance(p, str) else "resp:?")
+    lm_handler = LMHandler(mock)
+    lm_handler.start()
+
+    env = _make_env(tmp_path, lm_handler_address=(lm_handler.host, lm_handler.port))
+    try:
+        env.setup()
+        env.current_turn = 1
+        action = WorkspaceAction(
+            tool="python",
+            args={},
+            body=("r = llm_query('hello')\nprint(r)\n"),
+            raw="",
+        )
+        obs = env.run_action(action)
+        assert obs.error is None, (obs.error, obs.stderr)
+        assert "resp:hello" in obs.stdout
+        assert len(obs.rlm_calls) == 1
+        assert obs.rlm_calls[0].response == "resp:hello"
+        assert obs.rlm_calls[0].prompt == "hello"
+        # Drained — repeat call must return empty.
+        assert env.drain_broker_ledger("t1.a1") == []
+    finally:
+        try:
+            env.cleanup()
+        finally:
+            lm_handler.stop()
+
+
+def test_python_llm_query_batched_populates_rlm_calls(tmp_path: Path) -> None:
+    """A ``llm_query_batched`` from inside python surfaces N
+    RLMChatCompletions in ``obs.rlm_calls`` in input order."""
+    from rlm.core.lm_handler import LMHandler
+    from tests.mock_lm import MockLM
+
+    # response_fn (not a static list) because _handle_batched fires
+    # acompletions concurrently via asyncio.gather — list-pop ordering
+    # is not deterministic under concurrency.
+    mock = MockLM(response_fn=lambda p: f"resp:{p}" if isinstance(p, str) else "resp:?")
+    lm_handler = LMHandler(mock)
+    lm_handler.start()
+
+    env = _make_env(tmp_path, lm_handler_address=(lm_handler.host, lm_handler.port))
+    try:
+        env.setup()
+        env.current_turn = 1
+        action = WorkspaceAction(
+            tool="python",
+            args={},
+            body=("rs = llm_query_batched(['a','b','c'])\nprint('|'.join(rs))\n"),
+            raw="",
+        )
+        obs = env.run_action(action)
+        assert obs.error is None, (obs.error, obs.stderr)
+        assert "resp:a|resp:b|resp:c" in obs.stdout
+        assert len(obs.rlm_calls) == 3
+        responses = [rc.response for rc in obs.rlm_calls]
+        prompts = [rc.prompt for rc in obs.rlm_calls]
+        # Order matches input prompts because _handle_batched zips
+        # responses back with request.prompts (lm_handler.py:116).
+        assert prompts == ["a", "b", "c"]
+        assert responses == ["resp:a", "resp:b", "resp:c"]
+    finally:
+        try:
+            env.cleanup()
+        finally:
+            lm_handler.stop()
+
+
+def test_python_rlm_query_populates_rlm_calls_with_iterations(tmp_path: Path) -> None:
+    """A ``rlm_query`` from inside python surfaces the child's full
+    trajectory (``metadata.iterations``) in ``obs.rlm_calls[0]``."""
+    from rlm.core.lm_handler import LMHandler
+    from tests.mock_lm import MockLM
+
+    child_response = '<action tool="final"><answer>solved-it</answer></action>'
+    mock = MockLM(responses=[child_response])
+    lm_handler = LMHandler(mock)
+    lm_handler.start()
+
+    env = _make_env(tmp_path, lm_handler_address=(lm_handler.host, lm_handler.port))
+    try:
+        env.setup()
+        env.current_turn = 1
+        _wire_recursion_handler(env, lm_handler)
+        action = WorkspaceAction(
+            tool="python",
+            args={},
+            body=("r = rlm_query('subtask')\nprint(r)\n"),
+            raw="",
+        )
+        obs = env.run_action(action)
+        assert obs.error is None, (obs.error, obs.stderr)
+        assert "solved-it" in obs.stdout  # path-mapping observation flowed back
+        assert len(obs.rlm_calls) == 1
+        rc = obs.rlm_calls[0]
+        assert rc.metadata is not None and "iterations" in rc.metadata
+        assert len(rc.metadata["iterations"]) >= 1
+        last = rc.metadata["iterations"][-1]
+        assert last["final_answer"] is not None and "solved-it" in last["final_answer"]
+    finally:
+        try:
+            env.cleanup()
+        finally:
+            lm_handler.stop()
+
+
+def test_python_rlm_query_batched_populates_rlm_calls(tmp_path: Path) -> None:
+    """The headline case from Todo.md: ``rlm_query_batched`` from inside a
+    python action surfaces one RLMChatCompletion per child in
+    ``obs.rlm_calls``, each carrying populated ``metadata.iterations``.
+
+    Note: each child's first prompt to the LM is the standard
+    "begin by reading _rlm_query_0.txt" message — the task body itself
+    (``rlm_query_batched(["TASK_A", ...])``) lives in the child's workspace
+    file, not in the prompt. So we cannot deterministically map mock
+    responses to specific children. Asserting count + structure is what
+    proves the visibility plumbing without a multi-turn child trajectory."""
+    from rlm.core.lm_handler import LMHandler
+    from tests.mock_lm import MockLM
+
+    def respond(prompt):  # noqa: ARG001 — same response per child
+        return '<action tool="final"><answer>child-done</answer></action>'
+
+    mock = MockLM(response_fn=respond)
+    lm_handler = LMHandler(mock)
+    lm_handler.start()
+
+    env = _make_env(tmp_path, lm_handler_address=(lm_handler.host, lm_handler.port))
+    try:
+        env.setup()
+        env.current_turn = 1
+        _wire_recursion_handler(env, lm_handler)
+        action = WorkspaceAction(
+            tool="python",
+            args={},
+            body=(
+                "rs = rlm_query_batched(['task-1', 'task-2'])\n"
+                "print('count=' + str(len(rs)))\n"
+                "for r in rs:\n    print('---')\n    print(r)\n"
+            ),
+            raw="",
+        )
+        obs = env.run_action(action)
+        assert obs.error is None, (obs.error, obs.stderr)
+        assert "count=2" in obs.stdout
+        # Both children's answers flow back through the python tool's stdout
+        # via the path-mapping observations.
+        assert obs.stdout.count("child-done") == 2
+        # Visibility plumbing: one RLMChatCompletion per child, each with a
+        # populated trajectory.
+        assert len(obs.rlm_calls) == 2
+        for rc in obs.rlm_calls:
+            assert rc.metadata is not None and "iterations" in rc.metadata
+            assert len(rc.metadata["iterations"]) >= 1
+            last = rc.metadata["iterations"][-1]
+            assert last["final_answer"] == "child-done"
+        # Drained — repeat call must return empty.
+        assert env.drain_broker_ledger("t1.a1") == []
+    finally:
+        try:
+            env.cleanup()
+        finally:
+            lm_handler.stop()

@@ -42,7 +42,12 @@ import requests
 
 from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
 from rlm.core.config import WorkspaceConfig
-from rlm.core.types import WorkspaceAction, WorkspaceObservation, WorkspaceSnapshot
+from rlm.core.types import (
+    RLMChatCompletion,
+    WorkspaceAction,
+    WorkspaceObservation,
+    WorkspaceSnapshot,
+)
 from rlm.environments.base_workspace import BaseWorkspaceEnv
 from rlm.utils.provenance import ProvenanceStore, diff_snapshots, snapshot_paths
 from rlm.workspace_tools import get_executor, get_spec
@@ -106,6 +111,14 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
         self._poller_thread: threading.Thread | None = None
         self._poller_stop = threading.Event()
         self._action_seq_per_turn: dict[int, int] = {}
+
+        # Per-action ledger: broker-worker threads append produced
+        # RLMChatCompletions here keyed by ``current_action_id``; the python
+        # tool drains the entry after ``exec_in_container`` returns and
+        # surfaces the list in ``observation.rlm_calls``. See plan in
+        # ``read-the-visibility-followup-sunny-hopper.md``.
+        self._broker_ledger: dict[str, list[RLMChatCompletion]] = {}
+        self._broker_ledger_lock = threading.Lock()
 
         self._action_log_path = self.workspace_root / RESERVED_STATE_DIR / "action_log.jsonl"
         self._manifest_path = self.workspace_root / RESERVED_STATE_DIR / "workspace_manifest.json"
@@ -303,15 +316,20 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
     def _handle_broker_request(self, req: dict[str, Any]) -> None:
         req_id = req.get("id")
         kind = req.get("kind")
+        # Snapshot at handler entry: the python action's ``current_action_id``
+        # is fixed while ``exec_in_container`` blocks, but snapshotting here is
+        # robust to future refactors and is what guarantees per-action ledger
+        # keying for the broker workers spawned by the poller.
+        action_id = self.current_action_id
         try:
             if kind == "llm_query":
-                response = self._do_llm_query(req["prompt"])
+                response = self._do_llm_query(req["prompt"], action_id=action_id)
             elif kind == "llm_query_batched":
-                response = self._do_llm_query_batched(req["prompts"])
+                response = self._do_llm_query_batched(req["prompts"], action_id=action_id)
             elif kind == "rlm_query":
-                response = self._do_rlm_query(req["prompt"])
+                response = self._do_rlm_query(req["prompt"], action_id=action_id)
             elif kind == "rlm_query_batched":
-                response = self._do_rlm_query_batched(req["prompts"])
+                response = self._do_rlm_query_batched(req["prompts"], action_id=action_id)
             else:
                 response = {"error": f"Unknown broker kind: {kind!r}"}
         except Exception as e:
@@ -319,45 +337,74 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
             response = {"error": f"Host-side handler raised: {e}"}
         self._respond_to_broker(req_id, response)
 
-    def _do_llm_query(self, prompt: str) -> dict[str, Any]:
+    def _do_llm_query(self, prompt: str, *, action_id: str | None) -> dict[str, Any]:
         if self.lm_handler_address is None:
             return {"error": "No LM handler configured"}
         request = LMRequest(prompt=prompt, depth=self.depth)
         resp = send_lm_request(self.lm_handler_address, request)
         if not resp.success or resp.chat_completion is None:
             return {"error": resp.error or "LM call failed"}
+        # Append BEFORE responding to broker — ordering invariant: the
+        # in-container client unblocks only after ``_respond_to_broker``,
+        # so the python tool's drain always sees this entry.
+        self._append_broker_ledger(action_id, [resp.chat_completion])
         return {"response": resp.chat_completion.response}
 
-    def _do_llm_query_batched(self, prompts: list[str]) -> dict[str, Any]:
+    def _do_llm_query_batched(self, prompts: list[str], *, action_id: str | None) -> dict[str, Any]:
         if self.lm_handler_address is None:
             return {"error": "No LM handler configured"}
         # Widen for the invariant ``list[str | dict[str, Any]]`` parameter.
         widened: list[str | dict[str, Any]] = list(prompts)
         responses = send_lm_request_batched(self.lm_handler_address, widened, depth=self.depth)
         out: list[str] = []
+        completions: list[RLMChatCompletion] = []
         for resp in responses:
             if not resp.success or resp.chat_completion is None:
                 out.append(f"Error: {resp.error or 'LM call failed'}")
             else:
                 out.append(resp.chat_completion.response)
+                completions.append(resp.chat_completion)
+        self._append_broker_ledger(action_id, completions)
         return {"responses": out}
 
-    def _do_rlm_query(self, prompt: str) -> dict[str, Any]:
+    def _do_rlm_query(self, prompt: str, *, action_id: str | None) -> dict[str, Any]:
         if self.recursion_handler is None:
             return {
                 "error": ("Maximum recursion depth reached. The 'rlm_query' tool is unavailable.")
             }
-        return self.recursion_handler.spawn_via_broker(
-            child_task=prompt, action_id=self.current_action_id
-        )
+        return self.recursion_handler.spawn_via_broker(child_task=prompt, action_id=action_id)
 
-    def _do_rlm_query_batched(self, prompts: list[str]) -> dict[str, Any]:
+    def _do_rlm_query_batched(self, prompts: list[str], *, action_id: str | None) -> dict[str, Any]:
         if self.recursion_handler is None:
             err = "Maximum recursion depth reached. The 'rlm_query' tool is unavailable."
             return {"responses": [f"Error: {err}"] * len(prompts)}
         return self.recursion_handler.spawn_via_broker_batched(
-            child_tasks=prompts, action_id=self.current_action_id
+            child_tasks=prompts, action_id=action_id
         )
+
+    # =========================================================================
+    # Broker ledger (per-action ``RLMChatCompletion`` capture)
+    # =========================================================================
+
+    def _append_broker_ledger(
+        self, action_id: str | None, completions: list[RLMChatCompletion]
+    ) -> None:
+        """Thread-safe append of broker-produced ``RLMChatCompletion``s.
+
+        No-op if ``action_id`` is None or ``completions`` is empty — avoids
+        creating empty buckets for stale or out-of-band requests.
+        """
+        if not action_id or not completions:
+            return
+        with self._broker_ledger_lock:
+            self._broker_ledger.setdefault(action_id, []).extend(completions)
+
+    def drain_broker_ledger(self, action_id: str | None) -> list[RLMChatCompletion]:
+        """Pop and return the ledger entry for ``action_id`` (or ``[]``)."""
+        if not action_id:
+            return []
+        with self._broker_ledger_lock:
+            return self._broker_ledger.pop(action_id, [])
 
     def _respond_to_broker(self, req_id: str | None, response: dict[str, Any]) -> None:
         if not req_id:
@@ -572,6 +619,10 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
                 capture_output=True,
             )
             self._container_id = None
+        # Bound any pathological orphan ledger entries (fire-and-forget broker
+        # calls in user scripts) to a single run lifetime.
+        with self._broker_ledger_lock:
+            self._broker_ledger.clear()
         self._handle_workspace_cleanup()
         self._is_setup = False
 
