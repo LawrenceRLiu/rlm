@@ -45,7 +45,7 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
       tool failures DO halt the rest of the batch in this turn.
     - Per-call output above the configured cap is auto-spilled to
       ``_rlm_artifacts/_observations/`` and the observation is replaced
-      with a short summary plus a path. Don't worry about it.
+      with a short summary plus a path. Read the file in the path to get full output.
     - You may not write inside ``_rlm_state/``.
     {depth_rule}
     """

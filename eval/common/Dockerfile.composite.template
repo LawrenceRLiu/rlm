@@ -33,6 +33,12 @@ RUN (python -m pip install --no-cache-dir requests 2>/dev/null) \
 ENV RLM_BROKER_PORT=8080
 EXPOSE 8080
 
+# Caller-supplied environment variables. Used by per-benchmark callers to
+# adjust the agent-visible runtime env (e.g. to put a benchmark's conda env
+# on PATH so `docker exec` sees the right binaries without sourcing .bashrc).
+# Defaults to empty when no extra_env is passed to build_composite().
+${EXTRA_ENV}
+
 # Reset any inherited ENTRYPOINT so the broker is PID 1. Some benchmark base
 # images set ENTRYPOINT to start task-specific services (web servers,
 # daemons) — those side-effects are lost here. Tasks that depend on a

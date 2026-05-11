@@ -29,6 +29,12 @@ dependencies = [
     "rich>=13.0.0",
 ]
 
+[project.optional-dependencies]
+eval = [
+    "datasets>=2.14.0",
+    "tqdm>=4.65.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/alexzhang13/rlm"
 Repository = "https://github.com/alexzhang13/rlm"

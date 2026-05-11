@@ -219,4 +219,8 @@ _setup_runs/
 
 *jsonl
 
-eval/**/results/*
+eval/**/results*/*
+
+.claude/
+
+/*.json

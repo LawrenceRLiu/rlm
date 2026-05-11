@@ -38,6 +38,7 @@ def build_composite(
     cache: bool = True,
     rlm_workspace_src: Path | None = None,
     template_path: Path | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> str:
     """Build ``output_tag`` = ``base_image`` + RLM broker layer.
 
@@ -47,13 +48,22 @@ def build_composite(
             (per-benchmark logic).
         output_tag: tag for the resulting composite image.
         cache: if ``True`` and ``output_tag`` already exists locally, skip
-            the rebuild.
+            the rebuild. Callers that change ``extra_env`` between builds
+            should pass ``cache=False`` to force a rebuild — the cache key
+            here is only the output tag.
         rlm_workspace_src: directory containing the ``rlm_workspace``
             package to ``COPY`` into the image. Defaults to the repo's
             ``docker/workspace_image/rlm_workspace``.
-        template_path: Dockerfile template (with ``${BASE_IMAGE}``
-            placeholder). Defaults to ``Dockerfile.composite.template``
-            next to this file.
+        template_path: Dockerfile template (with ``${BASE_IMAGE}`` and
+            ``${EXTRA_ENV}`` placeholders). Defaults to
+            ``Dockerfile.composite.template`` next to this file.
+        extra_env: optional mapping of env-var name → value to inject into
+            the composite image. Each entry becomes an ``ENV K=V`` line
+            placed after the broker's own ENV declarations. Use cases:
+            putting a benchmark's project conda env on ``PATH`` so
+            ``docker exec`` sees the right binaries without sourcing
+            ``.bashrc`` (SWE-Bench's ``/opt/miniconda3/envs/testbed/bin``);
+            propagating ``CONDA_DEFAULT_ENV`` / ``CONDA_PREFIX``; etc.
 
     Returns:
         ``output_tag``.
@@ -73,8 +83,10 @@ def build_composite(
     if not template_path.is_file():
         raise FileNotFoundError(f"Dockerfile template not found at {template_path}")
 
+    extra_env_block = _render_extra_env(extra_env or {})
     dockerfile_text = Template(template_path.read_text(encoding="utf-8")).substitute(
-        BASE_IMAGE=base_image
+        BASE_IMAGE=base_image,
+        EXTRA_ENV=extra_env_block,
     )
 
     # Build context = rendered Dockerfile + the rlm_workspace package.
@@ -159,3 +171,16 @@ def _image_exists(tag: str) -> bool:
         text=True,
     )
     return result.returncode == 0
+
+
+def _render_extra_env(extra_env: dict[str, str]) -> str:
+    """Render ``extra_env`` as a block of ``ENV K=V`` Dockerfile lines.
+
+    Empty mapping renders to the empty string. Values are emitted literally;
+    callers wanting ``$X``-style expansion at build time would need to do
+    the expansion themselves before passing the dict in (Docker's ``ENV K=V``
+    form does NOT expand ``$VAR`` at build time).
+    """
+    if not extra_env:
+        return ""
+    return "\n".join(f"ENV {k}={v}" for k, v in extra_env.items())

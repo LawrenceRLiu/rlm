@@ -127,9 +127,85 @@ class TestBuildComposite:
         assert composite_image.DEFAULT_TEMPLATE.is_file()
         text = composite_image.DEFAULT_TEMPLATE.read_text()
         assert "${BASE_IMAGE}" in text
+        assert "${EXTRA_ENV}" in text
         assert "rlm_workspace" in text  # COPY line present
         # Reuses the shipped rlm_workspace src by default.
         assert composite_image.DEFAULT_RLM_WORKSPACE_SRC.is_dir()
+
+    def test_extra_env_renders_env_lines(self, tmp_path: Path) -> None:
+        """``extra_env`` entries become ``ENV K=V`` lines in the rendered
+        Dockerfile. Smoke-tests both the placeholder substitution and the
+        ``_render_extra_env`` helper.
+        """
+        ws_src = tmp_path / "rlm_workspace"
+        ws_src.mkdir()
+        (ws_src / "__init__.py").write_text("")
+        template = tmp_path / "Dockerfile.composite.template"
+        template.write_text("FROM ${BASE_IMAGE}\n${EXTRA_ENV}\nRUN true\n")
+
+        captured: dict = {}
+
+        def capture_run(cmd, **kwargs):
+            if cmd[:2] == ["docker", "build"]:
+                captured["dockerfile"] = (Path(cmd[-1]) / "Dockerfile").read_text()
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(composite_image, "_image_exists", return_value=False):
+            with patch.object(composite_image.subprocess, "run", side_effect=capture_run):
+                composite_image.build_composite(
+                    base_image="b",
+                    output_tag="t",
+                    rlm_workspace_src=ws_src,
+                    template_path=template,
+                    extra_env={
+                        "PATH": "/opt/miniconda3/envs/testbed/bin:/usr/bin",
+                        "CONDA_DEFAULT_ENV": "testbed",
+                    },
+                )
+
+        dockerfile = captured["dockerfile"]
+        assert "ENV PATH=/opt/miniconda3/envs/testbed/bin:/usr/bin" in dockerfile
+        assert "ENV CONDA_DEFAULT_ENV=testbed" in dockerfile
+
+    def test_extra_env_none_renders_empty_block(self, tmp_path: Path) -> None:
+        """When ``extra_env`` is omitted, the placeholder substitutes to the
+        empty string — no stray ``ENV`` lines, no Dockerfile errors.
+        """
+        ws_src = tmp_path / "rlm_workspace"
+        ws_src.mkdir()
+        (ws_src / "__init__.py").write_text("")
+        template = tmp_path / "Dockerfile.composite.template"
+        template.write_text("FROM ${BASE_IMAGE}\n${EXTRA_ENV}\nRUN true\n")
+
+        captured: dict = {}
+
+        def capture_run(cmd, **kwargs):
+            if cmd[:2] == ["docker", "build"]:
+                captured["dockerfile"] = (Path(cmd[-1]) / "Dockerfile").read_text()
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.object(composite_image, "_image_exists", return_value=False):
+            with patch.object(composite_image.subprocess, "run", side_effect=capture_run):
+                composite_image.build_composite(
+                    base_image="b",
+                    output_tag="t",
+                    rlm_workspace_src=ws_src,
+                    template_path=template,
+                )
+
+        dockerfile = captured["dockerfile"]
+        # No spurious ENV lines from the placeholder.
+        assert "\nENV " not in dockerfile
+        # Placeholder itself was substituted away.
+        assert "${EXTRA_ENV}" not in dockerfile
+
+    def test_render_extra_env_empty_returns_empty_string(self) -> None:
+        assert composite_image._render_extra_env({}) == ""
+
+    def test_render_extra_env_emits_one_env_per_line(self) -> None:
+        out = composite_image._render_extra_env({"A": "1", "B": "two words"})
+        # One ENV line per entry. Insertion order preserved (Python 3.7+ dict).
+        assert out.splitlines() == ["ENV A=1", "ENV B=two words"]
 
     def test_build_context_includes_rlm_workspace_dir(self, tmp_path: Path) -> None:
         """Beyond rendering the Dockerfile, the build context must contain
