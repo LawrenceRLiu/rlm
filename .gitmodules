@@ -1,3 +1,6 @@
 [submodule "third_party/harbor"]
 	path = third_party/harbor
 	url = https://github.com/laude-institute/harbor.git
+[submodule "third_party/terminal-bench-2"]
+	path = third_party/terminal-bench-2
+	url = https://github.com/laude-institute/terminal-bench-2
