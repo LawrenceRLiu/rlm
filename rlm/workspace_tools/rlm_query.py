@@ -25,6 +25,10 @@ SPEC = ToolSpec(
     is_state_mutating=True,  # mutating because it copies artifacts back into the workspace
     runs_on="host",
     body_required=True,
+    example=(
+        'No attributes. Body is the child task. The child inherits a snapshot of the workspace. '
+        'Example: <action tool="rlm_query">Read summary_*.txt files and produce a one-paragraph synthesis.</action>'
+    ),
 )
 
 

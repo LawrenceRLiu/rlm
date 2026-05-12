@@ -17,6 +17,10 @@ SPEC = ToolSpec(
     is_state_mutating=False,
     runs_on="host",
     body_required=False,
+    example=(
+        'No required attrs. Optional: path (defaults to workspace root). '
+        'Example: <action tool="list_directory" path="_rlm_artifacts/"/>'
+    ),
 )
 
 _DEFAULT_IGNORES = {".git", "__pycache__", "node_modules", ".venv"}

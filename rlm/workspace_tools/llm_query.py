@@ -18,6 +18,10 @@ SPEC = ToolSpec(
     is_state_mutating=False,
     runs_on="host",
     body_required=True,
+    example=(
+        'No attributes. Body is the prompt sent to the LM. '
+        'Example: <action tool="llm_query">Summarize the following paragraph in one sentence: ...</action>'
+    ),
 )
 
 

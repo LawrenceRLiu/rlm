@@ -20,6 +20,11 @@ SPEC = ToolSpec(
     is_state_mutating=True,
     runs_on="container",
     body_required=True,
+    example=(
+        'No attributes. Body is raw Python — do NOT wrap in <code>, <script>, '
+        '<python>, or markdown fences. '
+        'Example: <action tool="python">\nimport math\nprint(math.pi)\n</action>'
+    ),
 )
 
 # Wrapper preamble: makes the in-container client helpers available in the

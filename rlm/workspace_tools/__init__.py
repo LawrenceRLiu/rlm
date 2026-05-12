@@ -37,6 +37,7 @@ class ToolSpec:
     runs_on: Literal["host", "container"]
     body_required: bool
     is_terminal: bool = False  # `final` is the only terminal tool
+    example: str = ""  # rendered verbatim under the tool's line in the system prompt
 
 
 # Lazy import: each tool module is loaded on first lookup so that absent

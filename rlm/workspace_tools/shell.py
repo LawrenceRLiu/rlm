@@ -17,6 +17,11 @@ SPEC = ToolSpec(
     is_state_mutating=True,
     runs_on="container",
     body_required=True,
+    example=(
+        'No attributes. Body is raw bash — do NOT wrap in <code>, <script>, '
+        'or markdown fences. '
+        'Example: <action tool="shell">\nls -la _rlm_artifacts/\n</action>'
+    ),
 )
 
 # Tempfile location relative to workspace root. Lives under _rlm_state so it

@@ -23,6 +23,11 @@ SPEC = ToolSpec(
     runs_on="host",
     body_required=True,
     is_terminal=True,
+    example=(
+        'No attributes. Body has <answer>...</answer> plus zero or more <artifact path="..."/>. '
+        'Example: <action tool="final"><answer>42 primes found</answer>'
+        '<artifact path="primes.txt"/></action>'
+    ),
 )
 
 

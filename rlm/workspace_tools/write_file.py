@@ -17,6 +17,11 @@ SPEC = ToolSpec(
     is_state_mutating=True,
     runs_on="host",
     body_required=True,
+    example=(
+        'Required attr: path. Body is the raw file contents — do NOT wrap in '
+        '<code>, <body>, markdown fences, or any other tag. '
+        'Example: <action tool="write_file" path="hello.py">\nprint("hello")\n</action>'
+    ),
 )
 
 

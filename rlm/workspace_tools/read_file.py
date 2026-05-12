@@ -17,6 +17,10 @@ SPEC = ToolSpec(
     is_state_mutating=False,
     runs_on="host",
     body_required=False,
+    example=(
+        'Required attr: path. Optional: start_line, end_line. '
+        'Example: <action tool="read_file" path="notes.md" start_line="1" end_line="50"/>'
+    ),
 )
 
 

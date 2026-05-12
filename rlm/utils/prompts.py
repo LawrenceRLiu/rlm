@@ -66,7 +66,10 @@ def _format_tool_descriptions(include_rlm_query: bool) -> str:
         if name == "rlm_query" and not include_rlm_query:
             continue
         spec = get_spec(name)
-        lines.append(f"- ``{name}`` — {spec.short_description}")
+        entry = f"- ``{name}`` — {spec.short_description}"
+        if spec.example:
+            entry += f"\n  {spec.example}"
+        lines.append(entry)
     return "\n".join(lines)
 
 
