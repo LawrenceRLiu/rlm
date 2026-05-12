@@ -228,3 +228,4 @@ eval/**/results*/*
 /*.json
 
 /models
+litellm_config.yaml
