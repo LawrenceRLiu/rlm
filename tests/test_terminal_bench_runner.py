@@ -10,13 +10,19 @@ the Docker build.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from eval.terminal_bench import runner as runner_mod
 from eval.terminal_bench.runner import (
     TaskSpec,
+    already_done,
+    apply_shard,
     build_prompt,
+    discover_tasks,
     make_grader,
     run_task,
 )
@@ -447,3 +453,83 @@ class TestRunTask:
         assert rlm_kwargs["workspace_config"].docker.exec_timeout_seconds == 42
         # cleanup_mode is forced to "delete" for batch runs.
         assert rlm_kwargs["workspace_config"].docker.cleanup_mode == "delete"
+
+
+# ---------------------------------------------------------------------------
+# discover_tasks + apply_shard
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverAndShard:
+    def test_discover_finds_nested_task_tomls(self, tmp_path: Path) -> None:
+        _write_task_dir(tmp_path, "alpha", toml="[task]\nname='a'\n")
+        _write_task_dir(tmp_path, "beta", toml="[task]\nname='b'\n")
+        # A nested layout (mirrors TB2's tasks/<category>/<task>/ shape).
+        nested = tmp_path / "cat"
+        nested.mkdir()
+        _write_task_dir(nested, "gamma", toml="[task]\nname='g'\n")
+        found = discover_tasks(tmp_path)
+        names = [p.name for p in found]
+        # Sorted by basename for shard determinism.
+        assert names == ["alpha", "beta", "gamma"]
+
+    def test_discover_raises_on_missing_root(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            discover_tasks(tmp_path / "nope")
+
+    def test_apply_shard_partitions_deterministically(self) -> None:
+        tasks = [Path(f"/x/t{i}") for i in range(10)]
+        s0 = apply_shard(tasks, 0, 4)
+        s1 = apply_shard(tasks, 1, 4)
+        s2 = apply_shard(tasks, 2, 4)
+        s3 = apply_shard(tasks, 3, 4)
+        # Every task lands in exactly one shard.
+        assert sorted(s0 + s1 + s2 + s3, key=lambda p: p.name) == sorted(
+            tasks, key=lambda p: p.name
+        )
+        # Round-robin by index.
+        assert s0 == [tasks[i] for i in (0, 4, 8)]
+        assert s1 == [tasks[i] for i in (1, 5, 9)]
+
+    def test_apply_shard_rejects_out_of_range(self) -> None:
+        with pytest.raises(ValueError):
+            apply_shard([Path("/x/a")], -1, 2)
+        with pytest.raises(ValueError):
+            apply_shard([Path("/x/a")], 2, 2)
+        with pytest.raises(ValueError):
+            apply_shard([Path("/x/a")], 0, 0)
+
+    def test_num_shards_one_is_identity(self) -> None:
+        tasks = [Path(f"/x/t{i}") for i in range(5)]
+        assert apply_shard(tasks, 0, 1) == tasks
+
+
+# ---------------------------------------------------------------------------
+# already_done (--resume)
+# ---------------------------------------------------------------------------
+
+
+class TestAlreadyDone:
+    def test_returns_false_when_result_missing(self, tmp_path: Path) -> None:
+        assert already_done("never-ran", tmp_path) is False
+
+    def test_returns_true_when_result_parses(self, tmp_path: Path) -> None:
+        d = tmp_path / "demo"
+        d.mkdir()
+        (d / "result.json").write_text(json.dumps({"task_id": "demo", "passed": False}))
+        assert already_done("demo", tmp_path) is True
+
+    def test_returns_true_even_for_failed_result(self, tmp_path: Path) -> None:
+        # A recorded failure still counts as done — we don't want infinite retries.
+        d = tmp_path / "demo"
+        d.mkdir()
+        (d / "result.json").write_text(
+            json.dumps({"task_id": "demo", "passed": False, "error": "boom"})
+        )
+        assert already_done("demo", tmp_path) is True
+
+    def test_returns_false_on_corrupt_json(self, tmp_path: Path) -> None:
+        d = tmp_path / "demo"
+        d.mkdir()
+        (d / "result.json").write_text("{not json")
+        assert already_done("demo", tmp_path) is False

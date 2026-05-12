@@ -31,14 +31,18 @@ across all task styles (pytest-based, shell-based, custom).
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import subprocess
 import time
 import tomllib
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+from tqdm import tqdm
 
 from eval.common.composite_image import build_composite
 from rlm import RLM
@@ -292,13 +296,156 @@ def run_task(
     )
 
 
+def discover_tasks(root: Path) -> list[Path]:
+    """Find every subdirectory under ``root`` that contains a task.toml.
+
+    Returns absolute task directories sorted by task_id (basename) for
+    deterministic shard partitioning.
+    """
+    if not root.is_dir():
+        raise FileNotFoundError(f"tasks-root does not exist: {root}")
+    found: list[Path] = []
+    for toml_path in root.rglob("task.toml"):
+        if toml_path.is_file():
+            found.append(toml_path.parent)
+    return sorted(found, key=lambda p: p.name)
+
+
+def apply_shard(tasks: list[Path], shard_index: int, num_shards: int) -> list[Path]:
+    if num_shards <= 0:
+        raise ValueError(f"--num-shards must be >= 1, got {num_shards}")
+    if not 0 <= shard_index < num_shards:
+        raise ValueError(f"--shard-index {shard_index} out of range for --num-shards {num_shards}")
+    return [t for i, t in enumerate(tasks) if i % num_shards == shard_index]
+
+
+def already_done(task_id: str, output_dir: Path) -> bool:
+    """A task is 'done' if its result.json exists and parses as JSON.
+
+    We do NOT require ``passed=True`` — a recorded failure (grader exit 1 with
+    no exception) is a complete result we don't want to re-run. Only crashes
+    that prevented result.json from being written (or wrote garbage) will be
+    retried.
+    """
+    rj = output_dir / task_id / "result.json"
+    if not rj.is_file():
+        return False
+    try:
+        json.loads(rj.read_text())
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
+def rmi_task_images(task_id: str) -> None:
+    """Best-effort: remove the per-task base + composite images to bound disk.
+
+    Failures are logged at WARNING and otherwise ignored — image cleanup
+    is hygiene, not correctness.
+    """
+    for tag in (f"rlm-tb-{task_id}:latest", f"harbor-task-base-{task_id}:latest"):
+        proc = subprocess.run(
+            ["docker", "rmi", tag],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            log.warning("docker rmi %s failed: %s", tag, proc.stderr.strip())
+
+
+def append_summary_line(summary_path: Path, result: TaskResult) -> None:
+    """Append one JSONL line to ``summary.jsonl`` under a file lock.
+
+    Concurrent ProcessPoolExecutor workers may call this; ``fcntl.flock``
+    serializes the writes so we don't interleave partial lines.
+    """
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with summary_path.open("a") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(asdict(result)) + "\n")
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _process_one(
+    task_dir: Path,
+    *,
+    backend: str,
+    backend_kwargs: dict,
+    max_iterations: int,
+    output_dir: Path,
+    rmi_after: bool,
+) -> TaskResult:
+    """Worker entry: run a single task end-to-end and persist its result.json.
+
+    Designed to be pickled into ProcessPoolExecutor — takes only plain values.
+    """
+    task = TaskSpec.from_dir(task_dir)
+    try:
+        result = run_task(
+            task,
+            backend=backend,
+            backend_kwargs=backend_kwargs,
+            max_iterations=max_iterations,
+            output_dir=output_dir,
+        )
+    except Exception as exc:  # safety net; run_task already catches the agent path
+        log.exception("Task %s crashed outside run_task", task.task_id)
+        result = TaskResult(
+            task_id=task.task_id,
+            passed=False,
+            grader_exit_code=None,
+            grader_timed_out=False,
+            grader_reward_raw="",
+            grader_stdout_tail="",
+            grader_stderr_tail="",
+            agent_response="",
+            agent_turns=None,
+            wall_clock_s=0.0,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    per_task_out = output_dir / result.task_id
+    per_task_out.mkdir(parents=True, exist_ok=True)
+    (per_task_out / "result.json").write_text(json.dumps(asdict(result), indent=2))
+
+    if rmi_after:
+        rmi_task_images(result.task_id)
+
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument(
         "--tasks",
         nargs="+",
-        required=True,
-        help="Task directory paths (relative to repo root or absolute).",
+        help="Explicit task directory paths (relative to repo root or absolute).",
+    )
+    src.add_argument(
+        "--tasks-root",
+        type=Path,
+        help="Root directory to auto-discover task.toml subdirectories under.",
+    )
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip any task whose result.json already exists.",
+    )
+    parser.add_argument(
+        "--rmi-after",
+        action="store_true",
+        help="docker rmi the task's base+composite images after it completes.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Parallel ProcessPoolExecutor workers within this shard (default 1).",
     )
     parser.add_argument("--max-iterations", type=int, default=30)
     parser.add_argument(
@@ -318,45 +465,84 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    if args.tasks_root is not None:
+        root = args.tasks_root if args.tasks_root.is_absolute() else (REPO_ROOT / args.tasks_root)
+        all_tasks = discover_tasks(root.resolve())
+    else:
+        all_tasks = []
+        for task_path in args.tasks:
+            task_dir = (
+                (REPO_ROOT / task_path).resolve()
+                if not Path(task_path).is_absolute()
+                else Path(task_path)
+            )
+            if not (task_dir / "task.toml").is_file():
+                log.error("Missing task.toml at %s; skipping", task_dir)
+                continue
+            all_tasks.append(task_dir)
+        all_tasks.sort(key=lambda p: p.name)
+
+    sharded = apply_shard(all_tasks, args.shard_index, args.num_shards)
+    log.info(
+        "discovered %d tasks total; shard %d/%d -> %d tasks",
+        len(all_tasks),
+        args.shard_index,
+        args.num_shards,
+        len(sharded),
+    )
+
+    if args.resume:
+        before = len(sharded)
+        sharded = [t for t in sharded if not already_done(t.name, args.output_dir)]
+        log.info("--resume: skipping %d already-complete tasks", before - len(sharded))
+
+    if not sharded:
+        log.info("nothing to do; exiting")
+        return
+
     backend_kwargs = {
         "model_name": args.model,
         "base_url": args.base_url,
         "api_key": args.api_key,
     }
-
-    results: list[TaskResult] = []
-    for task_path in args.tasks:
-        task_dir = (
-            (REPO_ROOT / task_path).resolve()
-            if not Path(task_path).is_absolute()
-            else Path(task_path)
-        )
-        if not (task_dir / "task.toml").is_file():
-            log.error("Missing task.toml at %s; skipping", task_dir)
-            continue
-        task = TaskSpec.from_dir(task_dir)
-        result = run_task(
-            task,
-            backend=args.backend,
-            backend_kwargs=backend_kwargs,
-            max_iterations=args.max_iterations,
-            output_dir=args.output_dir,
-        )
-        results.append(result)
-        per_task_out = args.output_dir / result.task_id
-        per_task_out.mkdir(parents=True, exist_ok=True)
-        (per_task_out / "result.json").write_text(json.dumps(asdict(result), indent=2))
-
-    # Summary
     summary_path = args.output_dir / "summary.jsonl"
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    with summary_path.open("w") as f:
-        for r in results:
-            f.write(json.dumps(asdict(r)) + "\n")
+
+    results: list[TaskResult] = []
+    if args.num_workers > 1:
+        with ProcessPoolExecutor(max_workers=args.num_workers) as ex:
+            futures = {
+                ex.submit(
+                    _process_one,
+                    t,
+                    backend=args.backend,
+                    backend_kwargs=backend_kwargs,
+                    max_iterations=args.max_iterations,
+                    output_dir=args.output_dir,
+                    rmi_after=args.rmi_after,
+                ): t
+                for t in sharded
+            }
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="tasks"):
+                r = fut.result()
+                results.append(r)
+                append_summary_line(summary_path, r)
+    else:
+        for t in tqdm(sharded, desc="tasks"):
+            r = _process_one(
+                t,
+                backend=args.backend,
+                backend_kwargs=backend_kwargs,
+                max_iterations=args.max_iterations,
+                output_dir=args.output_dir,
+                rmi_after=args.rmi_after,
+            )
+            results.append(r)
+            append_summary_line(summary_path, r)
 
     passed = sum(1 for r in results if r.passed)
     print("\n=== TB 2.0 substrate validation summary ===")
-    print(f"Passed: {passed}/{len(results)}")
+    print(f"Shard {args.shard_index}/{args.num_shards}  Passed: {passed}/{len(results)}")
     for r in results:
         status = "PASS" if r.passed else "FAIL"
         extra = f" (error: {r.error})" if r.error else ""

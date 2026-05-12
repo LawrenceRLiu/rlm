@@ -215,7 +215,9 @@ marimo/_lsp/
 __marimo__/
 
 
-_setup_runs/
+_setup_runs/*
+!_setup_runs/serve_one_qwen.sh
+!_setup_runs/run_tb2_qwen_shards.sh
 
 *jsonl
 
