@@ -33,16 +33,17 @@ def test_paired_with_body_preserves_whitespace():
 
 
 def test_prose_around_actions_is_ignored():
+    """Prose before and after an action does not crash the parser. (Prose
+    *between* two actions is a cluster boundary under the last-contiguous-block
+    rule — see test_multiple_clusters_returns_last_only.)"""
     text = (
         "Let me think about this.\n\n"
-        '<action tool="list_directory" />\n\n'
-        "Now let me read the file.\n"
-        '<action tool="read_file" path="a.txt" />'
+        '<action tool="read_file" path="a.txt" />\n\n'
+        "Now I have the file contents."
     )
     actions = parse(text)
-    assert len(actions) == 2
-    assert actions[0].tool == "list_directory"
-    assert actions[1].args["path"] == "a.txt"
+    assert len(actions) == 1
+    assert actions[0].args["path"] == "a.txt"
 
 
 def test_raw_lt_in_body_is_fine():
@@ -256,3 +257,138 @@ def test_action_tag_is_case_insensitive():
     actions = parse(text)
     assert len(actions) == 1
     assert actions[0].tool == "list_directory"
+
+
+# ---------------------------------------------------------------------------
+# Think-block stripping (Bug 1 — Qwen3 self-corrective monologue poisoning)
+# ---------------------------------------------------------------------------
+
+
+def test_think_block_with_malformed_actions_is_stripped():
+    """Stale ``<action>`` attempts inside ``<think>`` must not crash the
+    scanner — the real well-formed action after the think wins."""
+    text = (
+        '<think>\nLet me try <action tool="read_file">_rlm_query_0.txt</action>'
+        " — no wait, that's missing the path attribute. Let me try"
+        ' <action tool="read_file" path="_rlm_query_0.txt">.\n</think>\n'
+        '<action tool="read_file" path="_rlm_query_0.txt" />'
+    )
+    actions = parse(text)
+    assert len(actions) == 1
+    assert actions[0].tool == "read_file"
+    assert actions[0].args["path"] == "_rlm_query_0.txt"
+
+
+def test_unterminated_think_block_drops_tail():
+    """A ``<think>`` with no closing tag is treated as runaway monologue; the
+    parser drops everything from there to end-of-text. The pre-think action
+    still parses; nothing else can leak through."""
+    text = (
+        '<action tool="list_directory" />\n'
+        "<think>\nrunaway reasoning <action tool='bogus'>never closed"
+    )
+    actions = parse(text)
+    assert len(actions) == 1
+    assert actions[0].tool == "list_directory"
+
+
+def test_think_block_case_insensitive_and_with_attrs():
+    text = (
+        '<THINK id="1">malformed <action tool="x"></action> here</think>\n'
+        '<action tool="list_directory" />'
+    )
+    actions = parse(text)
+    assert len(actions) == 1
+    assert actions[0].tool == "list_directory"
+
+
+# ---------------------------------------------------------------------------
+# Last-contiguous-block selection (Bug 2 — prose/code-fence quotations)
+# ---------------------------------------------------------------------------
+
+
+def test_last_cluster_wins_over_quoted_prose_example():
+    """A backticked example of ``<action>`` in prose must not pre-empt the
+    real action emitted afterward."""
+    text = (
+        'Here\'s what the format looks like: `<action tool="read_file" path="a.txt" />`.\n'
+        "Now the real call:\n"
+        '<action tool="list_directory" />'
+    )
+    actions = parse(text)
+    assert len(actions) == 1
+    assert actions[0].tool == "list_directory"
+
+
+def test_last_cluster_wins_over_system_prompt_quotation():
+    """The Qwen3.5-9B 3b failure pattern: model quotes the system prompt's
+    format example (`<action tool="...">...</action>`) before emitting its real
+    action. The quoted example has tool='...' which would be Unknown tool;
+    must be skipped in favor of the real action below."""
+    text = (
+        "The system prompt says: Each turn, emit one or more "
+        '``<action tool="...">...</action>`` elements. So I should use that '
+        "format. Here:\n"
+        '<action tool="read_file" path="x.txt" />'
+    )
+    actions = parse(text)
+    assert len(actions) == 1
+    assert actions[0].args["path"] == "x.txt"
+
+
+def test_multiple_clusters_returns_last_only():
+    """Two clusters separated by prose: only the last is returned."""
+    text = (
+        '<action tool="list_directory" />\n'
+        '<action tool="read_file" path="a.txt" />\n'
+        "Hmm wait, I need to do something else first.\n"
+        '<action tool="write_file" path="b.txt">hello</action>\n'
+        '<action tool="read_file" path="b.txt" />'
+    )
+    actions = parse(text)
+    assert [a.tool for a in actions] == ["write_file", "read_file"]
+    assert actions[0].args["path"] == "b.txt"
+    assert actions[1].args["path"] == "b.txt"
+
+
+def test_single_cluster_unchanged():
+    """Legacy single-cluster response: behavior identical to pre-cluster impl."""
+    text = '<action tool="list_directory" />\n\n<action tool="read_file" path="a.txt" />'
+    actions = parse(text)
+    assert len(actions) == 2
+    assert actions[0].tool == "list_directory"
+    assert actions[1].tool == "read_file"
+
+
+def test_sole_malformed_action_still_raises_validation_error():
+    """When the response contains only a malformed action (no later well-formed
+    cluster to fall back on), the original validation error is surfaced so
+    the model gets actionable feedback — not silently swallowed."""
+    with pytest.raises(ActionParseError, match="Missing required attribute 'tool'"):
+        parse("<action />")
+    with pytest.raises(ActionParseError, match="Unknown tool"):
+        parse('<action tool="not_a_real_tool" />')
+
+
+def test_malformed_example_in_prose_does_not_mask_real_action():
+    """Earlier malformed examples should be skipped, and the real well-formed
+    action after them should be returned (not a validation error)."""
+    text = (
+        'Bad attempt: <action tool="read_file">forgot path here</action>\n'
+        "Real call:\n"
+        '<action tool="read_file" path="x.txt" />'
+    )
+    actions = parse(text)
+    assert len(actions) == 1
+    assert actions[0].args["path"] == "x.txt"
+
+
+def test_structural_error_still_propagates_even_with_good_action_after():
+    """An unterminated ``<action>`` is a structural error and cannot be
+    skipped (its body would swallow whatever comes after). The scanner
+    must surface this rather than silently consume the rest of the text."""
+    text = '<action tool="shell">forgot to close\n<action tool="list_directory" />'
+    # The first <action>'s body consumption walks until it finds </action>,
+    # which it never does — Unterminated raised.
+    with pytest.raises(ActionParseError, match="Unterminated"):
+        parse(text)

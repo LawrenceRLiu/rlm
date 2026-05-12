@@ -506,6 +506,14 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
         Per-call observation truncation (spill-to-artifact above
         ``observation.max_observation_chars``) is applied here, not in the
         tool modules — it is a uniform post-processing step.
+
+        Backstop for ``ValueError`` from path-validating tools: an absolute
+        or workspace-escaping path raises ``ValueError`` out of
+        ``resolve_workspace_path`` (docker_workspace.py:138-149) and the tools
+        do not catch it. Without this backstop a typo'd path aborts the entire
+        run instead of giving the model an observation to retry from — see
+        Qwen3.5-9B 3d 2026-05-10 where ``/workspace/_rlm_artifacts/parse.py``
+        killed the loop.
         """
         spec = get_spec(action.tool)
         executor = get_executor(action.tool)
@@ -515,7 +523,10 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
         self._action_seq_per_turn[self.current_turn] = idx
         self.current_action_id = f"t{self.current_turn}.a{idx}"
 
-        obs = executor(self, action)
+        try:
+            obs = executor(self, action)
+        except ValueError as e:
+            obs = WorkspaceObservation(tool=action.tool, error=str(e))
         obs = self._maybe_spill_observation(obs)
 
         # Provenance changes are persisted after every action so a crash

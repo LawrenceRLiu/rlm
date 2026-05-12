@@ -257,6 +257,63 @@ class TestActionDispatch:
         assert len(observations) == 1  # broke after final
         assert observations[0].final_answer == "done"
 
+    def test_final_is_skipped_after_mutating_failure_in_same_batch(self):
+        """A batch like [python(error), final] must NOT commit final — the
+        model would claim success on a broken workspace. Observed in the
+        2026-05-11 Qwen3-8B 3a run: python wrapped in <script> tags raised
+        SyntaxError, final was batched after it, and the loop terminated
+        with the model's (wrong) claim 'Generated first 100 primes.'"""
+        rlm = self._rlm()
+        env = self._mock_env_returning(
+            {
+                "python": WorkspaceObservation(tool="python", error="SyntaxError: invalid syntax"),
+                "final": WorkspaceObservation(tool="final", final_answer="done", stdout="done"),
+            }
+        )
+        actions = [
+            WorkspaceAction(tool="python", args={}, body="<script>bad</script>", raw=""),
+            WorkspaceAction(tool="final", args={}, body="<answer>done</answer>", raw=""),
+        ]
+        observations = rlm._dispatch_actions(env=env, actions=actions)
+        # Both observations recorded; python errored, final was skipped (not
+        # executed by env), loop did not terminate via final_answer.
+        assert len(observations) == 2
+        assert observations[0].tool == "python"
+        assert observations[0].error == "SyntaxError: invalid syntax"
+        assert observations[1].tool == "final"
+        assert observations[1].error and "Skipped" in observations[1].error
+        assert observations[1].final_answer is None
+        # Env only saw python; final was gated out before reaching env.run_action.
+        assert env.run_action.call_count == 1
+
+    def test_read_only_still_runs_when_final_is_skipped_after_halt(self):
+        """When the halt fires, read-only tools should still execute so the
+        model can inspect state before retrying. Only mutating + terminal
+        tools are gated."""
+        rlm = self._rlm()
+        env = self._mock_env_returning(
+            {
+                "write_file": WorkspaceObservation(tool="write_file", error="disk full"),
+                "read_file": WorkspaceObservation(tool="read_file", stdout="contents"),
+                "final": WorkspaceObservation(tool="final", final_answer="done", stdout="done"),
+            }
+        )
+        actions = [
+            WorkspaceAction(tool="write_file", args={"path": "a"}, body="x", raw=""),
+            WorkspaceAction(tool="read_file", args={"path": "a"}, body=None, raw=""),
+            WorkspaceAction(tool="final", args={}, body="<answer>done</answer>", raw=""),
+        ]
+        observations = rlm._dispatch_actions(env=env, actions=actions)
+        assert len(observations) == 3
+        assert observations[0].error == "disk full"
+        assert observations[1].tool == "read_file"
+        assert observations[1].error is None  # read-only ran
+        assert observations[2].tool == "final"
+        assert observations[2].error and "Skipped" in observations[2].error
+        assert observations[2].final_answer is None
+        # Env saw write_file + read_file; final gated out.
+        assert env.run_action.call_count == 2
+
 
 # ---------------------------------------------------------------------------
 # Failed iteration is logged when parse retries are exhausted

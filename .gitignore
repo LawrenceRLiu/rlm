@@ -224,3 +224,5 @@ eval/**/results*/*
 .claude/
 
 /*.json
+
+/models

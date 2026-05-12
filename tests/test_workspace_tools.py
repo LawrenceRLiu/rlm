@@ -464,3 +464,33 @@ class TestPathResolution:
         assert not env.is_reserved_path("_rlm_artifacts/x")
         assert not env.is_reserved_path("_rlm_notes/x")
         assert not env.is_reserved_path("_rlm_query_0.txt")
+
+    def test_run_action_converts_absolute_path_to_observation(self, tmp_path: Path) -> None:
+        """A model emitting an absolute path (e.g. ``/workspace/foo.txt``) must
+        get an observation it can read on the next turn, not abort the run.
+        Regression for Qwen3.5-9B 3d 2026-05-10 where this killed the loop."""
+        env = make_thin_env(tmp_path)
+        action = WorkspaceAction(
+            tool="write_file",
+            args={"path": "/workspace/foo.txt"},
+            body="hello",
+            raw="",
+        )
+        obs = env.run_action(action)
+        assert obs.error is not None
+        assert "workspace-relative" in obs.error
+        assert obs.tool == "write_file"
+
+    def test_run_action_converts_traversal_path_to_observation(self, tmp_path: Path) -> None:
+        """``../foo`` must also become an observation, not an exception."""
+        env = make_thin_env(tmp_path)
+        action = WorkspaceAction(
+            tool="read_file",
+            args={"path": "../escape.txt"},
+            body=None,
+            raw="",
+        )
+        obs = env.run_action(action)
+        assert obs.error is not None
+        assert "escapes" in obs.error
+        assert obs.tool == "read_file"

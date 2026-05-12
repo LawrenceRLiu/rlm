@@ -42,7 +42,9 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
       about bodies (raw ``<``, ``&``, code are all fine inside an action
       body), but action open/close tags must balance.
     - Read-only tool failures do NOT halt the rest of the turn; mutating
-      tool failures DO halt the rest of the batch in this turn.
+      tool failures DO halt the rest of the batch in this turn, including
+      any ``final`` in the same batch — do not commit a final answer in
+      the same turn as a mutating action whose failure would invalidate it.
     - Per-call output above the configured cap is auto-spilled to
       ``_rlm_artifacts/_observations/`` and the observation is replaced
       with a short summary plus a path. Read the file in the path to get full output.

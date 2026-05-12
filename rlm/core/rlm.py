@@ -9,7 +9,8 @@ Each turn:
    capped by ``workspace_config.parse.max_action_parse_retries``).
 3. Dispatch each action through the env's tool registry. Read-only tool
    failures do not halt the turn; mutating tool failures halt the rest of
-   the batch.
+   the batch, including ``final`` (so the model can't commit an answer in
+   the same batch as a mutating sibling whose failure would invalidate it).
 4. Take a per-turn git snapshot of the workspace.
 5. Append a ``WorkspaceIteration`` to the logger and to the message history.
 6. If any observation carries a ``final_answer``, return it.
@@ -57,7 +58,7 @@ from rlm.utils.prompts import (
     format_workspace_iteration,
 )
 from rlm.utils.rlm_utils import filter_sensitive_keys
-from rlm.workspace_tools import is_state_mutating
+from rlm.workspace_tools import get_spec
 
 
 class RLM:
@@ -497,13 +498,17 @@ class RLM:
 
         Once a mutating action errors, subsequent mutating actions are
         skipped (replaced with an explicit "halted" observation) but
-        read-only actions continue. A ``final`` action causes immediate
-        loop termination after appending its observation.
+        read-only actions continue. ``final`` is also skipped after a halt
+        even though it is not state-mutating — committing an answer on a
+        batch whose mutating sibling failed lets the model claim success
+        on broken work, which is exactly the 2026-05-11 Qwen3-8B 3a bug.
+        A successful ``final`` causes immediate loop termination.
         """
         observations: list[WorkspaceObservation] = []
         halted = False
         for action in actions:
-            if halted and is_state_mutating(action.tool):
+            spec = get_spec(action.tool)
+            if halted and (spec.is_state_mutating or spec.is_terminal):
                 observations.append(
                     WorkspaceObservation(
                         tool=action.tool,
@@ -522,7 +527,7 @@ class RLM:
                 # Terminal action: stop dispatching the rest of the batch.
                 break
 
-            if obs.error is not None and is_state_mutating(action.tool):
+            if obs.error is not None and spec.is_state_mutating:
                 halted = True
         return observations
 

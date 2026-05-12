@@ -121,6 +121,16 @@ _OPEN_RE = re.compile(r"<\s*action\b", re.IGNORECASE)
 _CLOSE_RE = re.compile(r"</\s*action\s*>", re.IGNORECASE)
 _ATTR_RE = re.compile(r"(\w+)\s*=\s*\"([^\"]*)\"")
 
+# Reasoning-block tags emitted by Qwen3 / Qwen3.5 / Qwen3.6 / R1-style models
+# when `enable_thinking=True` (the default for the Qwen3 family). Anything
+# inside <think>...</think> is the model's private monologue and must not
+# feed the <action> scanner — see 2026-05-10 Qwen sweep reports.
+_THINK_PAIR_RE = re.compile(
+    r"<\s*think\b[^>]*>.*?<\s*/\s*think\s*>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_THINK_OPEN_RE = re.compile(r"<\s*think\b[^>]*>", flags=re.IGNORECASE)
+
 
 @dataclass(frozen=True)
 class _OpenTag:
@@ -223,108 +233,166 @@ def _extract_tool_attr(attrs: dict[str, str]) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def parse(text: str, schemas: dict[str, ActionSchema] | None = None) -> list[WorkspaceAction]:
-    """Parse all ``<action>`` elements from ``text``.
+def _strip_think_blocks(text: str) -> str:
+    """Remove ``<think>...</think>`` spans before action scanning.
 
-    Raises ``ActionParseError`` if zero actions are extracted, if any extracted
-    action fails its per-tool schema, or on any structural malformation.
+    Why: Qwen3-family models emit long self-corrective monologue inside
+    ``<think>``. The monologue routinely contains prior malformed ``<action>``
+    attempts ("I tried X, that didn't work, let me try Y"). The action scanner
+    is a forward regex walk and would dispatch the first stale attempt before
+    reaching the model's intended action below the think block. Stripping is
+    independent of vLLM's ``--reasoning-parser`` so the substrate is robust
+    regardless of serving config. An unterminated ``<think>`` (no closing tag)
+    drops the rest of the text — better than letting half the monologue feed
+    the scanner.
+    """
+    text = _THINK_PAIR_RE.sub("", text)
+    m = _THINK_OPEN_RE.search(text)
+    if m is not None:
+        text = text[: m.start()]
+    return text
+
+
+def parse(text: str, schemas: dict[str, ActionSchema] | None = None) -> list[WorkspaceAction]:
+    """Parse the **last contiguous block** of ``<action>`` elements from ``text``.
+
+    Strips ``<think>`` reasoning blocks first, then walks the rest tolerating
+    per-action schema failures: malformed ``<action>`` elements earlier in the
+    response (e.g. backticked examples in prose, system-prompt quotations) are
+    skipped rather than aborting the whole turn. The returned list is the last
+    cluster of well-formed actions separated only by whitespace — models'
+    self-correcting reasoning concludes with the intended action *at the end*.
+
+    Raises ``ActionParseError`` only if zero well-formed actions are recovered.
+    In that case the first per-action schema failure is re-raised so the model
+    still gets meaningful feedback for its retry; otherwise the standard
+    "no <action> elements" error fires. Structural malformation (unterminated
+    ``<action>``) always bubbles immediately.
     """
     schemas = schemas if schemas is not None else _DEFAULT_SCHEMAS
+    text = _strip_think_blocks(text)
 
-    actions: list[WorkspaceAction] = []
+    parsed: list[tuple[int, int, WorkspaceAction]] = []
+    first_validation_error: ActionParseError | None = None
     pos = 0
     while pos < len(text):
         opener = _find_open_tag(text, pos)
         if opener is None:
             break
 
-        attrs = _parse_attrs(opener.inner)
-        tool = _extract_tool_attr(attrs)
-        if not tool:
-            raise ActionParseError(
-                "Missing required attribute 'tool' on <action> element.",
-                fragment=text[opener.start : opener.end + 200],
-            )
-        if tool not in schemas:
-            raise ActionParseError(
-                f"Unknown tool '{tool}' on <action>. Known tools: {sorted(schemas.keys())}.",
-                fragment=text[opener.start : opener.end + 200],
-            )
-
-        schema = schemas[tool]
-
-        # Drop the `tool` attribute from args; the rest are tool-specific.
-        action_args = {k: v for k, v in attrs.items() if k != "tool"}
-
-        # Validate attributes against schema.
-        allowed = set(schema.required_attrs) | set(schema.optional_attrs)
-        unknown = set(action_args.keys()) - allowed
-        if unknown:
-            raise ActionParseError(
-                f"Unknown attribute(s) {sorted(unknown)} on <action tool='{tool}'>. "
-                f"Allowed: {sorted(allowed)}.",
-                fragment=text[opener.start : opener.end + 200],
-            )
-        missing = [a for a in schema.required_attrs if a not in action_args]
-        if missing:
-            raise ActionParseError(
-                f"Missing required attribute(s) {missing} on <action tool='{tool}'>.",
-                fragment=text[opener.start : opener.end + 200],
-            )
-
+        # Locate structural extent first; an unterminated <action> is a real
+        # structural error and propagates rather than getting silently skipped.
         if opener.self_closing:
-            if not schema.self_closing_allowed:
+            close_end = opener.end
+            body: str | None = None
+        else:
+            close_start = _find_matching_close(text, opener.end)
+            close_match = _CLOSE_RE.match(text, close_start)
+            if close_match is None:  # pragma: no cover — defensive
                 raise ActionParseError(
-                    f"<action tool='{tool}'> may not be self-closing; this tool requires a body.",
-                    fragment=text[opener.start : opener.end],
+                    "Internal parser error: lost close tag for <action>.",
+                    fragment=text[opener.start : close_start + 20],
                 )
-            actions.append(
-                WorkspaceAction(
-                    tool=tool,
-                    args=action_args,
-                    body=None,
-                    raw=text[opener.start : opener.end],
-                )
-            )
-            pos = opener.end
+            close_end = close_match.end()
+            body = text[opener.end : close_start]
+
+        try:
+            action = _validate_action(text, opener, body, schemas)
+        except ActionParseError as exc:
+            if first_validation_error is None:
+                first_validation_error = exc
+            pos = close_end
             continue
 
-        # Find the matching </action> via depth-counting nested <action> openings.
-        close_start = _find_matching_close(text, opener.end)
-        body = text[opener.end : close_start]
-        # The closing `</action>` ends at close_start + len("</action>") which we
-        # locate via regex to handle whitespace/casing inside the close tag.
-        close_match = _CLOSE_RE.match(text, close_start)
-        if close_match is None:  # pragma: no cover — defensive
-            raise ActionParseError(
-                f"Internal parser error: lost close tag for <action tool='{tool}'>.",
-                fragment=text[opener.start : close_start + 20],
-            )
-        close_end = close_match.end()
-
-        if schema.body_required and not body.strip():
-            raise ActionParseError(
-                f"<action tool='{tool}'> requires a non-empty body.",
-                fragment=text[opener.start : close_end],
-            )
-
-        actions.append(
-            WorkspaceAction(
-                tool=tool,
-                args=action_args,
-                body=body,
-                raw=text[opener.start : close_end],
-            )
-        )
+        parsed.append((opener.start, close_end, action))
         pos = close_end
 
-    if not actions:
+    if not parsed:
+        if first_validation_error is not None:
+            raise first_validation_error
         raise ActionParseError(
             "No <action> elements found in response. The model must emit at "
             "least one well-formed <action> per turn."
         )
 
-    return actions
+    # Group into clusters: consecutive actions separated only by whitespace.
+    # Return the last cluster. With a single action or all-adjacent actions
+    # the result is identical to the legacy "return all" behavior.
+    last_cluster_start = 0
+    for i in range(1, len(parsed)):
+        between = text[parsed[i - 1][1] : parsed[i][0]]
+        if between.strip():
+            last_cluster_start = i
+    return [a for (_, _, a) in parsed[last_cluster_start:]]
+
+
+def _validate_action(
+    text: str,
+    opener: _OpenTag,
+    body: str | None,
+    schemas: dict[str, ActionSchema],
+) -> WorkspaceAction:
+    """Validate a single ``<action>`` extent against its tool's schema.
+
+    Raises ``ActionParseError`` on any per-action schema failure; the caller in
+    ``parse()`` decides whether to skip or surface the error.
+    """
+    attrs = _parse_attrs(opener.inner)
+    tool = _extract_tool_attr(attrs)
+    if not tool:
+        raise ActionParseError(
+            "Missing required attribute 'tool' on <action> element.",
+            fragment=text[opener.start : opener.end + 200],
+        )
+    if tool not in schemas:
+        raise ActionParseError(
+            f"Unknown tool '{tool}' on <action>. Known tools: {sorted(schemas.keys())}.",
+            fragment=text[opener.start : opener.end + 200],
+        )
+
+    schema = schemas[tool]
+    action_args = {k: v for k, v in attrs.items() if k != "tool"}
+
+    allowed = set(schema.required_attrs) | set(schema.optional_attrs)
+    unknown = set(action_args.keys()) - allowed
+    if unknown:
+        raise ActionParseError(
+            f"Unknown attribute(s) {sorted(unknown)} on <action tool='{tool}'>. "
+            f"Allowed: {sorted(allowed)}.",
+            fragment=text[opener.start : opener.end + 200],
+        )
+    missing = [a for a in schema.required_attrs if a not in action_args]
+    if missing:
+        raise ActionParseError(
+            f"Missing required attribute(s) {missing} on <action tool='{tool}'>.",
+            fragment=text[opener.start : opener.end + 200],
+        )
+
+    if opener.self_closing:
+        if not schema.self_closing_allowed:
+            raise ActionParseError(
+                f"<action tool='{tool}'> may not be self-closing; this tool requires a body.",
+                fragment=text[opener.start : opener.end],
+            )
+        return WorkspaceAction(
+            tool=tool,
+            args=action_args,
+            body=None,
+            raw=text[opener.start : opener.end],
+        )
+
+    assert body is not None  # paired tag always has a body extent
+    if schema.body_required and not body.strip():
+        raise ActionParseError(
+            f"<action tool='{tool}'> requires a non-empty body.",
+            fragment=text[opener.start : opener.end + len(body) + 20],
+        )
+    return WorkspaceAction(
+        tool=tool,
+        args=action_args,
+        body=body,
+        raw=text[opener.start : opener.end + len(body) + len("</action>")],
+    )
 
 
 # ---------------------------------------------------------------------------
