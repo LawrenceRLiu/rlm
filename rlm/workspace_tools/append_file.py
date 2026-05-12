@@ -18,7 +18,8 @@ SPEC = ToolSpec(
     runs_on="host",
     body_required=True,
     example=(
-        'Required attr: path. Body is appended verbatim — no wrappers. '
+        'Required attr: path (workspace-relative; absolute paths rejected). '
+        'Body is appended verbatim — no wrappers. '
         'Example: <action tool="append_file" path="log.txt">\nnew entry\n</action>'
     ),
 )

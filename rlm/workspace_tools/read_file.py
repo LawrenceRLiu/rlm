@@ -18,7 +18,8 @@ SPEC = ToolSpec(
     runs_on="host",
     body_required=False,
     example=(
-        'Required attr: path. Optional: start_line, end_line. '
+        'Required attr: path (workspace-relative; absolute paths rejected). '
+        'Optional: start_line, end_line. '
         'Example: <action tool="read_file" path="notes.md" start_line="1" end_line="50"/>'
     ),
 )

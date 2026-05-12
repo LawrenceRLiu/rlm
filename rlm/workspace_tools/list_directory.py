@@ -18,7 +18,7 @@ SPEC = ToolSpec(
     runs_on="host",
     body_required=False,
     example=(
-        'No required attrs. Optional: path (defaults to workspace root). '
+        'No required attrs. Optional: path (workspace-relative; defaults to workspace root). '
         'Example: <action tool="list_directory" path="_rlm_artifacts/"/>'
     ),
 )

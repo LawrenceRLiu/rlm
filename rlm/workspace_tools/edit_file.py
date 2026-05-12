@@ -23,7 +23,8 @@ SPEC = ToolSpec(
     runs_on="host",
     body_required=True,
     example=(
-        'Required attr: path. Optional: allow_multiple. Body must contain '
+        'Required attr: path (workspace-relative; absolute paths rejected). '
+        'Optional: allow_multiple. Body must contain '
         '<search>...</search><replace>...</replace>. '
         'Example: <action tool="edit_file" path="src/foo.py">'
         '<search>old_token</search><replace>new_token</replace></action>'
