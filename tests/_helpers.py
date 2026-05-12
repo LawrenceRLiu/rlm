@@ -5,15 +5,14 @@
   created on disk, the provenance store is initialized, but ``setup()`` (which
   starts the container + poller) is intentionally not called.
 
-- ``normalize_jsonl(text)`` strips run-specific values (timestamps, SHAs, run
-  ids, file paths, durations, uuid spill names) so two rollouts produced by
-  the same scripted ``MockLM`` compare byte-for-byte against a golden file.
+- ``schema_of_jsonl(text)`` reduces each JSONL line to its structural schema
+  (keys + value types, with list elements merged) so the visualizer-schema
+  golden test only fails on real shape changes — not on prompt copy edits.
 """
 
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 from rlm.core.config import WorkspaceConfig
@@ -50,42 +49,68 @@ def make_thin_env(
     return env
 
 
-_TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"[^"]+"')
-_SHA_RE = re.compile(r'"commit_sha"\s*:\s*"[a-f0-9]{7,64}"')
-_RUN_ID_RE = re.compile(r"run_\d+_[a-f0-9]+")
-_WS_PATH_RE = re.compile(r'"workspace_root"\s*:\s*"[^"]+"')
-_DURATION_RE = re.compile(r'"(execution_time|iteration_time)"\s*:\s*[0-9.eE+-]+')
-_SPILL_ID_RE = re.compile(r"_observations/[a-z0-9._-]+\.txt")
-# Abbreviated SHA inside a message content (the snapshot rendering inserts
-# ``commit="<7-hex>"`` into the user-message string included in prompt history).
-# In the on-disk JSONL this appears with the inner double-quotes escaped as ``\"``.
-_INNER_SHA_RE = re.compile(r'commit=\\"[a-f0-9]{7,64}\\"')
+def _schema_of(node):
+    """Recursively reduce a JSON value to a stable type/shape representation.
+
+    Scalars become ``"<str>"`` / ``"<int>"`` / ``"<float>"`` / ``"<bool>"`` /
+    ``"<null>"``. Lists become a single-element list whose element is the
+    merged schema of every input element (so list length and content vary
+    across runs without breaking the golden). Dicts keep their keys and
+    recurse into values.
+    """
+    if isinstance(node, dict):
+        return {k: _schema_of(v) for k, v in node.items()}
+    if isinstance(node, list):
+        if not node:
+            return []
+        merged = _schema_of(node[0])
+        for item in node[1:]:
+            merged = _merge_schemas(merged, _schema_of(item))
+        return [merged]
+    if node is None:
+        return "<null>"
+    if isinstance(node, bool):
+        return "<bool>"
+    if isinstance(node, int):
+        return "<int>"
+    if isinstance(node, float):
+        return "<float>"
+    return "<str>"
 
 
-def normalize_jsonl(text: str) -> str:
-    """Strip run-varying values so a JSONL run is reproducible across executions.
+def _merge_schemas(a, b):
+    """Union two schemas: dicts merge keys, lists merge elements; mismatches
+    fall back to a deterministic ``"a|b"`` tag so divergence is visible
+    rather than silently hidden by first-wins.
+    """
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = dict(a)
+        for k, v in b.items():
+            out[k] = _merge_schemas(out[k], v) if k in out else v
+        return out
+    if isinstance(a, list) and isinstance(b, list):
+        if not a:
+            return b
+        if not b:
+            return a
+        return [_merge_schemas(a[0], b[0])]
+    if a == b:
+        return a
+    return "|".join(sorted({str(a), str(b)}))
 
-    Replaces timestamps, commit SHAs, run ids, workspace paths, durations, and
-    spill-file names with stable placeholders. Each line is round-tripped
-    through ``json.dumps(..., sort_keys=True)`` so key ordering is stable too.
+
+def schema_of_jsonl(text: str) -> str:
+    """Reduce a JSONL stream to one schema-tagged line per record.
+
+    Each line is parsed, run through ``_schema_of``, and re-serialized with
+    sorted keys. The result fails only on shape changes — added/removed
+    keys or changed value types — and is invariant to scalar content,
+    list lengths, timestamps, hashes, or rendered prompt text.
     """
     out_lines: list[str] = []
     for raw in text.splitlines():
         if not raw.strip():
             continue
-        s = raw
-        s = _TIMESTAMP_RE.sub('"timestamp":"<TS>"', s)
-        s = _SHA_RE.sub('"commit_sha":"<SHA>"', s)
-        s = _RUN_ID_RE.sub("<RUN_ID>", s)
-        s = _WS_PATH_RE.sub('"workspace_root":"<WS>"', s)
-        s = _DURATION_RE.sub(lambda m: f'"{m.group(1)}":<T>', s)
-        s = _SPILL_ID_RE.sub("_observations/<SPILL>.txt", s)
-        s = _INNER_SHA_RE.sub(r'commit=\\"<INNER_SHA>\\"', s)
-        # Re-serialize for stable key ordering.
-        try:
-            obj = json.loads(s)
-        except json.JSONDecodeError:
-            out_lines.append(s)
-            continue
-        out_lines.append(json.dumps(obj, sort_keys=True))
+        obj = json.loads(raw)
+        out_lines.append(json.dumps(_schema_of(obj), sort_keys=True))
     return "\n".join(out_lines) + "\n"

@@ -251,12 +251,47 @@ class TestSpillIsolationInRollout:
 GOLDEN_FIXTURE = Path(__file__).parent / "fixtures" / "golden_rollout.jsonl"
 
 
+class TestSystemPromptInvariants:
+    """Content-level smoke checks complementing the schema-only golden test.
+
+    These guard the prompt against regressions that the schema-only golden
+    would miss (e.g. a tool registered but never advertised, or the workspace
+    layout no longer interpolated).
+    """
+
+    def test_system_prompt_advertises_every_tool(self, tmp_path: Path) -> None:
+        from rlm.workspace_tools import all_tool_names
+
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        _scripted_run(tmp_path, SCRIPT_HAPPY_PATH, log_dir=log_dir)
+        live_file = next(log_dir.glob("*.jsonl"))
+        lines = [json.loads(line) for line in live_file.read_text().splitlines() if line]
+        iter1 = next(line for line in lines if line.get("type") == "iteration")
+        system_msg = iter1["prompt"][0]
+        assert system_msg["role"] == "system"
+        sys_text = system_msg["content"]
+        for tool_name in all_tool_names():
+            assert tool_name in sys_text, f"tool {tool_name!r} missing from system prompt"
+        # Workspace layout is interpolated (catches a busted template).
+        assert "_rlm_query_0.txt" in sys_text
+
+    def test_final_answer_round_trips_to_jsonl(self, tmp_path: Path) -> None:
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        _scripted_run(tmp_path, SCRIPT_HAPPY_PATH, log_dir=log_dir)
+        live_file = next(log_dir.glob("*.jsonl"))
+        lines = [json.loads(line) for line in live_file.read_text().splitlines() if line]
+        iters = [line for line in lines if line.get("type") == "iteration"]
+        assert iters[-1]["final_answer"] == "The answer is 42."
+
+
 class TestGoldenJSONL:
     def test_jsonl_shape_matches_golden(self, tmp_path: Path) -> None:
         """The JSONL emitted by a fixed rollout must structurally match the
-        checked-in golden. ``normalize_jsonl`` strips run-varying values
-        (timestamps, SHAs, run ids, durations, paths) so only the schema
-        is compared.
+        checked-in golden. ``schema_of_jsonl`` reduces each record to its
+        key/type schema (scalars → type tags, lists → merged element schema)
+        so this only fires on real shape changes, not prompt or content edits.
 
         If this fails, the Python ``to_dict()`` shape changed — the
         visualizer's TypeScript types in ``visualizer/src/lib/types.ts``
@@ -265,13 +300,13 @@ class TestGoldenJSONL:
 
             python -m tests.test_e2e_rollout --regenerate-golden
         """
-        from tests._helpers import normalize_jsonl
+        from tests._helpers import schema_of_jsonl
 
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
         _scripted_run(tmp_path, SCRIPT_HAPPY_PATH, log_dir=log_dir)
         live_file = next(log_dir.glob("*.jsonl"))
-        live = normalize_jsonl(live_file.read_text())
+        live = schema_of_jsonl(live_file.read_text())
 
         if not GOLDEN_FIXTURE.exists():
             GOLDEN_FIXTURE.parent.mkdir(parents=True, exist_ok=True)
@@ -304,7 +339,7 @@ def _regenerate_golden() -> None:  # pragma: no cover — invoked from CLI only
     import sys
     import tempfile
 
-    from tests._helpers import normalize_jsonl
+    from tests._helpers import schema_of_jsonl
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
@@ -312,7 +347,7 @@ def _regenerate_golden() -> None:  # pragma: no cover — invoked from CLI only
         log_dir.mkdir()
         _scripted_run(td_path, SCRIPT_HAPPY_PATH, log_dir=log_dir)
         live_file = next(log_dir.glob("*.jsonl"))
-        live = normalize_jsonl(live_file.read_text())
+        live = schema_of_jsonl(live_file.read_text())
     GOLDEN_FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     GOLDEN_FIXTURE.write_text(live)
     shutil.rmtree(td_path, ignore_errors=True)
