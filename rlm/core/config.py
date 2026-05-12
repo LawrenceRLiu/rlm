@@ -70,6 +70,20 @@ class DockerConfig:
 
 
 @dataclass
+class LMConfig:
+    """LM-side behavior knobs applied to OpenAI-compatible clients.
+
+    The substrate's primary purpose is benchmarking reasoning models, so
+    ``enable_thinking`` defaults to True — Gemma 4 and Qwen3.x headline
+    numbers are thinking-on scores. Pass ``LMConfig(enable_thinking=False)``
+    to run an off-thinking baseline. Typos in field names raise ``TypeError``
+    at construction, surfacing misconfiguration before any LM call fires.
+    """
+
+    enable_thinking: bool = True
+
+
+@dataclass
 class WorkspaceConfig:
     """Composed config tree. Pass to ``RLM(workspace_config=...)``."""
 
@@ -77,3 +91,4 @@ class WorkspaceConfig:
     observation: ObservationConfig = field(default_factory=ObservationConfig)
     recursion: RecursionConfig = field(default_factory=RecursionConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
+    lm: LMConfig = field(default_factory=LMConfig)

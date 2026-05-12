@@ -136,14 +136,17 @@ class RLM:
         # RecursionHandler to selectively pull artifacts back into its workspace.
         self._last_final_artifacts: list[str] = []
 
-        # Log run metadata once if a logger / verbose is attached.
+        # Log run metadata once if a logger / verbose is attached. Use the
+        # resolved kwargs so the JSONL header reflects what actually gets
+        # passed to the client (in particular, ``enable_thinking``).
         if self.logger or verbose:
+            resolved = self._resolved_backend_kwargs()
             metadata = RLMMetadata(
-                root_model=(backend_kwargs or {}).get("model_name", "unknown"),
+                root_model=resolved.get("model_name", "unknown"),
                 max_depth=max_depth,
                 max_iterations=max_iterations,
                 backend=backend,
-                backend_kwargs=filter_sensitive_keys(backend_kwargs) if backend_kwargs else {},
+                backend_kwargs=filter_sensitive_keys(resolved),
                 environment_type="docker",
                 environment_kwargs={
                     "image": self.workspace_config.docker.image,
@@ -158,10 +161,28 @@ class RLM:
     # Resource management
     # =========================================================================
 
+    # Backends that route to ``rlm.clients.openai.OpenAIClient`` and therefore
+    # accept ``enable_thinking`` from ``LMConfig``. Other backends (anthropic,
+    # gemini, azure_openai, portkey) have their own thinking-mode mechanisms;
+    # we don't inject ``enable_thinking`` into their kwargs.
+    _OPENAI_COMPAT_BACKENDS: tuple[str, ...] = ("openai", "vllm", "openrouter", "vercel")
+
+    def _resolved_backend_kwargs(self) -> dict[str, Any]:
+        """Merge ``LMConfig`` into ``backend_kwargs`` for the active backend.
+
+        Caller-supplied ``backend_kwargs`` win over the config default (so a
+        run can override ``enable_thinking`` per-call without touching the
+        substrate config).
+        """
+        merged: dict[str, Any] = dict(self.backend_kwargs or {})
+        if self.backend in self._OPENAI_COMPAT_BACKENDS:
+            merged.setdefault("enable_thinking", self.workspace_config.lm.enable_thinking)
+        return merged
+
     @contextmanager
     def _spawn_completion_context(self, prompt: str | dict[str, Any] | list[Any]):
         """Bring up an LM handler + workspace env for a single completion."""
-        client: BaseLM = get_client(self.backend, self.backend_kwargs or {})
+        client: BaseLM = get_client(self.backend, self._resolved_backend_kwargs())
         lm_handler = LMHandler(client)
         lm_handler.start()
 

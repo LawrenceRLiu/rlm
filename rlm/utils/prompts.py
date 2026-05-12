@@ -4,6 +4,7 @@ from rlm.core.types import (
     WorkspaceIteration,
     WorkspaceObservation,
 )
+from rlm.utils.action_parser import strip_reasoning_blocks
 
 WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     """\
@@ -143,6 +144,12 @@ def format_workspace_iteration(iteration: WorkspaceIteration) -> list[dict[str, 
     and a synthetic user message containing the rendered observations and a
     one-line snapshot summary. Parse-retry attempts are NOT included here;
     they live in ``iteration.parse_attempts`` for the visualizer.
+
+    The assistant ``content`` is stripped of reasoning blocks
+    (``<think>`` and ``<|channel|>thought`` spans) before being replayed.
+    Google and Alibaba both document multi-turn semantics where the prior
+    turn's thought is dropped on replay; the strip also avoids paying
+    input-token cost for monologue the substrate already discarded.
     """
     obs_chunks: list[str] = []
     # Pair each action with its observation by index. Length should match
@@ -162,7 +169,7 @@ def format_workspace_iteration(iteration: WorkspaceIteration) -> list[dict[str, 
 
     user_message = "\n\n".join(obs_chunks) if obs_chunks else "(no observations)"
     return [
-        {"role": "assistant", "content": iteration.response},
+        {"role": "assistant", "content": strip_reasoning_blocks(iteration.response)},
         {"role": "user", "content": user_message},
     ]
 

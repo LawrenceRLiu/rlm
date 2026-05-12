@@ -96,6 +96,7 @@ huggingface-cli download google/gemma-4-31B-it
 A note on flags:
 - `--max-num-batched-tokens 8192` is **required** for Gemma 4 — its multimodal-bidirectional attention forces `--disable_chunked_mm_input`, and the default `max_num_batched_tokens=2048` is below the 2496-token MM item ceiling.
 - `--max-num-seqs 64` on replica C — TP=2 BF16 of a 31B on 48 GB cards OOMs during sampler warm-up at the default `max_num_seqs=256`.
+- `--reasoning-parser gemma4` — routes Gemma 4's `<|channel|>thought…<|channel|>` reasoning blocks into the response's separate `reasoning_content` field instead of leaving them inline in `content`. The substrate's `LMConfig.enable_thinking=True` default needs this server flag to actually surface reasoning into `WorkspaceIteration.reasoning`. Without it, reasoning lands as raw special tokens in `content` and the substrate's `strip_reasoning_blocks` discards it instead of capturing.
 
 ```bash
 # Replica A — A100 (GPU 4)
@@ -105,7 +106,8 @@ CUDA_VISIBLE_DEVICES=4 CUDA_DEVICE_ORDER=PCI_BUS_ID nohup bash -c '
   vllm serve google/gemma-4-31B-it \
     --port 8001 --host 127.0.0.1 \
     --max-model-len 32768 --max-num-batched-tokens 8192 \
-    --gpu-memory-utilization 0.90 --dtype bfloat16
+    --gpu-memory-utilization 0.90 --dtype bfloat16 \
+    --reasoning-parser gemma4
 ' > vllm_logs/replicaA.log 2>&1 &
 
 # Replica B — A100 (GPU 5)
@@ -115,7 +117,8 @@ CUDA_VISIBLE_DEVICES=5 CUDA_DEVICE_ORDER=PCI_BUS_ID nohup bash -c '
   vllm serve google/gemma-4-31B-it \
     --port 8002 --host 127.0.0.1 \
     --max-model-len 32768 --max-num-batched-tokens 8192 \
-    --gpu-memory-utilization 0.90 --dtype bfloat16
+    --gpu-memory-utilization 0.90 --dtype bfloat16 \
+    --reasoning-parser gemma4
 ' > vllm_logs/replicaB.log 2>&1 &
 
 # Replica C — A6000 ×2 TP=2 (GPUs 2,3)
@@ -126,9 +129,12 @@ CUDA_VISIBLE_DEVICES=2,3 CUDA_DEVICE_ORDER=PCI_BUS_ID nohup bash -c '
     --port 8003 --host 127.0.0.1 \
     --tensor-parallel-size 2 \
     --max-model-len 16384 --max-num-batched-tokens 8192 \
-    --max-num-seqs 64 --gpu-memory-utilization 0.85 --dtype bfloat16
+    --max-num-seqs 64 --gpu-memory-utilization 0.85 --dtype bfloat16 \
+    --reasoning-parser gemma4
 ' > vllm_logs/replicaC.log 2>&1 &
 ```
+
+For Qwen3-family models served via `_setup_runs/serve_one_qwen.sh`, pass `--reasoning-parser qwen3`; the same rationale applies for `<think>...</think>` blocks.
 
 Each replica takes 2–4 minutes to load. Watch for `Application startup complete.` in the log. Per-replica peak GPU memory (with the flags above): ~77 GB on each A100, ~43 GB per A6000.
 

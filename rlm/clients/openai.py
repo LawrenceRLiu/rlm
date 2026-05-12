@@ -1,4 +1,5 @@
 import os
+import re
 from collections import defaultdict
 from typing import Any
 
@@ -8,6 +9,22 @@ from dotenv import load_dotenv
 from rlm.clients.base_lm import BaseLM
 from rlm.core.types import ModelUsageSummary, UsageSummary
 
+# Gemma 4 thinking block (asymmetric special tokens). When vLLM's
+# ``--reasoning-parser gemma4`` fails to surface ``reasoning_content`` (see
+# vllm#38855 in 0.19.1), the block lands as literal text in ``content``. The
+# client-side fallback below detects and extracts it so the substrate's
+# ``reasoning_content`` channel still populates, and the trailing answer is
+# returned as the assistant content.
+_GEMMA_CHANNEL_RE = re.compile(
+    r"<\|channel>\s*thought\b(.*?)<channel\|>(.*)",
+    flags=re.DOTALL,
+)
+# Qwen-family ``<think>...</think>`` block. Same fallback strategy.
+_THINK_RE = re.compile(
+    r"<\s*think\b[^>]*>(.*?)<\s*/\s*think\s*>(.*)",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
 load_dotenv()
 
 # Load API keys from environment variables
@@ -16,6 +33,20 @@ DEFAULT_OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 DEFAULT_VERCEL_API_KEY = os.getenv("AI_GATEWAY_API_KEY")
 DEFAULT_PRIME_API_KEY = os.getenv("PRIME_API_KEY")
 DEFAULT_PRIME_INTELLECT_BASE_URL = "https://api.pinference.ai/api/v1/"
+
+# Public OpenAI-compatible endpoints that do NOT accept vLLM's
+# ``chat_template_kwargs`` extra-body field. Sending it to these endpoints
+# can 400 or silently degrade. ``enable_thinking`` is only forwarded when the
+# client's base URL is not in this set (i.e., we're pointed at a self-hosted
+# vLLM replica).
+_PUBLIC_OPENAI_COMPAT_BASES: frozenset[str] = frozenset(
+    {
+        "https://api.openai.com/v1",
+        "https://openrouter.ai/api/v1",
+        "https://ai-gateway.vercel.sh/v1",
+        DEFAULT_PRIME_INTELLECT_BASE_URL,
+    }
+)
 
 
 class OpenAIClient(BaseLM):
@@ -32,9 +63,11 @@ class OpenAIClient(BaseLM):
         api_key: str | None = None,
         model_name: str | None = None,
         base_url: str | None = None,
+        enable_thinking: bool = True,
         **kwargs,
     ):
         super().__init__(model_name=model_name, **kwargs)
+        self.enable_thinking: bool = enable_thinking
 
         if api_key is None:
             if base_url == "https://api.openai.com/v1" or base_url is None:
@@ -58,6 +91,9 @@ class OpenAIClient(BaseLM):
         self.async_client = openai.AsyncOpenAI(**client_kwargs)
         self.model_name = model_name
         self.base_url = base_url  # Track for cost extraction
+        self._is_self_hosted_vllm: bool = (
+            base_url is not None and base_url not in _PUBLIC_OPENAI_COMPAT_BASES
+        )
 
         # Per-model usage tracking
         self.model_call_counts: dict[str, int] = defaultdict(int)
@@ -78,15 +114,13 @@ class OpenAIClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for OpenAI client.")
 
-        extra_body = {}
-        if self.client.base_url == DEFAULT_PRIME_INTELLECT_BASE_URL:
-            extra_body["usage"] = {"include": True}
+        extra_body = self._build_extra_body()
 
         response = self.client.chat.completions.create(
             model=model, messages=messages, extra_body=extra_body
         )
         self._track_cost(response, model)
-        return response.choices[0].message.content
+        return self._capture_reasoning_and_content(response)
 
     async def acompletion(
         self, prompt: str | list[dict[str, Any]], model: str | None = None
@@ -102,15 +136,83 @@ class OpenAIClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for OpenAI client.")
 
-        extra_body = {}
-        if self.client.base_url == DEFAULT_PRIME_INTELLECT_BASE_URL:
-            extra_body["usage"] = {"include": True}
+        extra_body = self._build_extra_body()
 
         response = await self.async_client.chat.completions.create(
             model=model, messages=messages, extra_body=extra_body
         )
         self._track_cost(response, model)
-        return response.choices[0].message.content
+        return self._capture_reasoning_and_content(response)
+
+    def _build_extra_body(self) -> dict[str, Any]:
+        """Assemble the per-request ``extra_body`` dict.
+
+        ``chat_template_kwargs`` is a vLLM-specific extra-body field; sending
+        it to public OpenAI-compatible APIs (OpenAI, OpenRouter, Vercel, Prime)
+        can 400 or be silently dropped. Only forward when pointed at a
+        self-hosted vLLM replica.
+        """
+        extra_body: dict[str, Any] = {}
+        if self.client.base_url == DEFAULT_PRIME_INTELLECT_BASE_URL:
+            extra_body["usage"] = {"include": True}
+        if self._is_self_hosted_vllm:
+            extra_body["chat_template_kwargs"] = {"enable_thinking": self.enable_thinking}
+        return extra_body
+
+    def _capture_reasoning_and_content(self, response: openai.ChatCompletion) -> str:
+        """Populate ``_last_reasoning_content`` and return the assistant content.
+
+        Two paths feed ``reasoning_content``:
+
+        1. **Server-side parser.** vLLM surfaces a separate
+           ``reasoning_content`` field on ``message`` when launched with
+           ``--reasoning-parser <name>`` (gemma4, qwen3, etc.). When present,
+           we trust it and leave ``content`` untouched.
+        2. **Client-side fallback.** When the server-side parser is absent or
+           buggy (e.g. vllm#38855 for gemma4 in 0.19.1), the reasoning block
+           lands as literal text in ``content``. We detect known patterns
+           (Gemma 4 ``<|channel>thought ... <channel|>``, Qwen-family
+           ``<think>...</think>``), move the inner text into
+           ``_last_reasoning_content``, and strip them out of the returned
+           content. Anything after the closing tag (the model's actual
+           answer) is preserved.
+
+        Backends that don't expose reasoning either way leave
+        ``_last_reasoning_content`` at ``None`` and ``content`` unchanged.
+        """
+        msg = response.choices[0].message
+        # vLLM 0.19.1 names the field ``reasoning`` on the message. Older vLLM
+        # versions and some other backends use ``reasoning_content``. Check
+        # both, preferring the newer name. Both routes (direct attribute and
+        # the pydantic ``model_extra`` fall-through) are tried since the
+        # OpenAI SDK only types the standard fields.
+        reasoning: str | None = None
+        for field in ("reasoning", "reasoning_content"):
+            val = getattr(msg, field, None)
+            if val is None and hasattr(msg, "model_extra") and msg.model_extra:
+                val = msg.model_extra.get(field)
+            if val:
+                reasoning = val
+                break
+        content = msg.content or ""
+
+        if not reasoning and content:
+            # Try the client-side fallback. First match wins; in practice a
+            # single response carries only one format.
+            for pattern in (_GEMMA_CHANNEL_RE, _THINK_RE):
+                m = pattern.search(content)
+                if m is None:
+                    continue
+                # Inner text (group 1) → reasoning; pre-match prefix +
+                # post-match suffix → content. The fallback intentionally
+                # preserves any prose before the reasoning block (rare but
+                # legitimate; some models emit a leading "Let me think:" line).
+                reasoning = (m.group(1) or "").strip() or None
+                content = (content[: m.start()] + (m.group(2) or "")).lstrip()
+                break
+
+        self._last_reasoning_content = reasoning or None
+        return content
 
     def _track_cost(self, response: openai.ChatCompletion, model: str):
         self.model_call_counts[model] += 1

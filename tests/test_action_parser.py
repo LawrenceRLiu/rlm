@@ -303,6 +303,54 @@ def test_think_block_case_insensitive_and_with_attrs():
 
 
 # ---------------------------------------------------------------------------
+# Channel-block stripping (Gemma 4 — <|channel>thought ... <channel|>)
+# ---------------------------------------------------------------------------
+
+
+def test_channel_block_with_malformed_actions_is_stripped():
+    """Gemma 4 emits reasoning inside ``<|channel>thought ... <channel|>``
+    blocks (note the asymmetric special tokens: ``<|channel>`` opens,
+    ``<channel|>`` closes). When served without ``--reasoning-parser gemma4``
+    (or with a buggy parser), they appear as literal text. Stale
+    ``<action>`` attempts inside the channel must not poison the scanner."""
+    text = (
+        '<|channel>thought\nLet me try <action tool="read_file">_rlm_query_0.txt</action>'
+        " — that's missing the path. I should use"
+        ' <action tool="read_file" path="_rlm_query_0.txt"/>.\n<channel|>\n'
+        '<action tool="read_file" path="_rlm_query_0.txt" />'
+    )
+    actions = parse(text)
+    assert len(actions) == 1
+    assert actions[0].tool == "read_file"
+    assert actions[0].args["path"] == "_rlm_query_0.txt"
+
+
+def test_unterminated_channel_block_drops_tail():
+    """A ``<|channel>thought`` with no closing ``<channel|>`` is treated as
+    runaway monologue; everything from there to end-of-text is dropped."""
+    text = (
+        '<action tool="list_directory" />\n'
+        "<|channel>thought\nrunaway reasoning <action tool='bogus'>never closed"
+    )
+    actions = parse(text)
+    assert len(actions) == 1
+    assert actions[0].tool == "list_directory"
+
+
+def test_channel_and_think_mixed():
+    """Both reasoning formats can appear in a single response if a model is
+    transitioning between substrates; both must be stripped before scanning."""
+    text = (
+        "<think>qwen-style monologue</think>\n"
+        "<|channel>thought\ngemma-style monologue\n<channel|>\n"
+        '<action tool="list_directory" />'
+    )
+    actions = parse(text)
+    assert len(actions) == 1
+    assert actions[0].tool == "list_directory"
+
+
+# ---------------------------------------------------------------------------
 # Last-contiguous-block selection (Bug 2 — prose/code-fence quotations)
 # ---------------------------------------------------------------------------
 

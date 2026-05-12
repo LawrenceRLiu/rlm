@@ -131,6 +131,22 @@ _THINK_PAIR_RE = re.compile(
 )
 _THINK_OPEN_RE = re.compile(r"<\s*think\b[^>]*>", flags=re.IGNORECASE)
 
+# Gemma 4 emits reasoning blocks with **asymmetric** channel special tokens:
+# start ``<|channel>`` (no trailing pipe), end ``<channel|>`` (no leading pipe).
+# When vLLM is run without ``--reasoning-parser gemma4`` (or when the parser
+# is buggy — see vllm#38855 in 0.19.1), the tokens detokenize as literal text
+# into ``content``. The pattern matches the inner ``thought`` role label so
+# an unrelated future channel (e.g. ``<|channel>output``) is not accidentally
+# consumed. Token literals confirmed by reading
+# ``vllm/reasoning/gemma4_reasoning_parser.py:start_token`` /
+# ``end_token`` and by a raw ``/v1/completions`` probe against the served
+# replica on 2026-05-11.
+_CHANNEL_PAIR_RE = re.compile(
+    r"<\|channel>\s*thought\b.*?<channel\|>",
+    flags=re.DOTALL,
+)
+_CHANNEL_OPEN_RE = re.compile(r"<\|channel>\s*thought\b")
+
 
 @dataclass(frozen=True)
 class _OpenTag:
@@ -233,24 +249,42 @@ def _extract_tool_attr(attrs: dict[str, str]) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _strip_think_blocks(text: str) -> str:
-    """Remove ``<think>...</think>`` spans before action scanning.
+def strip_reasoning_blocks(text: str) -> str:
+    """Remove model-emitted reasoning spans before action scanning or replay.
 
-    Why: Qwen3-family models emit long self-corrective monologue inside
-    ``<think>``. The monologue routinely contains prior malformed ``<action>``
-    attempts ("I tried X, that didn't work, let me try Y"). The action scanner
-    is a forward regex walk and would dispatch the first stale attempt before
-    reaching the model's intended action below the think block. Stripping is
-    independent of vLLM's ``--reasoning-parser`` so the substrate is robust
-    regardless of serving config. An unterminated ``<think>`` (no closing tag)
-    drops the rest of the text — better than letting half the monologue feed
-    the scanner.
+    Covers two formats:
+    - Qwen3-family ``<think>...</think>`` (plain text tags).
+    - Gemma 4 ``<|channel|>thought ... <|channel|>`` (special-token channel
+      block; appears as literal text when vLLM's ``--reasoning-parser`` is
+      not configured).
+
+    Why: these models emit long self-corrective monologue inside the block.
+    The monologue routinely contains prior malformed ``<action>`` attempts
+    ("I tried X, that didn't work, let me try Y"). The action scanner is a
+    forward regex walk and would dispatch the first stale attempt before
+    reaching the model's intended action below. Stripping is independent of
+    vLLM's ``--reasoning-parser`` so the substrate is robust regardless of
+    serving config. An unterminated open tag (no matching close) drops the
+    rest of the text — better than letting half the monologue feed the
+    scanner or be replayed verbatim into the next turn's input.
     """
     text = _THINK_PAIR_RE.sub("", text)
-    m = _THINK_OPEN_RE.search(text)
-    if m is not None:
-        text = text[: m.start()]
+    text = _CHANNEL_PAIR_RE.sub("", text)
+    earliest_open: int | None = None
+    for pattern in (_THINK_OPEN_RE, _CHANNEL_OPEN_RE):
+        m = pattern.search(text)
+        if m is None:
+            continue
+        if earliest_open is None or m.start() < earliest_open:
+            earliest_open = m.start()
+    if earliest_open is not None:
+        text = text[:earliest_open]
     return text
+
+
+# Backwards-compatible alias for any external callers / tests that referenced
+# the old name. Internal callers use ``strip_reasoning_blocks`` directly.
+_strip_think_blocks = strip_reasoning_blocks
 
 
 def parse(text: str, schemas: dict[str, ActionSchema] | None = None) -> list[WorkspaceAction]:
@@ -270,7 +304,7 @@ def parse(text: str, schemas: dict[str, ActionSchema] | None = None) -> list[Wor
     ``<action>``) always bubbles immediately.
     """
     schemas = schemas if schemas is not None else _DEFAULT_SCHEMAS
-    text = _strip_think_blocks(text)
+    text = strip_reasoning_blocks(text)
 
     parsed: list[tuple[int, int, WorkspaceAction]] = []
     first_validation_error: ActionParseError | None = None
