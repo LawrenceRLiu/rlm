@@ -2,9 +2,14 @@
 
 ## Purpose & audience
 
-This is the playbook for someone who clones `rlm_substrate` on a fresh GPU box and wants to actually run an `RLM(...).completion(...)` end-to-end against a self-hosted model — not against a managed API. It documents the literal commands that worked (verified 2026-05-09 on a host with 2× A100 80 GB + 6× RTX A6000 48 GB), the failure modes I hit, and the schema/log layout the visualizer consumes.
+This is the playbook for someone who clones `rlm_substrate` on a fresh GPU box and wants to actually run an `RLM(...).completion(...)` end-to-end against a self-hosted model — not against a managed API. It documents the literal commands that worked (last verified 2026-05-11 on a host with 2× A100 80 GB + 6× RTX A6000 48 GB), the failure modes I hit, and the schema/log layout the visualizer consumes.
 
-The reference model used for the bring-up is **`google/gemma-4-31B-it`** (BF16, ≈62 GB weights, Apache 2.0). Per `Todo.md` the Gemma family is the proven format-follower for RLM substrates; Qwen3.6 27B / 35B-A3B is interesting as a *secondary* run since it failed the format on the old REPL substrate.
+The reference model used for the bring-up is **`google/gemma-4-31B-it`** (BF16, ≈62 GB weights, Apache 2.0). Per `Todo.md` the Gemma family is the proven format-follower for RLM substrates. The 2026-05-10/11 multi-model substrate sweep also has **Qwen3-8B / Qwen3.5-9B / Qwen3-32B / Qwen3.5-27B** passing all four Phase-3 tasks after the parser-forgiveness work and per-tool prompt examples landed (see `dev/2026-05-11_per_tool_example_ablation.md`). Qwen3.6-35B-A3B remains the standing failure case.
+
+Two serving patterns are documented below:
+
+- **One model, three replicas behind LiteLLM** (§4–§5) — the original Gemma 4 bring-up topology. Use this when you want a single model serving many concurrent `rlm_query` subcalls.
+- **One model per GPU, no LiteLLM** (§4b) — preferred for short multi-model evals. Used for the 2026-05-10/11 Qwen3 sweep. Scripts in `_setup_runs/serve_one_qwen.sh` + `run_all_qwen.sh`.
 
 ## Topology
 
@@ -40,9 +45,14 @@ Three independent runtimes talk over loopback. The model serving stack fans out 
   - **Permissions gotcha:** if a `docker` command returns "permission denied" even after group add, your shell's group set is stale (a long-lived IDE/editor server pre-dates the group change). Run `newgrp docker` and retry. **Do not** `sudo`.
 - `conda` (miniconda or mamba) available on PATH.
 - Python ≥3.11 in the env that runs `rlm` (we use 3.12).
-- Free TCP ports: 8000 (litellm), 8001/8002/8003 (vLLM replicas), 3001 (visualizer).
+- Free TCP ports: 8000 (litellm, only for the LiteLLM topology), 8001/8002/8003/8004 (vLLM replicas), 3001 (visualizer).
 - HuggingFace account with the model license accepted (Gemma 4 is Apache 2.0 — no license click required; Gemma 3 is *gated* and needs license acceptance on the model page).
-- ≥80 GB free disk for the model cache.
+- ≥80 GB free disk for the model cache. **On this host the root partition is tight** (a parallel multi-model download to `~/.cache` previously filled `/` and crashed the box). Redirect HF cache to `/data`:
+  ```bash
+  export HF_HUB_CACHE=/data/nwei/rlm_substrate/models
+  mkdir -p "$HF_HUB_CACHE"
+  ```
+  Put this in your shell rc and in every `vllm serve` / `huggingface-cli download` invocation. The `_setup_runs/serve_one_qwen.sh` script already does this; ad-hoc commands must opt in.
 
 ## Step-by-step setup
 
@@ -54,7 +64,7 @@ Three independent runtimes talk over loopback. The model serving stack fans out 
 # rlm client
 conda create -n RLM_substrate python=3.12 -y
 conda activate RLM_substrate
-python -m pip install -e .                                  # core deps
+python -m pip install -e ".[eval]"                          # core deps + datasets/tqdm for eval/ runners
 python -m pip install pytest-asyncio pytest-cov ruff pre-commit
 
 # vLLM server (separate env)
@@ -66,12 +76,14 @@ python -m pip install -U 'transformers>=5.8.0' 'huggingface-hub>=1.14.0'
 
 Why `vllm==0.19.1` and not the latest 0.20.x: see Issue Log entry "vLLM version pin." Why `transformers>=5.8.0`: the older 4.x line doesn't recognize `model_type=gemma4`.
 
+The eval-runner extras (`datasets`, `tqdm`) come from `pip install -e ".[eval]"`; the `RLM_substrate` env on this host already has them. Verified 2026-05-11: vllm 0.19.1, transformers 5.8.0, torch 2.10.0+cu128, 8 visible CUDA devices.
+
 > Sanity check after install:
 > ```
 > conda run -n RLM_substrate python -c "import rlm; print(rlm.__file__)"
-> conda run -n RLM_vllm_server python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"
+> conda run -n RLM_vllm_server python -c "import torch, vllm, transformers; print(torch.__version__, vllm.__version__, transformers.__version__, torch.cuda.device_count())"
 > ```
-> Expect torch `2.10.0+cu128` (or `+cu126`, depending on which torch wheel is current), `True`, and the actual device count.
+> Expect torch `2.10.0+cu128`, vllm `0.19.1`, transformers `5.8.0`, and 8 devices on this host.
 
 ### 2. Build the workspace Docker image
 
@@ -86,10 +98,11 @@ docker images | grep rlm-workspace
 
 ```bash
 conda activate RLM_vllm_server
+export HF_HUB_CACHE=/data/nwei/rlm_substrate/models
 huggingface-cli download google/gemma-4-31B-it
 ```
 
-≈59 GB; check `~/.cache/huggingface/hub/models--google--gemma-4-31B-it/`.
+≈59 GB; check `/data/nwei/rlm_substrate/models/models--google--gemma-4-31B-it/`. **Do not** let `huggingface-cli` default to `~/.cache/huggingface` — root has under ~20 GB headroom on this box. The qwen serve scripts under `_setup_runs/` already export `HF_HUB_CACHE` for you; for `vllm serve` invocations you write yourself, set it explicitly.
 
 ### 4. Launch three vLLM replicas
 
@@ -134,7 +147,7 @@ CUDA_VISIBLE_DEVICES=2,3 CUDA_DEVICE_ORDER=PCI_BUS_ID nohup bash -c '
 ' > vllm_logs/replicaC.log 2>&1 &
 ```
 
-For Qwen3-family models served via `_setup_runs/serve_one_qwen.sh`, pass `--reasoning-parser qwen3`; the same rationale applies for `<think>...</think>` blocks.
+For Qwen3-family models served via `_setup_runs/serve_one_qwen.sh`, pass `--reasoning-parser qwen3`; the same rationale applies for `<think>...</think>` blocks. As of the 2026-05-11 `rlm/clients/openai.py` rewrite, the substrate also strips in-band `<think>…</think>` from `content` and routes it to `WorkspaceIteration.reasoning` when the server *doesn't* expose `reasoning_content` — see `dev/2026-05-10_cot_prose_investigation.md` for the rationale and `rlm/clients/openai.py:163` for the implementation.
 
 Each replica takes 2–4 minutes to load. Watch for `Application startup complete.` in the log. Per-replica peak GPU memory (with the flags above): ~77 GB on each A100, ~43 GB per A6000.
 
@@ -180,11 +193,34 @@ curl -fsS http://127.0.0.1:8000/v1/models | python -c "import sys,json; print(js
 # → gemma-4-31b
 ```
 
+### 5b. Alternative topology — one model per GPU, no LiteLLM
+
+For short multi-model evals (the 2026-05-10/11 Qwen3 sweep is the canonical example), the LiteLLM-fronted multi-replica topology is overkill: each model only needs to serve one task at a time, and three replicas of an 8B model leave most of the box idle. The preferred pattern there is **one model per GPU, vLLM directly on :8001, no proxy**.
+
+Scripts under `_setup_runs/`:
+
+- `serve_one_qwen.sh <alias>` — bring up a single Qwen3 model on GPU 4 :8001, caching to `/data/nwei/rlm_substrate/models`. Handles the Qwen3.5-VL flags (`--limit-mm-per-prompt`, `--max-num-seqs 64`) automatically.
+- `stop_one_qwen.sh <alias> [--delete]` — kill the server and, with `--delete`, remove the cached weights so the next model fits on disk.
+- `run_all_qwen.sh` — serial orchestrator: for each of `qwen-3-8b`, `qwen-3-5-9b`, `qwen-3-32b`, `qwen-3-5-27b`, serve → run all four Phase-3 tasks → stop+delete → next. Parallel downloads filled the root partition on 2026-05-10, so this is intentionally serial.
+- `serve_all_qwen.sh` — parallel one-model-per-GPU bring-up of all four Qwen3 models at once on ports 8001–8004; use when GPU and disk both have headroom and you don't want sequential gating.
+
+Aliases (`--served-model-name`) are `qwen-3-8b`, `qwen-3-5-9b`, `qwen-3-32b`, `qwen-3-5-27b` (LiteLLM is not involved; vLLM serves these names directly). The client points `base_url` at the per-model port:
+
+```python
+RLM(
+    backend="vllm",
+    backend_kwargs={"model_name": "qwen-3-8b", "base_url": "http://127.0.0.1:8001/v1", "api_key": "EMPTY"},
+    ...
+)
+```
+
+The Qwen3.5-VL variants (`Qwen/Qwen3.5-9B`, `Qwen/Qwen3.5-27B`) are vision-language models served text-only — see `dev/2026-05-10_qwen-3-5-9b_substrate_eval.md` §1 for why `--limit-mm-per-prompt '{"image":0,"video":0}'` and `--max-num-seqs 64` are required (hybrid linear attention OOMs CUDA-graph capture at default `max_num_seqs=256`).
+
 ### 6. First completion — minimal copy-paste
 
 ```python
 from rlm import RLM
-from rlm.core.config import DockerConfig, WorkspaceConfig
+from rlm.core.config import DockerConfig, LMConfig, WorkspaceConfig
 from rlm.logger import RLMLogger
 
 logger = RLMLogger(log_dir="./logs")
@@ -196,7 +232,10 @@ rlm = RLM(
         "base_url": "http://127.0.0.1:8000/v1",
         "api_key": "EMPTY",
     },
-    workspace_config=WorkspaceConfig(docker=DockerConfig(cleanup_mode="keep")),
+    workspace_config=WorkspaceConfig(
+        docker=DockerConfig(cleanup_mode="keep"),
+        lm=LMConfig(enable_thinking=True),            # default; pass False for an off-thinking baseline
+    ),
     logger=logger,
     verbose=True,
 )
@@ -209,23 +248,25 @@ print(result.response)
 
 Expect: ≈15 s wall clock, 4 LM calls, `~/.rlm/workspaces/run_<id>/primes.txt` containing 100 primes starting `2,3,5,7,…`.
 
-> **Common typo trap:** `backend_kwargs.model_name` is the litellm-proxy alias `gemma-4-31b`, not the HF id `google/gemma-4-31B-it`. Litellm rejects requests where `model` doesn't match its `model_list` aliases.
+> **Common typo trap:** `backend_kwargs.model_name` is the litellm-proxy alias `gemma-4-31b` (or the vLLM `--served-model-name` if you're using the no-proxy topology), not the HF id `google/gemma-4-31B-it`. The server rejects requests where `model` doesn't match a registered alias.
+
+> **`LMConfig.enable_thinking` defaults to True.** The substrate's primary purpose is benchmarking reasoning models, so Gemma 4 / Qwen3.x headline numbers are thinking-on. Typos in `LMConfig` field names raise `TypeError` at construction (the dataclass is fail-loud by design). Prefer `LMConfig(...)` over passing free-form kwargs to backends.
 
 ## Running the test suite
 
 ```bash
 conda activate RLM_substrate
 
-# Pure unit tests (no Docker, no network) — 107 tests, ~4 s
+# Pure unit tests (no Docker, no network) — 304 tests, ~5 s
 pytest tests/ -v --ignore=tests/clients --ignore=tests/test_docker_workspace.py
 
-# Docker integration tests — 15 tests, ~40 s. Includes the only end-to-end
+# Docker integration tests — 22 tests, ~40 s. Includes the only end-to-end
 # rlm_query exercise in the repo (test_rlm_query_end_to_end_with_mock_lm).
 # Auto-skips if the workspace image isn't built.
 pytest tests/test_docker_workspace.py -v
 ```
 
-`tests/clients/` is excluded because it requires real provider API keys (matches `.github/workflows/test.yml`).
+`tests/clients/` is excluded because it requires real provider API keys (matches `.github/workflows/test.yml`). The full suite (`pytest tests/` with the workspace image built) currently runs ~347 tests including the benchmark-runner tests under `tests/test_terminal_bench_runner.py`, `tests/test_swebench_runner.py`, and `tests/test_composite_image.py`.
 
 ## Tracing & inspecting a run
 
@@ -233,7 +274,9 @@ pytest tests/test_docker_workspace.py -v
 `rlm_<YYYY-MM-DD>_<HH-MM-SS>_<uuid>.jsonl`. Each file has:
 
 - one **metadata** header line: `{"type":"metadata", "root_model":"...", "backend":"...", "max_depth":N, ...}`
-- one **iteration** line per turn: `{"type":"iteration", "iteration":N, "actions":[...], "observations":[...], "snapshot":{...}, "parse_attempts":[...], "iteration_time":<s>, "final_answer":"..."}`
+- one **iteration** line per turn: `{"type":"iteration", "iteration":N, "actions":[...], "observations":[...], "snapshot":{...}, "parse_attempts":[...], "iteration_time":<s>, "reasoning":"...", "final_answer":"..."}`
+
+The `reasoning` field carries thinking content for that turn. It is populated from two sources, in priority order: (a) the backend's structured `reasoning_content` field (Gemma 4 with `--reasoning-parser gemma4`, Qwen3.x with `--reasoning-parser qwen3`, Anthropic extended thinking, OpenAI reasoning, Gemini thinking), and (b) any `<think>…</think>` block the substrate finds in raw `content`, which it strips and routes here. If neither is present (e.g. Gemma 4 served without the parser flag), `reasoning` is `null`.
 
 Visualizer (`visualizer/`):
 
@@ -270,9 +313,39 @@ Notes:
 - 0 parse retries and 0 observation spills across all four runs — the substrate didn't have to fall back.
 - Run scripts: `_setup_runs/run_3{a,b,c,d}_*.py`. Logs: `_setup_runs/logs/`.
 
+### Qwen3 family — 2026-05-11 substrate sweep (one-model-per-GPU, no LiteLLM)
+
+After the action-parser forgiveness work and the per-tool prompt examples landed (commits `ac7d97b` + `7666f61`), all four Qwen3 models pass all four Phase-3 tasks. Full breakdown: `dev/2026-05-11_per_tool_example_ablation.md`.
+
+| Model | 3a | 3b | 3c | 3d | total retries | total LM calls | wall (s) |
+|---|---|---|---|---|---|---|---|
+| Qwen3-8B | ✅ | ✅ | ✅ | ✅ | 0 | 24 | 251 |
+| Qwen3.5-9B | ✅ | ✅ | ✅ (1r) | ✅ | 1 | 74 | 256 |
+| Qwen3-32B | ✅ | ✅ | ✅ | ✅ | 0 | 26 | 705 |
+| Qwen3.5-27B | ✅ | ✅ | ✅ | ✅\* | 0 | 33 | 232 |
+
+\* 27B 3d returns 336/420 functions (top-level only). Task-comprehension issue, not a substrate issue.
+
+Standing exception: **Qwen3.6-35B-A3B** still fails the substrate format (see `dev/2026-05-09_qwen3-6-35B-A3B_vs_gemma4-31B.md`).
+
+## Benchmarks (`eval/`)
+
+Two third-party benchmark integrations live under `eval/`. Architecture and conventions in [`08_benchmark_support.md`](08_benchmark_support.md).
+
+- **Terminal-Bench 2.0** (`eval/terminal_bench/runner.py`) — wired up; substrate validation passes on 3 demo tasks. Task source is the `third_party/harbor` git submodule (`git submodule update --init --recursive` to fetch).
+- **SWE-Bench** (`eval/swebench/runner.py`) — wired up; runs against SWE-Bench Verified instances. Composite image is built per instance from `swebench/sweb.eval.x86_64.<id>` + the broker layer.
+
+Both runners use a shared `pre_cleanup_callback` hook on `RLM.completion(...)` that fires after the agent loop returns but before the container is torn down (this is where the grader runs). The composite-image builder is in `eval/common/composite_image.py`. Optional eval-runner deps (`datasets`, `tqdm`) come from `pip install -e ".[eval]"`.
+
 ## Issues found in the scaffold
 
-Tagged `BLOCKER` / `BUG` / `ROUGH-EDGE` / `NOTE`. Patches were avoided unless trivial.
+Tagged `BLOCKER` / `BUG` / `ROUGH-EDGE` / `NOTE` / `RESOLVED`. Patches were avoided unless trivial; resolved items are kept for the audit trail.
+
+- **`RESOLVED` — action parser used to reject child-element XML.** Qwen3 family models naturally emit `<action tool="read_file"><path>...</path></action>` instead of the attribute form. Originally this exhausted the retry budget on the first turn for 3 of 4 Qwen3 models. The parser was rewritten in `ac7d97b` to accept both forms; the per-tool examples in `7666f61` further cut retries to ~0. All four Qwen3 models now pass 4/4 Phase-3 tasks. See `dev/2026-05-11_per_tool_example_ablation.md`.
+
+- **`RESOLVED` — `WorkspaceIteration.reasoning` was empty for vLLM-served models.** Two fixes in `4314a04`: (1) pass `--reasoning-parser <gemma4|qwen3>` to vLLM so the server populates structured `reasoning_content`; (2) substrate-side fallback strips in-band `<think>...</think>` from `content` into `reasoning`. Now populated for both Gemma 4 (with the flag) and Qwen3.x (with or without it).
+
+- **`NOTE` — Gemma 4 emits no prose around `<action>` tags.** Spotted in SWE-Bench smoke (`dev/2026-05-10_cot_prose_investigation.md`). The system prompt says reasoning prose is *permitted*; Gemma takes the permissive option to the limit. Likely a prompt-phrasing change is warranted, but not bundled with substrate fixes since it cross-cuts all models. A/B tracked in that note.
 
 - **`BLOCKER` — the README's `uv` quick-setup needs `uv` already installed.** README's "Manual Setup" runs `curl https://astral.sh/uv/install.sh | sh` then `uv venv …`. On a host without `uv`, that one curl-pipe-sh step is the install bootstrap; the README implies `uv` is "the" way to install. CLAUDE.md does say `python -m pip install` is acceptable; I used that path. **Suggested fix:** README should call out the bootstrap or offer the `python -m pip` path as the primary alternative.
 
@@ -284,7 +357,11 @@ Tagged `BLOCKER` / `BUG` / `ROUGH-EDGE` / `NOTE`. Patches were avoided unless tr
 
 - **`ROUGH-EDGE` — sampler warm-up OOMs on A6000 TP=2 at default `max_num_seqs`.** Replica C OOMs during `_dummy_sampler_run` with 256 dummy requests on Gemma 4 31B BF16 / 2× A6000 / 32K context. Lower `--max-num-seqs 64` and/or `--gpu-memory-utilization 0.85`. Single-card A100 80 GB doesn't hit this.
 
-- **`ROUGH-EDGE` — RLM's `vllm` backend takes the litellm-proxy alias, NOT the HF id.** When fronted by litellm, `backend_kwargs.model_name` must match the proxy's `model_list[*].model_name` (e.g. `gemma-4-31b`), not the underlying HF id. Mismatch produces `400 Invalid model name passed in model=…`. Worth a one-liner in the README.
+- **`ROUGH-EDGE` — RLM's `vllm` backend takes the served alias, NOT the HF id.** Whether fronted by LiteLLM (the alias is `model_list[*].model_name`) or by vLLM directly (the alias is `--served-model-name`), `backend_kwargs.model_name` must match. Mismatch produces `400 Invalid model name passed in model=…`. Worth a one-liner in the README.
+
+- **`ROUGH-EDGE` — disk layout matters.** Root `/` on this host has < 20 GB headroom. Letting `huggingface-cli` or `vllm serve` default to `~/.cache/huggingface` will fill the partition mid-download and crash the box (this happened during the parallel multi-model bring-up on 2026-05-10). Always export `HF_HUB_CACHE=/data/nwei/rlm_substrate/models`. `_setup_runs/serve_one_qwen.sh` and `serve_all_qwen.sh` do this for you; ad-hoc invocations must opt in.
+
+- **`ROUGH-EDGE` — Qwen3.5-VL hybrid-attention OOMs CUDA-graph capture at default `max_num_seqs`.** Same failure family as Qwen3.6 (Mamba/linear-attention). For both `Qwen/Qwen3.5-9B` and `Qwen/Qwen3.5-27B`, set `--max-num-seqs 64` and `--limit-mm-per-prompt '{"image":0,"video":0}'` (we serve them text-only). The `serve_one_qwen.sh` per-alias config handles this.
 
 - **`ROUGH-EDGE` — `litellm` warns `Key 'request_timeout' is not a valid argument for Router.__init__()`.** The plan's example config has `request_timeout: 600` under `router_settings`. litellm 1.83 ignores it harmlessly but emits a warning. Use `timeout: 600` instead, or omit if defaults are fine.
 
@@ -312,6 +389,7 @@ sudo rm -rf ~/.rlm/workspaces/*
 # remove docker image
 docker rmi rlm-workspace:0.1.0
 
-# remove model cache (frees ~59 GB)
-rm -rf ~/.cache/huggingface/hub/models--google--gemma-4-31B-it
+# remove model cache (frees ~59 GB per Gemma 4 / ~17–55 GB per Qwen3)
+rm -rf /data/nwei/rlm_substrate/models/models--google--gemma-4-31B-it
+# or for one-shot: bash _setup_runs/stop_one_qwen.sh <alias> --delete
 ```
