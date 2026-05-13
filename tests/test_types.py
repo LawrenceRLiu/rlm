@@ -173,6 +173,7 @@ class TestRLMMetadata:
             max_iterations=10,
             backend="openai",
             backend_kwargs={"api_key": "secret"},
+            action_format="native",
             environment_type="docker",
             environment_kwargs={},
         )
@@ -180,3 +181,4 @@ class TestRLMMetadata:
         assert d["root_model"] == "gpt-4"
         assert d["max_depth"] == 2
         assert d["backend"] == "openai"
+        assert d["action_format"] == "native"

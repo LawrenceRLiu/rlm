@@ -11,7 +11,7 @@ from threading import Thread
 
 from rlm.clients.base_lm import BaseLM
 from rlm.core.comms_utils import LMRequest, LMResponse, socket_recv, socket_send
-from rlm.core.types import RLMChatCompletion, UsageSummary
+from rlm.core.types import LMCompletionResult, RLMChatCompletion, UsageSummary
 
 
 class LMRequestHandler(StreamRequestHandler):
@@ -219,6 +219,18 @@ class LMHandler:
         client = self.get_client(model)
         content = client.completion(prompt)
         return content, client.get_last_reasoning_content()
+
+    def completion_with_tools(
+        self,
+        prompt,
+        *,
+        tools: list[dict],
+        tool_choice="required",
+        model: str | None = None,
+    ) -> LMCompletionResult:
+        """Direct completion call using native OpenAI-compatible tool calls."""
+        client = self.get_client(model)
+        return client.completion_with_tools(prompt, tools=tools, tool_choice=tool_choice)
 
     def __enter__(self):
         self.start()

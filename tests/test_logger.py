@@ -37,6 +37,7 @@ def _make_metadata() -> RLMMetadata:
         max_iterations=5,
         backend="openai",
         backend_kwargs={"model_name": "mock-model"},
+        action_format="native",
         environment_type="docker",
         environment_kwargs={"image": "rlm-workspace:0.1.0"},
     )
@@ -177,7 +178,7 @@ class TestLoggerLineShape:
             assert key in line, f"missing iteration key: {key}"
         # Action / observation children mirror their to_dict shape.
         a = line["actions"][0]
-        assert set(a.keys()) == {"tool", "args", "body", "raw"}
+        assert set(a.keys()) == {"tool", "args", "body", "raw", "call_id"}
         o = line["observations"][0]
         for k in (
             "tool",

@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from rlm.core.config import PromptHistoryConfig, WorkspaceConfig
+from rlm.core.config import ParseConfig, PromptHistoryConfig, WorkspaceConfig
 from rlm.core.rlm import RLM
 from rlm.core.types import (
     RLMChatCompletion,
@@ -63,9 +63,38 @@ class TestWorkspaceSystemPrompt:
     def test_system_prompt_describes_tool_intent(self):
         p = build_workspace_system_prompt(depth=0, max_depth=1)
         assert "# Tool intent" in p
-        assert "Use ``write_file``, ``append_file``, and ``edit_file``" in p
-        assert "Do not use ``python`` or ``shell`` as a substitute" in p
+        assert "Use ``write_file``, ``append_file``, and ``edit``" in p
+        assert "run_python_command" in p
+        assert "run_shell_command" in p
+        assert "Every assistant turn must make at least one native tool call" in p
+        assert '<action tool="final"' not in p
+        assert "<answer>" not in p
+        assert "<artifact" not in p
+        assert "<action" not in p
+
+    def test_xml_system_prompt_is_explicit_compatibility_path(self):
+        p = build_workspace_system_prompt(depth=0, max_depth=1, action_format="xml")
+        assert "emit one or more ``<action tool=\"...\">...</action>`` elements" in p
         assert "one short ``<note>...</note>``" in p
+
+    def test_native_action_format_defaults_thinking_off_for_vllm(self):
+        cfg = WorkspaceConfig()
+        rlm = RLM(
+            backend="vllm",
+            backend_kwargs={"model_name": "fake", "base_url": "http://localhost:8000/v1"},
+            workspace_config=cfg,
+        )
+        assert rlm._resolved_backend_kwargs()["enable_thinking"] is False
+
+    def test_public_completion_rejects_deprecated_xml_format(self):
+        cfg = WorkspaceConfig(parse=ParseConfig(action_format="xml"))
+        rlm = RLM(
+            backend="openai",
+            backend_kwargs={"model_name": "fake"},
+            workspace_config=cfg,
+        )
+        with pytest.raises(ValueError, match="Legacy XML tool calling is deprecated"):
+            rlm.completion("x")
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +119,7 @@ class TestFormatWorkspaceIteration:
             observations=[obs],
             snapshot=snap,
         )
-        msgs = format_workspace_iteration(it)
+        msgs = format_workspace_iteration(it, action_format="xml")
         assert [m["role"] for m in msgs] == ["assistant", "user"]
         assert '<action_replay action_id="t1.a1" tool="read_file"' in msgs[0]["content"]
         assert "t1.a1" in msgs[1]["content"]
@@ -120,7 +149,7 @@ class TestFormatWorkspaceIteration:
             actions=[action],
             observations=[obs],
         )
-        msgs = format_workspace_iteration(it)
+        msgs = format_workspace_iteration(it, action_format="xml")
         assert "secret draft body" not in msgs[0]["content"]
         assert "body omitted from replay" in msgs[0]["content"]
         assert "Wrote 29 chars to draft.md" in msgs[1]["content"]
@@ -139,7 +168,7 @@ class TestFormatWorkspaceIteration:
             actions=[action],
             observations=[WorkspaceObservation(tool="list_directory", stdout="ok")],
         )
-        msgs = format_workspace_iteration(it)
+        msgs = format_workspace_iteration(it, action_format="xml")
         assert '<turn_note turn="3">' in msgs[0]["content"]
         assert "verify the beta derivation" in msgs[0]["content"]
 
@@ -156,7 +185,7 @@ class TestFormatWorkspaceIteration:
             observations=[WorkspaceObservation(tool="list_directory", stdout="ok")],
         )
         cfg = PromptHistoryConfig(max_turn_note_chars=10)
-        msgs = format_workspace_iteration(it, history_config=cfg)
+        msgs = format_workspace_iteration(it, history_config=cfg, action_format="xml")
         assert long_note not in msgs[0]["content"]
         assert '<turn_note turn="4" omitted="true" reason="too-long"' in msgs[0]["content"]
 
@@ -174,7 +203,7 @@ class TestFormatWorkspaceIteration:
             actions=[action],
             observations=[WorkspaceObservation(tool="list_directory", stdout="ok")],
         )
-        msgs = format_workspace_iteration(it)
+        msgs = format_workspace_iteration(it, action_format="xml")
         assert "print('large content')" not in msgs[0]["content"]
         assert 'reason="content-like"' in msgs[0]["content"]
 
@@ -200,6 +229,7 @@ class TestFormatWorkspaceIteration:
         msgs = format_workspace_history(
             [old, new],
             history_config=PromptHistoryConfig(full_observation_turns=1),
+            action_format="xml",
         )
         assert "full file contents" not in msgs[1]["content"]
         assert "stdout omitted from replay" in msgs[1]["content"]
@@ -223,10 +253,35 @@ class TestFormatWorkspaceIteration:
             observations=[obs],
         )
         cfg = PromptHistoryConfig(max_mutating_command_stdout_replay_chars=10)
-        msgs = format_workspace_iteration(it, history_config=cfg)
+        msgs = format_workspace_iteration(it, history_config=cfg, action_format="xml")
         assert "x" * 10 in msgs[1]["content"]
         assert "x" * 11 not in msgs[1]["content"]
         assert "stdout truncated for replay" in msgs[1]["content"]
+
+    def test_native_replay_does_not_emit_xml_tags(self):
+        action = WorkspaceAction(
+            tool="run_python_command",
+            args={"code": "print('x')\n", "timeout": 10},
+            body="print('x')\n",
+            raw='{"name": "run_python_command"}',
+            call_id="call_1",
+        )
+        obs = WorkspaceObservation(tool="run_python_command", stdout="x\n")
+        it = WorkspaceIteration(
+            iteration=1,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="",
+            reasoning=None,
+            actions=[action],
+            observations=[obs],
+        )
+        msgs = format_workspace_iteration(it)
+        text = "\n".join(msg["content"] for msg in msgs)
+        assert "TOOL_CALL t1.a1 tool=run_python_command" in text
+        assert "OBSERVATION t1.a1 tool=run_python_command" in text
+        assert "<action" not in text
+        assert "<observation" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +298,7 @@ def _mock_lm_handler(responses: list[tuple[str, str | None]]) -> MagicMock:
 
 class TestParseAndRetry:
     def _rlm(self, retries: int = 3) -> RLM:
-        cfg = WorkspaceConfig()
+        cfg = WorkspaceConfig(parse=ParseConfig(action_format="xml"))
         cfg.parse.max_action_parse_retries = retries
         return RLM(
             backend="openai",
@@ -462,7 +517,7 @@ class TestFailedIterationLogging:
     """When parse retries exhaust, the partial iteration must reach the log."""
 
     def _rlm(self, retries: int = 2) -> RLM:
-        cfg = WorkspaceConfig()
+        cfg = WorkspaceConfig(parse=ParseConfig(action_format="xml"))
         cfg.parse.max_action_parse_retries = retries
         return RLM(
             backend="openai",
@@ -506,7 +561,7 @@ class TestFailedIterationLogging:
         `self.logger.log_iteration`, then re-raises."""
         from rlm.logger import RLMLogger
 
-        cfg = WorkspaceConfig()
+        cfg = WorkspaceConfig(parse=ParseConfig(action_format="xml"))
         cfg.parse.max_action_parse_retries = 1
         logger = RLMLogger(log_dir=None)
         rlm = RLM(

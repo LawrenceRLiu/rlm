@@ -88,7 +88,7 @@ The RLM runtime operates inside a **Docker container with a mounted workspace di
 
 - **Durable memory**: Files in the workspace survive across iterations
 - **Git snapshots**: One commit per turn tracks changes and enables rollback
-- **Structured actions**: The LM emits `<action>` XML blocks for file ops, code execution, and recursive calls
+- **Structured actions**: native OpenAI-compatible/vLLM tool calls for file ops, code execution, and recursive calls; legacy `<action>` XML is retained only for old logs and parser compatibility
 - **Isolation**: Code execution is sandboxed; malicious payloads are contained
 - **File provenance**: Role-based tagging (`user`, `assistant`, `system`, `child`) tracks which tool created/modified each file
 - **Recursive support**: Child RLM instances get a copy-on-spawn snapshot of the parent workspace
@@ -98,11 +98,15 @@ The workspace environment is configured via `WorkspaceConfig`, with sub-configs 
 
 ```python
 from rlm import RLM
-from rlm.core.config import WorkspaceConfig, DockerConfig, RecursionConfig
+from rlm.core.config import DockerConfig, RecursionConfig, WorkspaceConfig
 
 rlm = RLM(
-    backend="anthropic",
-    backend_kwargs={"model_name": "claude-3-5-sonnet-20241022"},
+    backend="vllm",
+    backend_kwargs={
+        "model_name": "qwen3-5-9b",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "api_key": "EMPTY",
+    },
     workspace_config=WorkspaceConfig(
         docker=DockerConfig(
             image="rlm-workspace:0.1.0",
@@ -127,6 +131,29 @@ make build-image IMAGE_TAG=my-workspace:latest
 ```
 
 The image is based on `python:3.11-slim` with pre-installed scientific/utility libraries (NumPy, Pandas, SciPy, Matplotlib, etc.). See `docker/workspace.Dockerfile` for the full manifest.
+
+### Native vLLM Tool Calls
+For Qwen/Qwen3.5 runs, the native scaffold is the default:
+
+```python
+from rlm.core.config import WorkspaceConfig
+
+workspace_config = WorkspaceConfig()
+```
+
+Serve vLLM with auto tool choice enabled. The single-replica helper now defaults to the `hermes` parser:
+
+```bash
+python setup/server_qwen35_single.py --port 8001 --gpus 0 --model Qwen/Qwen3.5-9B
+```
+
+The native tool surface uses `run_shell_command`, `run_python_command`, `edit`, `write_file`, `append_file`, `read_file`, `list_directory`, `llm_query`, `rlm_query`, and `final`. `run_python_command` preimports `llm_query`, `llm_query_batched`, `rlm_query`, and `rlm_query_batched` for programmatic document loops and batched calls.
+
+In native mode, OpenAI-compatible backends default to `enable_thinking=False` unless `backend_kwargs` explicitly overrides it. This avoids known Qwen/vLLM cases where thinking text can interfere with tool-call extraction.
+
+Legacy XML is not supported for new public `RLM.completion()` runs. Existing
+XML logs remain readable by the visualizer, and the parser compatibility code
+is retained for old traces and tests.
 
 
 ### Supported LM Backends

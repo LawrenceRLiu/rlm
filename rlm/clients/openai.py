@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from collections import defaultdict
@@ -7,7 +8,7 @@ import openai
 from dotenv import load_dotenv
 
 from rlm.clients.base_lm import BaseLM
-from rlm.core.types import ModelUsageSummary, UsageSummary
+from rlm.core.types import LMCompletionResult, LMToolCall, ModelUsageSummary, UsageSummary
 
 # Gemma 4 thinking block (asymmetric special tokens). When vLLM's
 # ``--reasoning-parser gemma4`` fails to surface ``reasoning_content`` (see
@@ -115,7 +116,7 @@ class OpenAIClient(BaseLM):
             raise ValueError("Model name is required for OpenAI client.")
 
         extra_body = self._build_extra_body()
-        
+
         openai_kwargs = dict(self.sampling_kwargs)
         for k in ["top_k", "min_p", "repetition_penalty"]:
             if k in openai_kwargs:
@@ -126,6 +127,62 @@ class OpenAIClient(BaseLM):
         )
         self._track_cost(response, model)
         return self._capture_reasoning_and_content(response)
+
+    def completion_with_tools(
+        self,
+        prompt: str | list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]],
+        tool_choice: Any = "required",
+        model: str | None = None,
+    ) -> LMCompletionResult:
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, list) and all(isinstance(item, dict) for item in prompt):
+            messages = prompt
+        else:
+            raise ValueError(f"Invalid prompt type: {type(prompt)}")
+
+        model = model or self.model_name
+        if not model:
+            raise ValueError("Model name is required for OpenAI client.")
+
+        extra_body = self._build_extra_body()
+        openai_kwargs = dict(self.sampling_kwargs)
+        for k in ["top_k", "min_p", "repetition_penalty"]:
+            if k in openai_kwargs:
+                extra_body[k] = openai_kwargs.pop(k)
+
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            extra_body=extra_body,
+            **openai_kwargs,
+        )
+        self._track_cost(response, model)
+        content = self._capture_reasoning_and_content(response)
+        calls: list[LMToolCall] = []
+        for call in response.choices[0].message.tool_calls or []:
+            raw_args = call.function.arguments or "{}"
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Tool call {call.id} ({call.function.name}) arguments are not valid JSON: "
+                    f"{exc.msg}"
+                ) from exc
+            if not isinstance(args, dict):
+                raise ValueError(
+                    f"Tool call {call.id} ({call.function.name}) arguments must be a JSON object."
+                )
+            calls.append(LMToolCall(id=call.id, name=call.function.name, arguments=args))
+        return LMCompletionResult(
+            content=content,
+            reasoning_content=self.get_last_reasoning_content(),
+            tool_calls=calls,
+        )
 
     async def acompletion(
         self, prompt: str | list[dict[str, Any]], model: str | None = None
@@ -142,7 +199,7 @@ class OpenAIClient(BaseLM):
             raise ValueError("Model name is required for OpenAI client.")
 
         extra_body = self._build_extra_body()
-        
+
         openai_kwargs = dict(self.sampling_kwargs)
         for k in ["top_k", "min_p", "repetition_penalty"]:
             if k in openai_kwargs:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from shlex import quote as sh_quote
 from typing import TYPE_CHECKING
 
 from rlm.core.types import WorkspaceAction, WorkspaceObservation
@@ -34,7 +35,34 @@ _TMP_REL_DIR = "_rlm_state/_tmp"
 
 def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObservation:
     start = time.perf_counter()
-    body = action.body or ""
+    body = action.body if action.body is not None else str(action.args.get("command", ""))
+    timeout = env.workspace_config.docker.exec_timeout_seconds
+    if action.args.get("timeout") not in (None, ""):
+        try:
+            timeout = int(action.args["timeout"])
+        except (TypeError, ValueError):
+            return WorkspaceObservation(
+                tool=action.tool,
+                error="timeout must be an integer number of seconds.",
+                execution_time=time.perf_counter() - start,
+            )
+    if str(action.args.get("is_background", "false")).lower() == "true":
+        return WorkspaceObservation(
+            tool=action.tool,
+            error="Background shell commands are not supported yet; set is_background=false.",
+            execution_time=time.perf_counter() - start,
+        )
+    directory = action.args.get("directory")
+    if directory not in (None, ""):
+        workdir = env.resolve_workspace_path(str(directory))
+        if not workdir.exists() or not workdir.is_dir():
+            return WorkspaceObservation(
+                tool=action.tool,
+                error=f"directory does not exist or is not a directory: {directory}",
+                execution_time=time.perf_counter() - start,
+            )
+        rel = workdir.relative_to(env.workspace_root).as_posix()
+        body = f"cd {sh_quote('/workspace' if rel == '.' else '/workspace/' + rel)}\n{body}"
 
     action_id = env.current_action_id or "unknown"
     rel_tmp = f"{_TMP_REL_DIR}/shell_{action_id}.sh"
@@ -47,7 +75,7 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
 
     result = env.exec_in_container(
         ["bash", f"/workspace/{rel_tmp}"],
-        timeout=env.workspace_config.docker.exec_timeout_seconds,
+        timeout=timeout,
     )
 
     after = env.snapshot_paths_for_provenance(excludes)
@@ -59,7 +87,7 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
         env.provenance.remove(path)
 
     obs = WorkspaceObservation(
-        tool=SPEC.name,
+        tool=action.tool,
         stdout=result.stdout,
         stderr=result.stderr,
         data={"exit_code": result.exit_code, "changed_paths": changed, "removed_paths": removed},
@@ -67,7 +95,7 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
         execution_time=time.perf_counter() - start,
     )
     if result.timed_out:
-        obs.error = f"exec timeout after {env.workspace_config.docker.exec_timeout_seconds}s"
+        obs.error = f"exec timeout after {timeout}s"
     elif result.exit_code != 0:
         obs.error = f"shell exited with code {result.exit_code}"
     return obs

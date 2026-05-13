@@ -27,9 +27,9 @@ from typing import cast
 
 sys.path.insert(0, str(Path(__file__).parent))
 from server_qwen35_single import (  # type: ignore[import]
-    LOG_DIR,
     _MAX_NUM_SEQS_FLOOR,
     _MAX_NUM_SEQS_START,
+    LOG_DIR,
     _derive_served_name,
     _try_launch,
 )
@@ -82,6 +82,14 @@ def parse_args() -> argparse.Namespace:
         dest="replica_port_start",
         help="Scan for free replica ports starting here when --replica-ports is not given (default: 8001)",
     )
+    p.add_argument(
+        "--tool-call-parser",
+        default="hermes",
+        help=(
+            "vLLM tool parser forwarded to every replica with --enable-auto-tool-choice. "
+            "Default: hermes."
+        ),
+    )
     return p.parse_args()
 
 
@@ -113,6 +121,7 @@ def _probe_replica(
     gpus: str,
     gpu_mem_util: float,
     served_name: str,
+    tool_call_parser: str,
     results: dict,
     lock: threading.Lock,
 ) -> None:
@@ -120,7 +129,16 @@ def _probe_replica(
     max_num_seqs = _MAX_NUM_SEQS_START
     while max_num_seqs >= _MAX_NUM_SEQS_FLOOR:
         print(f"[replica {idx}] probe max-num-seqs={max_num_seqs}  port={port}  gpus={gpus}")
-        pid, ok = _try_launch(model, port, gpus, gpu_mem_util, max_num_seqs, served_name, log_path)
+        pid, ok = _try_launch(
+            model,
+            port,
+            gpus,
+            gpu_mem_util,
+            max_num_seqs,
+            served_name,
+            tool_call_parser,
+            log_path,
+        )
         if ok:
             with lock:
                 results[idx] = {"port": port, "pid": pid, "max_num_seqs": max_num_seqs, "gpus": gpus}
@@ -157,7 +175,7 @@ def _launch_router(router_port: int, backend_urls: list[str]) -> int:
                 return proc.pid
         except OSError:
             if proc.poll() is not None:
-                raise RuntimeError(f"vllm-router exited unexpectedly — see {log_path}")
+                raise RuntimeError(f"vllm-router exited unexpectedly — see {log_path}") from None
             time.sleep(1)
 
     raise RuntimeError(
@@ -195,7 +213,7 @@ def main() -> None:
     results: dict[int, dict | None] = {}
     to_launch: list[tuple[int, str, int]] = []  # (idx, gpus, port)
 
-    for i, (gpus, port) in enumerate(zip(args.gpus, replica_ports)):
+    for i, (gpus, port) in enumerate(zip(args.gpus, replica_ports, strict=True)):
         tp = len(gpus.split(","))
         if _is_replica_healthy(port):
             print(f"[replica {i}] healthy  port={port}  gpus={gpus}  tp={tp}  (skipping launch)")
@@ -209,7 +227,17 @@ def main() -> None:
         threads = [
             threading.Thread(
                 target=_probe_replica,
-                args=(i, args.model, port, gpus, args.gpu_mem_util, served_name, results, lock),
+                args=(
+                    i,
+                    args.model,
+                    port,
+                    gpus,
+                    args.gpu_mem_util,
+                    served_name,
+                    args.tool_call_parser,
+                    results,
+                    lock,
+                ),
                 daemon=True,
             )
             for i, gpus, port in to_launch

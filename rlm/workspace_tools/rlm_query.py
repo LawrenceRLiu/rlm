@@ -34,11 +34,11 @@ SPEC = ToolSpec(
 
 def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObservation:
     start = time.perf_counter()
-    body = action.body or ""
+    body = action.body if action.body is not None else str(action.args.get("prompt", ""))
 
     if env.recursion_handler is None:
         return WorkspaceObservation(
-            tool=SPEC.name,
+            tool=action.tool,
             error=("Maximum recursion depth reached. The 'rlm_query' tool is unavailable."),
             execution_time=time.perf_counter() - start,
         )

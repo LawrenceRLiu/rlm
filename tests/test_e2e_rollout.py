@@ -32,6 +32,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from rlm.core.config import ParseConfig, WorkspaceConfig
 from rlm.core.rlm import RLM
 from tests._helpers import make_thin_env
 
@@ -50,11 +51,13 @@ def _scripted_run(tmp_path: Path, responses: list[str], *, log_dir: Path | None 
     """Run the RLM loop end-to-end against a thin env with scripted responses."""
     from rlm.logger import RLMLogger
 
-    env = make_thin_env(tmp_path)
+    cfg = WorkspaceConfig(parse=ParseConfig(action_format="xml"))
+    env = make_thin_env(tmp_path, workspace_config=cfg)
     logger = RLMLogger(log_dir=str(log_dir)) if log_dir is not None else RLMLogger(log_dir=None)
     rlm = RLM(
         backend="openai",
         backend_kwargs={"model_name": "mock-model"},
+        workspace_config=cfg,
         logger=logger,
         max_iterations=10,
     )
@@ -203,12 +206,15 @@ class TestMixedDispatchInRollout:
 
 class TestSpillIsolationInRollout:
     def test_only_the_oversized_tool_spills(self, tmp_path: Path) -> None:
-        from rlm.core.config import ObservationConfig, WorkspaceConfig
+        from rlm.core.config import ObservationConfig
         from rlm.logger import RLMLogger
 
         # Cap chosen so the small list_directory output (~200 chars) fits but
         # the read_file output (5000+ chars of body, plus header) does not.
-        cfg = WorkspaceConfig(observation=ObservationConfig(max_observation_chars=500))
+        cfg = WorkspaceConfig(
+            parse=ParseConfig(action_format="xml"),
+            observation=ObservationConfig(max_observation_chars=500),
+        )
         env = make_thin_env(tmp_path, workspace_config=cfg)
         # Pre-populate a big file the model will read on turn 1.
         big = "y" * 5000
@@ -260,7 +266,7 @@ class TestSystemPromptInvariants:
     """
 
     def test_system_prompt_advertises_every_tool(self, tmp_path: Path) -> None:
-        from rlm.workspace_tools import all_tool_names
+        from rlm.workspace_tools import xml_tool_names
 
         log_dir = tmp_path / "logs"
         log_dir.mkdir()
@@ -271,7 +277,7 @@ class TestSystemPromptInvariants:
         system_msg = iter1["prompt"][0]
         assert system_msg["role"] == "system"
         sys_text = system_msg["content"]
-        for tool_name in all_tool_names():
+        for tool_name in xml_tool_names():
             assert tool_name in sys_text, f"tool {tool_name!r} missing from system prompt"
         # Workspace layout is interpolated (catches a busted template).
         assert "_rlm_query_0.txt" in sys_text

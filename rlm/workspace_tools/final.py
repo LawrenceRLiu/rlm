@@ -34,16 +34,30 @@ SPEC = ToolSpec(
 def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObservation:
     del env  # final does not touch the env; signature is uniform across tools.
     start = time.perf_counter()
-    try:
-        answer, artifacts = parse_final_body(action.body or "")
-    except ActionParseError as e:
-        return WorkspaceObservation(
-            tool=SPEC.name,
-            error=str(e),
-            execution_time=time.perf_counter() - start,
-        )
+    if action.body is None and "answer" in action.args:
+        answer = str(action.args["answer"])
+        raw_artifacts = action.args.get("artifacts", [])
+        if raw_artifacts is None:
+            artifacts = []
+        elif isinstance(raw_artifacts, list):
+            artifacts = [str(path) for path in raw_artifacts]
+        else:
+            return WorkspaceObservation(
+                tool=action.tool,
+                error="artifacts must be a list of workspace-relative paths.",
+                execution_time=time.perf_counter() - start,
+            )
+    else:
+        try:
+            answer, artifacts = parse_final_body(action.body or "")
+        except ActionParseError as e:
+            return WorkspaceObservation(
+                tool=action.tool,
+                error=str(e),
+                execution_time=time.perf_counter() - start,
+            )
     return WorkspaceObservation(
-        tool=SPEC.name,
+        tool=action.tool,
         stdout=answer,
         final_answer=answer,
         final_artifacts=artifacts,

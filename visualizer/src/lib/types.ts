@@ -38,6 +38,7 @@ export interface WorkspaceAction {
   args: Record<string, unknown>;
   body: string | null;
   raw: string;
+  call_id?: string | null;
 }
 
 export interface WorkspaceObservation {
@@ -91,6 +92,7 @@ export interface RLMConfigMetadata {
   max_iterations: number | null;
   backend: string | null;
   backend_kwargs: Record<string, unknown> | null;
+  action_format?: string | null;
   environment_type: string | null;
   environment_kwargs: Record<string, unknown> | null;
   other_backends: string[] | null;

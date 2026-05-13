@@ -49,12 +49,41 @@ _TOOL_MODULES = {
     "write_file": "rlm.workspace_tools.write_file",
     "append_file": "rlm.workspace_tools.append_file",
     "edit_file": "rlm.workspace_tools.edit_file",
+    "edit": "rlm.workspace_tools.edit",
     "shell": "rlm.workspace_tools.shell",
     "python": "rlm.workspace_tools.python",
+    "run_shell_command": "rlm.workspace_tools.run_shell_command",
+    "run_python_command": "rlm.workspace_tools.run_python_command",
     "llm_query": "rlm.workspace_tools.llm_query",
     "rlm_query": "rlm.workspace_tools.rlm_query",
     "final": "rlm.workspace_tools.final",
 }
+
+XML_TOOL_NAMES = [
+    "list_directory",
+    "read_file",
+    "write_file",
+    "append_file",
+    "edit_file",
+    "shell",
+    "python",
+    "llm_query",
+    "rlm_query",
+    "final",
+]
+
+NATIVE_TOOL_NAMES = [
+    "list_directory",
+    "read_file",
+    "write_file",
+    "append_file",
+    "edit",
+    "run_shell_command",
+    "run_python_command",
+    "llm_query",
+    "rlm_query",
+    "final",
+]
 
 
 def _load(name: str):
@@ -77,6 +106,14 @@ def all_tool_names() -> list[str]:
     return list(_TOOL_MODULES.keys())
 
 
+def native_tool_names() -> list[str]:
+    return list(NATIVE_TOOL_NAMES)
+
+
+def xml_tool_names() -> list[str]:
+    return list(XML_TOOL_NAMES)
+
+
 def is_state_mutating(name: str) -> bool:
     return get_spec(name).is_state_mutating
 
@@ -87,5 +124,7 @@ __all__ = [
     "get_spec",
     "get_executor",
     "all_tool_names",
+    "native_tool_names",
+    "xml_tool_names",
     "is_state_mutating",
 ]

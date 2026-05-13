@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
-from rlm.core.types import ModelUsageSummary, UsageSummary
+from rlm.core.types import LMCompletionResult, ModelUsageSummary, UsageSummary
 
 # Default timeout for LM API calls (in seconds)
 DEFAULT_TIMEOUT: float = 300.0
@@ -24,12 +24,12 @@ class BaseLM(ABC):
     def __init__(self, model_name: str, timeout: float = DEFAULT_TIMEOUT, **kwargs):
         self.model_name = model_name
         self.timeout = timeout
-        
+
         self.sampling_kwargs = {}
         for key in list(kwargs.keys()):
             if key in SAMPLING_PARAM_KEYS:
                 self.sampling_kwargs[key] = kwargs.pop(key)
-                
+
         self.kwargs = kwargs
         # Backend reasoning-channel content from the last completion() call,
         # if the subclass populates it. Defaults to None for backends that
@@ -39,6 +39,15 @@ class BaseLM(ABC):
     @abstractmethod
     def completion(self, prompt: str | dict[str, Any]) -> str:
         raise NotImplementedError
+
+    def completion_with_tools(
+        self,
+        prompt: str | list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]],
+        tool_choice: Any = "required",
+    ) -> LMCompletionResult:
+        raise NotImplementedError(f"{type(self).__name__} does not support native tool calls")
 
     @abstractmethod
     async def acompletion(self, prompt: str | dict[str, Any]) -> str:

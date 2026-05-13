@@ -1,3 +1,4 @@
+import json
 import re
 import textwrap
 from html import escape
@@ -48,7 +49,7 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     ``read_file`` when you need to inspect file contents. Self-closing
     ``<action ... />`` is allowed for tools that take no body.
 
-    Before the actions, include a short note: ``<note>...</note>`` to preserve turn-to-turn
+    Before the actions, include one short ``<note>...</note>`` to preserve turn-to-turn
     intent. Use this to keep a running summary of the task and what you have done
     and plan to do so you can stay on track. This note MUST be extremely compact,
     terse, and dense (maximum 2-3 sentences). Use shorthand and abbreviations.
@@ -82,20 +83,77 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     """
 )
 
+NATIVE_WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
+    """\
+    You are an autonomous reasoning agent operating in a durable workspace.
 
-def _format_tool_descriptions(include_rlm_query: bool) -> str:
+    The workspace is a real filesystem directory that persists across your
+    turns. Your memory is the files you read, write, and edit. Use the
+    provided native tool calls to act; do not print XML, JSON wrappers, or
+    markdown code fences as a substitute for tool calls.
+
+    # Workspace layout
+    - ``_rlm_query_0.txt`` — the root task you must solve. Read it first.
+    - ``_rlm_query_<N>.txt`` — additional user-supplied context, when present.
+    - ``_rlm_notes/`` — scratch notes you write for yourself.
+    - ``_rlm_artifacts/`` — artifacts and outputs (incl. spilled tool output
+      under ``_rlm_artifacts/_observations/`` when an observation exceeded
+      the per-call cap).
+    - ``_rlm_state/`` — reserved runtime state. You may not write here.
+
+    # Tool intent
+    Use ``write_file``, ``append_file``, and ``edit`` for durable workspace
+    edits. Use ``run_python_command`` and ``run_shell_command`` for scratch
+    computation, inspection, validation, tests, parsing, and complex one-off
+    transforms. In ``run_python_command``, the helper functions ``llm_query``,
+    ``llm_query_batched``, ``rlm_query``, and ``rlm_query_batched`` are
+    already imported, so use Python for loops over documents and batched
+    model calls.
+
+    # Whitespace-sensitive tools
+    - ``edit.old_string`` is exact literal text. Whitespace, indentation, and
+      newlines must match the file contents. Read the file first and include
+      enough surrounding context to make one match, or set ``replace_all``.
+    - ``run_shell_command.command`` is passed as a command string to bash via
+      a script file. Quote paths and use heredocs for large multiline literals.
+    - ``write_file.content`` and ``run_python_command.code`` are strings;
+      include the exact content/code you want executed or written.
+
+    # Available tools
+    {tool_descriptions}
+
+    # Hard rules
+    - Every assistant turn must make at least one native tool call.
+    - Read-only tool failures do NOT halt the rest of the turn; mutating tool
+      failures DO halt the rest of the batch in this turn, including any
+      ``final`` in the same batch.
+    - Per-call output above the configured cap is auto-spilled to
+      ``_rlm_artifacts/_observations/`` and replaced with a short summary path.
+    - You may not write inside ``_rlm_state/``.
+    - Prompt history is truncated over time. If details are missing, re-read
+      ``_rlm_query_0.txt`` or your own ``_rlm_notes/`` instead of guessing.
+    {depth_rule}
+    """
+)
+
+
+def _format_tool_descriptions(include_rlm_query: bool, *, native: bool = False) -> str:
     """Pull short descriptions from the workspace tool registry."""
     # Imported lazily to avoid a circular import at module load time
     # (workspace_tools → core.types → … → utils.prompts).
-    from rlm.workspace_tools import all_tool_names, get_spec
+    from rlm.workspace_tools import get_spec, native_tool_names, xml_tool_names
 
     lines: list[str] = []
-    for name in all_tool_names():
+    names = native_tool_names() if native else xml_tool_names()
+    for name in names:
         if name == "rlm_query" and not include_rlm_query:
             continue
-        spec = get_spec(name)
-        entry = f"- ``{name}`` — {spec.short_description}"
-        if spec.example:
+        if native:
+            entry = f"- ``{name}`` — {NATIVE_TOOL_DESCRIPTIONS[name]}"
+        else:
+            spec = get_spec(name)
+            entry = f"- ``{name}`` — {spec.short_description}"
+        if not native and spec.example:
             entry += f"\n  {spec.example}"
         lines.append(entry)
     return "\n".join(lines)
@@ -106,6 +164,7 @@ def build_workspace_system_prompt(
     depth: int,
     max_depth: int,
     custom_system_prompt: str | None = None,
+    action_format: str = "native",
 ) -> str:
     """Build the workspace system prompt, depth-aware.
 
@@ -116,7 +175,11 @@ def build_workspace_system_prompt(
         return custom_system_prompt
 
     at_max_depth = depth >= max_depth
-    tool_descriptions = _format_tool_descriptions(include_rlm_query=not at_max_depth)
+    native = action_format == "native"
+    tool_descriptions = _format_tool_descriptions(
+        include_rlm_query=not at_max_depth,
+        native=native,
+    )
     if at_max_depth:
         depth_rule = (
             "- You are at the maximum recursion depth. The ``rlm_query`` "
@@ -126,7 +189,8 @@ def build_workspace_system_prompt(
         )
     else:
         depth_rule = ""
-    return WORKSPACE_SYSTEM_PROMPT_TEMPLATE.format(
+    template = NATIVE_WORKSPACE_SYSTEM_PROMPT_TEMPLATE if native else WORKSPACE_SYSTEM_PROMPT_TEMPLATE
+    return template.format(
         tool_descriptions=tool_descriptions,
         depth_rule=depth_rule,
     )
@@ -148,9 +212,58 @@ def build_workspace_initial_user_prompt(*, root_prompt: str | None = None) -> st
     return base
 
 
-FILE_BODY_TOOLS = {"write_file", "append_file", "edit_file"}
-COMMAND_TOOLS = {"python", "shell"}
+FILE_BODY_TOOLS = {"write_file", "append_file", "edit_file", "edit"}
+COMMAND_TOOLS = {"python", "shell", "run_python_command", "run_shell_command"}
 NOTE_RE = re.compile(r"<note>(.*?)</note>", re.DOTALL)
+
+NATIVE_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "list_directory": (
+        "Shallow listing of a workspace directory. Arguments: "
+        '{"path": "."} where path is optional and workspace-relative.'
+    ),
+    "read_file": (
+        "Read a slice of a workspace file. Arguments: "
+        '{"path": "notes.md", "start_line": 1, "end_line": 50}; '
+        "path is required, line bounds are optional and 1-indexed."
+    ),
+    "write_file": (
+        "Create or completely overwrite a workspace file. Arguments: "
+        '{"file_path": "hello.py", "content": "print(\\"hello\\")\\n"}.'
+    ),
+    "append_file": (
+        "Append text verbatim to a workspace file, creating it if missing. "
+        'Arguments: {"file_path": "log.txt", "content": "new entry\\n"}.'
+    ),
+    "edit": (
+        "Replace exact literal text in a workspace file. Arguments: "
+        '{"file_path": "src/foo.py", "old_string": "old\\n", '
+        '"new_string": "new\\n", "replace_all": false}.'
+    ),
+    "run_shell_command": (
+        "Run a shell command string inside the workspace container. Arguments: "
+        '{"command": "python -m pytest", "directory": ".", "timeout": 300, '
+        '"is_background": false}.'
+    ),
+    "run_python_command": (
+        "Run Python code inside the workspace container. Arguments: "
+        '{"code": "from pathlib import Path\\nprint(Path(\\".\\").resolve())", '
+        '"timeout": 300}. The helpers llm_query, llm_query_batched, '
+        "rlm_query, and rlm_query_batched are pre-imported."
+    ),
+    "llm_query": (
+        "Single LM completion without recursion. Arguments: "
+        '{"prompt": "Summarize this paragraph in one sentence."}.'
+    ),
+    "rlm_query": (
+        "Spawn a child RLM with a copy-on-spawn workspace snapshot. Arguments: "
+        '{"prompt": "Inspect summary files and synthesize the result."}.'
+    ),
+    "final": (
+        "Terminate the run with the final answer. Arguments: "
+        '{"answer": "42 primes found", "artifacts": ["primes.txt"]}; '
+        "artifacts is optional."
+    ),
+}
 
 
 def truncate_for_prompt(text: str, cap: int) -> tuple[str, bool]:
@@ -166,6 +279,17 @@ def action_changed_files(observation: WorkspaceObservation | None) -> bool:
     changed = observation.data.get("changed_paths")
     removed = observation.data.get("removed_paths")
     return bool(changed or removed)
+
+
+def compact_action_args(action: WorkspaceAction) -> dict[str, object]:
+    """Return replay-safe arguments without duplicating large payload strings."""
+    args = dict(action.args)
+    for key in ("content", "old_string", "new_string", "code", "command", "prompt"):
+        value = args.pop(key, None)
+        if isinstance(value, str):
+            args[f"{key}_chars"] = len(value)
+            args[f"{key}_lines"] = len(value.splitlines()) if value else 0
+    return args
 
 
 def extract_turn_note(
@@ -198,9 +322,19 @@ def extract_turn_note(
 
 
 def render_turn_note(
-    iteration: WorkspaceIteration, history_config: PromptHistoryConfig
+    iteration: WorkspaceIteration,
+    history_config: PromptHistoryConfig,
+    *,
+    action_format: str = "native",
 ) -> str | None:
     note, omitted_reason = extract_turn_note(iteration.response, history_config)
+    if action_format == "native":
+        if note is not None:
+            return f"TURN_NOTE turn={iteration.iteration}\n{note}"
+        if omitted_reason is not None:
+            return f"TURN_NOTE turn={iteration.iteration} omitted=true reason={omitted_reason}"
+        return None
+
     if note is not None:
         return (
             f'<turn_note turn="{iteration.iteration}">\n{escape(note, quote=False)}\n</turn_note>'
@@ -218,6 +352,8 @@ def render_action_replay(
     action: WorkspaceAction,
     observation: WorkspaceObservation | None,
     history_config: PromptHistoryConfig,
+    *,
+    action_format: str = "native",
 ) -> str:
     """Compact model-facing replay of what the assistant attempted.
 
@@ -226,6 +362,49 @@ def render_action_replay(
     bodies so the transcript does not become a second filesystem.
     """
     status = "error" if observation is not None and observation.error else "ok"
+    body = action.body or ""
+    body_lines = len(body.splitlines()) if body else 0
+    body_chars = len(body)
+
+    if action_format == "native":
+        compact_args = compact_action_args(action)
+        parts = [
+            f"TOOL_CALL {action_id} tool={action.tool} status={status}"
+        ]
+        if action.call_id:
+            parts[0] += f" call_id={action.call_id}"
+        if compact_args:
+            parts.append(
+                "args="
+                + json.dumps(compact_args, ensure_ascii=False, sort_keys=True)
+            )
+        if action.tool in FILE_BODY_TOOLS:
+            parts.append(
+                f"payload omitted: {body_chars} chars, {body_lines} lines; "
+                "use read_file to inspect durable contents"
+            )
+        elif action.tool in COMMAND_TOOLS:
+            cap = (
+                history_config.max_mutating_command_body_replay_chars
+                if action_changed_files(observation)
+                else history_config.max_command_body_replay_chars
+            )
+            source, truncated = truncate_for_prompt(body, cap)
+            if source:
+                parts.append("source:")
+                parts.append(source.rstrip())
+            else:
+                parts.append("source omitted: empty")
+            if truncated:
+                parts.append(
+                    f"source truncated for replay: {body_chars} chars total, showing first {cap}"
+                )
+        elif body:
+            parts.append(f"payload length: {body_chars} chars")
+        if observation is not None and observation.error:
+            parts.append(f"error: {observation.error}")
+        return "\n".join(parts)
+
     args = " ".join(
         f'{escape(str(k), quote=True)}="{escape(str(v), quote=True)}"'
         for k, v in action.args.items()
@@ -234,12 +413,10 @@ def render_action_replay(
         f'action_id="{escape(action_id, quote=True)}" '
         f'tool="{escape(action.tool, quote=True)}" status="{status}"'
     )
+    if action.call_id:
+        attrs += f' call_id="{escape(action.call_id, quote=True)}"'
     if args:
         attrs += f" {args}"
-
-    body = action.body or ""
-    body_lines = len(body.splitlines()) if body else 0
-    body_chars = len(body)
 
     if action.tool in FILE_BODY_TOOLS:
         lines = [f"<action_replay {attrs}>"]
@@ -294,10 +471,61 @@ def render_observation(
     action: WorkspaceAction | None = None,
     compact: bool = False,
     history_config: PromptHistoryConfig | None = None,
+    action_format: str = "native",
 ) -> str:
     """Render a single observation for inclusion in the next user message."""
     if history_config is None:
         history_config = PromptHistoryConfig()
+
+    if action_format == "native":
+        status = "error" if observation.error else "ok"
+        label = "OBSERVATION_RECEIPT" if compact else "OBSERVATION"
+        parts = [f"{label} {action_id} tool={observation.tool} status={status}"]
+        if compact:
+            if observation.error:
+                parts.append(f"error: {observation.error}")
+            if observation.stdout:
+                parts.append(f"stdout omitted from replay: {len(observation.stdout)} chars")
+            if observation.stderr:
+                parts.append(f"stderr omitted from replay: {len(observation.stderr)} chars")
+            if action is not None and action.args:
+                compact_args = compact_action_args(action)
+                if compact_args:
+                    parts.append(
+                        "args="
+                        + json.dumps(compact_args, ensure_ascii=False, sort_keys=True)
+                    )
+            if observation.artifacts:
+                parts.append("artifacts: " + ", ".join(observation.artifacts))
+            if observation.final_answer is not None:
+                parts.append("final answer omitted from replay")
+            return "\n".join(parts)
+
+        if observation.error:
+            parts.append(f"error: {observation.error}")
+        if observation.stdout:
+            stdout = observation.stdout.rstrip()
+            if observation.tool in COMMAND_TOOLS and action_changed_files(observation):
+                cap = history_config.max_mutating_command_stdout_replay_chars
+                stdout, truncated = truncate_for_prompt(stdout, cap)
+                parts.append(stdout.rstrip())
+                if truncated:
+                    parts.append(
+                        f"stdout truncated for replay: {len(observation.stdout)} chars total, "
+                        f"showing first {cap}; rerun or read artifacts/files for details"
+                    )
+            else:
+                parts.append(stdout)
+        if observation.stderr:
+            parts.append("stderr:")
+            parts.append(observation.stderr.rstrip())
+        if observation.artifacts:
+            parts.append("artifacts: " + ", ".join(observation.artifacts))
+        if observation.final_answer is not None:
+            parts.append(f"final: {observation.final_answer}")
+            if observation.final_artifacts:
+                parts.append("final artifacts: " + ", ".join(observation.final_artifacts))
+        return "\n".join(parts)
 
     if compact:
         parts = [f'<observation_receipt action_id="{action_id}" tool="{observation.tool}">']
@@ -353,6 +581,7 @@ def format_workspace_iteration(
     *,
     history_config: PromptHistoryConfig | None = None,
     age: int = 0,
+    action_format: str = "native",
 ) -> list[dict[str, str]]:
     """Convert a completed ``WorkspaceIteration`` into next-turn messages.
 
@@ -373,7 +602,11 @@ def format_workspace_iteration(
     compact_observations = age >= history_config.full_observation_turns
 
     action_chunks: list[str] = []
-    turn_note = render_turn_note(iteration, history_config)
+    turn_note = render_turn_note(
+        iteration,
+        history_config,
+        action_format=action_format,
+    )
     if turn_note is not None:
         action_chunks.append(turn_note)
 
@@ -386,6 +619,7 @@ def format_workspace_iteration(
                 action=action,
                 observation=observation,
                 history_config=history_config,
+                action_format=action_format,
             )
         )
 
@@ -403,16 +637,22 @@ def format_workspace_iteration(
                 action=action,
                 compact=compact_observations,
                 history_config=history_config,
+                action_format=action_format,
             )
         )
 
     if iteration.snapshot is not None:
         snap = iteration.snapshot
         changed = ", ".join(snap.changed_files) if snap.changed_files else "(no changes)"
-        obs_chunks.append(
-            f'<snapshot turn="{snap.turn}" commit="{snap.commit_sha[:7]}">'
-            f"\nchanged: {changed}\n</snapshot>"
-        )
+        if action_format == "native":
+            obs_chunks.append(
+                f"SNAPSHOT turn={snap.turn} commit={snap.commit_sha[:7]}\nchanged: {changed}"
+            )
+        else:
+            obs_chunks.append(
+                f'<snapshot turn="{snap.turn}" commit="{snap.commit_sha[:7]}">'
+                f"\nchanged: {changed}\n</snapshot>"
+            )
 
     user_message = "\n\n".join(obs_chunks) if obs_chunks else "(no observations)"
     return [
@@ -430,6 +670,7 @@ def format_workspace_history(
     iterations: list[WorkspaceIteration],
     *,
     history_config: PromptHistoryConfig | None = None,
+    action_format: str = "native",
 ) -> list[dict[str, str]]:
     """Render completed iterations for model-facing prompt replay."""
     if history_config is None:
@@ -443,6 +684,7 @@ def format_workspace_history(
                 iteration,
                 history_config=history_config,
                 age=age,
+                action_format=action_format,
             )
         )
     return messages
@@ -457,4 +699,15 @@ def build_parse_retry_message(error: str, fragment: str | None) -> str:
     )
     if fragment:
         msg += f"\n\nOffending fragment (truncated):\n{fragment[:500]}"
+    return msg
+
+
+def build_native_tool_retry_message(error: str, fragment: str | None) -> str:
+    msg = (
+        "Your previous response did not produce valid native tool calls: "
+        f"{error}\n\n"
+        "Reply again by calling one or more of the provided tools."
+    )
+    if fragment:
+        msg += f"\n\nOffending tool-call payload (truncated):\n{fragment[:500]}"
     return msg

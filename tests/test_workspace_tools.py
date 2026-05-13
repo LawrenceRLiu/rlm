@@ -19,6 +19,7 @@ import pytest
 from rlm.core.config import ObservationConfig, WorkspaceConfig
 from rlm.core.types import WorkspaceAction
 from rlm.workspace_tools.append_file import execute as append_file_execute
+from rlm.workspace_tools.edit import execute as edit_execute
 from rlm.workspace_tools.edit_file import execute as edit_file_execute
 from rlm.workspace_tools.final import execute as final_execute
 from rlm.workspace_tools.list_directory import execute as list_directory_execute
@@ -173,6 +174,20 @@ class TestWriteFile:
         assert obs.error is not None
         assert "path" in obs.error
 
+    def test_native_content_arg_writes_file(self, tmp_path: Path) -> None:
+        env = make_thin_env(tmp_path)
+        obs = write_file_execute(
+            env,
+            WorkspaceAction(
+                tool="write_file",
+                args={"file_path": "native.txt", "content": "hello\n"},
+                body=None,
+                raw="",
+            ),
+        )
+        assert obs.error is None
+        assert (env.workspace_root / "native.txt").read_text() == "hello\n"
+
 
 # ---------------------------------------------------------------------------
 # append_file
@@ -275,6 +290,47 @@ class TestEditFile:
         obs = edit_file_execute(env, _action("edit_file", body=body, path="_rlm_state/x"))
         assert obs.error is not None
         assert "reserved" in obs.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# edit
+# ---------------------------------------------------------------------------
+
+
+class TestEdit:
+    def test_exact_literal_replacement(self, tmp_path: Path) -> None:
+        env = make_thin_env(tmp_path)
+        (env.workspace_root / "code.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        obs = edit_execute(
+            env,
+            WorkspaceAction(
+                tool="edit",
+                args={
+                    "file_path": "code.py",
+                    "old_string": "    return 1\n",
+                    "new_string": "    return 2\n",
+                },
+                body=None,
+                raw="",
+            ),
+        )
+        assert obs.error is None
+        assert (env.workspace_root / "code.py").read_text() == "def f():\n    return 2\n"
+
+    def test_multiple_matches_require_replace_all(self, tmp_path: Path) -> None:
+        env = make_thin_env(tmp_path)
+        (env.workspace_root / "f.txt").write_text("x\nx\n", encoding="utf-8")
+        obs = edit_execute(
+            env,
+            WorkspaceAction(
+                tool="edit",
+                args={"file_path": "f.txt", "old_string": "x\n", "new_string": "y\n"},
+                body=None,
+                raw="",
+            ),
+        )
+        assert obs.error is not None
+        assert "matches 2 times" in obs.error
 
 
 # ---------------------------------------------------------------------------

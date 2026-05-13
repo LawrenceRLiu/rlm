@@ -545,6 +545,7 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
             "action_id": self.current_action_id,
             "turn": self.current_turn,
             "tool": action.tool,
+            "call_id": action.call_id,
             "args": action.args,
             "mutating": mutating,
             "observation": {

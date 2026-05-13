@@ -27,24 +27,24 @@ SPEC = ToolSpec(
 
 def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObservation:
     start = time.perf_counter()
-    prompt = action.body or ""
+    prompt = action.body if action.body is not None else str(action.args.get("prompt", ""))
     request = LMRequest(prompt=prompt, depth=env.depth)
     if env.lm_handler_address is None:
         return WorkspaceObservation(
-            tool=SPEC.name,
+            tool=action.tool,
             error="No LM handler address configured for this environment.",
             execution_time=time.perf_counter() - start,
         )
     response = send_lm_request(env.lm_handler_address, request)
     if not response.success or response.chat_completion is None:
         return WorkspaceObservation(
-            tool=SPEC.name,
+            tool=action.tool,
             error=response.error or "LM request failed with no error message.",
             execution_time=time.perf_counter() - start,
         )
     rc = response.chat_completion
     return WorkspaceObservation(
-        tool=SPEC.name,
+        tool=action.tool,
         stdout=rc.response,
         data={"model": rc.root_model},
         rlm_calls=[rc],

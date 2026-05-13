@@ -8,6 +8,7 @@ Usage:
     python setup/server_qwen35_single.py --port 8001 --gpus 0
     python setup/server_qwen35_single.py --port 8001 --gpus 0,1   # tensor-parallel across 2 GPUs
     python setup/server_qwen35_single.py --port 8001 --gpus 0 --model Qwen/Qwen3.5-32B --gpu-mem-util 0.9
+    python setup/server_qwen35_single.py --port 8001 --gpus 0 --tool-call-parser qwen3_xml
 """
 
 import argparse
@@ -49,6 +50,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override --served-model-name (default: lowercased basename of --model with dots→dashes)",
     )
+    p.add_argument(
+        "--tool-call-parser",
+        default="hermes",
+        help=(
+            "vLLM tool parser to use with --enable-auto-tool-choice. "
+            "Default hermes matches current Qwen/Qwen3.5 guidance; try qwen3_xml or "
+            "qwen3_coder for coder-tuned variants if needed."
+        ),
+    )
     return p.parse_args()
 
 
@@ -63,6 +73,7 @@ def _build_cmd(
     gpu_mem_util: float,
     max_num_seqs: int,
     served_name: str,
+    tool_call_parser: str,
 ) -> list[str]:
     tp_size = len(gpus.split(","))
     cmd = [
@@ -75,6 +86,8 @@ def _build_cmd(
         "--max-num-seqs", str(max_num_seqs),
         "--limit-mm-per-prompt", '{"image":0,"video":0}',  # VL model; text-only KV layout
         "--reasoning-parser", "qwen3",                     # <think> → reasoning_content
+        "--enable-auto-tool-choice",
+        "--tool-call-parser", tool_call_parser,
     ]
     if tp_size > 1:
         cmd += ["--tensor-parallel-size", str(tp_size)]
@@ -88,6 +101,7 @@ def _try_launch(
     gpu_mem_util: float,
     max_num_seqs: int,
     served_name: str,
+    tool_call_parser: str,
     log_path: Path,
 ) -> tuple[int | None, bool]:
     """Start vLLM and block until startup succeeds or an OOM is detected.
@@ -95,7 +109,9 @@ def _try_launch(
     Returns (pid, True) on success — process is left running.
     Returns (None, False) on OOM or unexpected exit — process is killed before return.
     """
-    cmd = _build_cmd(model, port, gpus, gpu_mem_util, max_num_seqs, served_name)
+    cmd = _build_cmd(
+        model, port, gpus, gpu_mem_util, max_num_seqs, served_name, tool_call_parser
+    )
     # nvidia PyPI packages install their .so files under site-packages/nvidia/*/lib/.
     # The system dynamic linker won't find them unless we add these dirs to LD_LIBRARY_PATH.
     nvidia_lib_dirs = [
@@ -144,7 +160,14 @@ def main() -> None:
     while max_num_seqs >= _MAX_NUM_SEQS_FLOOR:
         print(f"[probe] max-num-seqs={max_num_seqs}  (log: {log_path})")
         pid, ok = _try_launch(
-            args.model, args.port, args.gpus, args.gpu_mem_util, max_num_seqs, served_name, log_path
+            args.model,
+            args.port,
+            args.gpus,
+            args.gpu_mem_util,
+            max_num_seqs,
+            served_name,
+            args.tool_call_parser,
+            log_path,
         )
         if ok:
             print(

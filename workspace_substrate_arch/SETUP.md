@@ -135,7 +135,7 @@ rlm = RLM(
     },
     workspace_config=WorkspaceConfig(
         docker=DockerConfig(cleanup_mode="keep"),
-        lm=LMConfig(enable_thinking=True),
+        lm=LMConfig(enable_thinking=False),
     ),
     logger=logger,
     verbose=True,

@@ -11,6 +11,7 @@ Units policy:
 - counts: structural caps (retries, list_directory entries, concurrent children)
 """
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -20,6 +21,18 @@ class ParseConfig:
     """Action parser knobs."""
 
     max_action_parse_retries: int = 3
+    action_format: Literal["xml", "native"] = "native"
+    native_tool_choice: Literal["auto", "required"] = "required"
+
+    def __post_init__(self) -> None:
+        if self.action_format == "xml":
+            warnings.warn(
+                "ParseConfig(action_format='xml') is deprecated and is no longer "
+                "the default. Use action_format='native' with a vLLM/OpenAI-compatible "
+                "tool parser for new runs.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
 
 @dataclass

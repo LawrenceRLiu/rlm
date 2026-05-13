@@ -28,27 +28,27 @@ SPEC = ToolSpec(
 
 def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObservation:
     start = time.perf_counter()
-    rel = action.args.get("path")
+    rel = action.args.get("path") or action.args.get("file_path")
     if not rel:
         return WorkspaceObservation(
-            tool=SPEC.name,
-            error="Missing required attribute 'path'.",
+            tool=action.tool,
+            error="Missing required argument 'path' or 'file_path'.",
             execution_time=time.perf_counter() - start,
         )
     if env.is_reserved_path(rel):
         return WorkspaceObservation(
-            tool=SPEC.name,
+            tool=action.tool,
             error=f"Refusing to write reserved path: {rel}",
             execution_time=time.perf_counter() - start,
         )
     target = env.resolve_workspace_path(rel)
-    body = action.body if action.body is not None else ""
+    body = action.body if action.body is not None else str(action.args.get("content", ""))
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(body, encoding="utf-8")
     except OSError as e:
         return WorkspaceObservation(
-            tool=SPEC.name,
+            tool=action.tool,
             error=f"Failed to write {rel}: {e}",
             execution_time=time.perf_counter() - start,
         )
@@ -57,7 +57,7 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
         rel, role="assistant", action_id=env.current_action_id, turn=env.current_turn
     )
     return WorkspaceObservation(
-        tool=SPEC.name,
+        tool=action.tool,
         stdout=f"Wrote {len(body)} chars to {rel}",
         data={"path": rel, "bytes": len(body.encode("utf-8"))},
         artifacts=[rel],

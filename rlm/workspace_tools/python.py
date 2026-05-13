@@ -44,7 +44,17 @@ _TMP_REL_DIR = "_rlm_state/_tmp"
 
 def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObservation:
     start = time.perf_counter()
-    body = action.body or ""
+    body = action.body if action.body is not None else str(action.args.get("code", ""))
+    timeout = env.workspace_config.docker.exec_timeout_seconds
+    if action.args.get("timeout") not in (None, ""):
+        try:
+            timeout = int(action.args["timeout"])
+        except (TypeError, ValueError):
+            return WorkspaceObservation(
+                tool=action.tool,
+                error="timeout must be an integer number of seconds.",
+                execution_time=time.perf_counter() - start,
+            )
 
     action_id = env.current_action_id or "unknown"
     rel_tmp = f"{_TMP_REL_DIR}/python_{action_id}.py"
@@ -59,7 +69,7 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
     # via its in-container path.
     result = env.exec_in_container(
         ["python", f"/workspace/{rel_tmp}"],
-        timeout=env.workspace_config.docker.exec_timeout_seconds,
+        timeout=timeout,
     )
 
     after = env.snapshot_paths_for_provenance(excludes)
@@ -76,7 +86,7 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
     captured_calls = env.drain_broker_ledger(env.current_action_id)
 
     obs = WorkspaceObservation(
-        tool=SPEC.name,
+        tool=action.tool,
         stdout=result.stdout,
         stderr=result.stderr,
         data={"exit_code": result.exit_code, "changed_paths": changed, "removed_paths": removed},
@@ -85,7 +95,7 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
         execution_time=time.perf_counter() - start,
     )
     if result.timed_out:
-        obs.error = f"exec timeout after {env.workspace_config.docker.exec_timeout_seconds}s"
+        obs.error = f"exec timeout after {timeout}s"
     elif result.exit_code != 0:
         obs.error = f"python exited with code {result.exit_code}"
     return obs

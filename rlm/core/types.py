@@ -180,13 +180,39 @@ ProvenanceRole = Literal["user", "assistant", "system", "child"]
 
 
 @dataclass
+class LMToolCall:
+    """A native model-emitted tool call from an OpenAI-compatible backend."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "arguments": self.arguments,
+        }
+
+
+@dataclass
+class LMCompletionResult:
+    """Assistant response payload, optionally with native tool calls."""
+
+    content: str
+    reasoning_content: str | None = None
+    tool_calls: list[LMToolCall] = field(default_factory=list)
+
+
+@dataclass
 class WorkspaceAction:
-    """A single ``<action>`` element extracted from an LM response."""
+    """A single workspace tool invocation extracted from an LM response."""
 
     tool: str
     args: dict[str, Any]
     body: str | None  # element body (for write_file/python/etc.); None for self-closing
     raw: str  # original tag-pair fragment, for replay/debugging
+    call_id: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -194,6 +220,7 @@ class WorkspaceAction:
             "args": self.args,
             "body": self.body,
             "raw": self.raw,
+            "call_id": self.call_id,
         }
 
 
@@ -293,6 +320,7 @@ class RLMMetadata:
     max_iterations: int
     backend: str
     backend_kwargs: dict[str, Any]
+    action_format: str
     environment_type: str
     environment_kwargs: dict[str, Any]
     other_backends: list[str] | None = None
@@ -304,6 +332,7 @@ class RLMMetadata:
             "max_iterations": self.max_iterations,
             "backend": self.backend,
             "backend_kwargs": {k: _serialize_value(v) for k, v in self.backend_kwargs.items()},
+            "action_format": self.action_format,
             "environment_type": self.environment_type,
             "environment_kwargs": {
                 k: _serialize_value(v) for k, v in self.environment_kwargs.items()

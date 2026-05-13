@@ -48,13 +48,31 @@ To help the model reason about the workspace without needing to memorize its ent
 
 ## Action Format
 
-The model interacts with the workspace by outputting structured action blocks. Because embedding multi-line code inside JSON strings is notoriously difficult and breaks whitespace, **we exclusively use XML for all actions.**
+The runtime supports two action scaffolds:
 
-XML natively preserves formatting, is extremely robust for LLM generation, and provides a unified interface for both simple reads and complex code writes.
+- **Native tool calls** (`WorkspaceConfig()` default): the production scaffold for Qwen/Qwen3.5 served through vLLM with `--enable-auto-tool-choice --tool-call-parser hermes` (or `qwen3_xml` / `qwen3_coder` for model-specific experiments). The provider returns a `tool_calls` array with call IDs, function names, and JSON arguments. The substrate converts those calls into `WorkspaceAction`s and preserves the original call ID in logs.
+- **Legacy XML** (`ParseConfig(action_format="xml")`): deprecated and retained only for compatibility with existing traces, visualizer support, and parser tests. Public `RLM.completion()` rejects this format for new runs.
 
-**Parsing Strategy (Important):** Standard XML parsers will crash if the assistant writes code containing unescaped characters like `<` or `&` (e.g., `if a < b:`). Therefore, the host-side parser must NOT be a strict XML parser. It must be a **tolerant, regex-based extractor** that simply finds the `<action ...>` opening tag and the `</action>` closing tag, and extracts the raw string between them. This prevents parsing failures when handling raw Python, Bash, or HTML files.
+Native mode avoids asking the model to print XML delimiters. It still puts whitespace-sensitive payloads in JSON string arguments, so the tool semantics are intentionally Qwen-Code-like: `edit.old_string` must match exactly and returns a recoverable error if it does not; `run_shell_command.command` is passed as a shell command string; `run_python_command.code` is executed from a materialized script and has `llm_query`, `llm_query_batched`, `rlm_query`, and `rlm_query_batched` preimported.
 
-### Action Format (XML)
+### Native Tool Calls
+
+In native mode, the model calls tools by schema, not by printing these examples:
+
+```json
+{"name": "read_file", "arguments": {"path": "_rlm_query_0.txt"}}
+{"name": "run_python_command", "arguments": {"code": "from pathlib import Path\nprint(Path('.').resolve())"}}
+{"name": "edit", "arguments": {"file_path": "src/foo.py", "old_string": "return 1\n", "new_string": "return 2\n"}}
+{"name": "final", "arguments": {"answer": "Done", "artifacts": ["out.txt"]}}
+```
+
+The native tool surface is:
+
+`list_directory`, `read_file`, `write_file`, `append_file`, `edit`, `run_shell_command`, `run_python_command`, `llm_query`, `rlm_query`, `final`.
+
+### Legacy XML Format
+
+**Parsing Strategy (Important):** Standard XML parsers will crash if the assistant writes code containing unescaped characters like `<` or `&` (e.g., `if a < b:`). Therefore, the legacy host-side parser is not a strict XML parser. It is a tolerant tag-pair scanner that finds `<action ...>` / `</action>` spans and extracts raw bodies.
 
 For simple reads or commands, use empty elements with attributes:
 

@@ -61,6 +61,7 @@ class VerbosePrinter:
         environment: str,
         max_iterations: int,
         max_depth: int,
+        action_format: str,
         other_backends: list[str] | None = None,
     ) -> None:
         if not self.enabled:
@@ -92,8 +93,14 @@ class VerbosePrinter:
         config_table.add_row(
             "Model",
             Text(model, style=STYLE_ACCENT),
+            "Action Format",
+            Text(action_format, style=STYLE_ACCENT),
+        )
+        config_table.add_row(
             "Max Iterations",
             Text(str(max_iterations), style=STYLE_WARNING),
+            "Max Depth",
+            Text(str(max_depth), style=STYLE_WARNING),
         )
 
         if other_backends:
@@ -101,13 +108,6 @@ class VerbosePrinter:
             config_table.add_row(
                 "Sub-models",
                 backends_text,
-                "Max Depth",
-                Text(str(max_depth), style=STYLE_WARNING),
-            )
-        else:
-            config_table.add_row(
-                "Max Depth",
-                Text(str(max_depth), style=STYLE_WARNING),
                 "",
                 "",
             )
@@ -134,6 +134,7 @@ class VerbosePrinter:
             environment=metadata.environment_type,
             max_iterations=metadata.max_iterations,
             max_depth=metadata.max_depth,
+            action_format=metadata.action_format,
             other_backends=other,
         )
 

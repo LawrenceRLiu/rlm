@@ -1,5 +1,7 @@
 """Unit tests for WorkspaceConfig and its sub-configs."""
 
+import pytest
+
 from rlm.core.config import (
     DockerConfig,
     ObservationConfig,
@@ -13,13 +15,15 @@ from rlm.core.config import (
 def test_workspace_config_defaults():
     cfg = WorkspaceConfig()
     assert cfg.parse.max_action_parse_retries == 3
+    assert cfg.parse.action_format == "native"
+    assert cfg.parse.native_tool_choice == "required"
     assert cfg.observation.max_observation_chars == 16_000
     assert cfg.observation.default_read_file_lines == 500
     assert cfg.observation.max_list_directory_entries == 200
     assert cfg.history.full_observation_turns == 1
     assert cfg.history.max_command_body_replay_chars == 4_000
-    assert cfg.history.max_turn_note_chars == 600
-    assert cfg.history.max_turn_note_lines == 6
+    assert cfg.history.max_turn_note_chars == 1_000_000
+    assert cfg.history.max_turn_note_lines == 1_000_000
     assert cfg.recursion.max_concurrent_subcalls == 5
     assert cfg.recursion.copy_on_spawn_max_file_bytes == 50 * 1024 * 1024
     assert ".git" in cfg.recursion.copy_on_spawn_excludes
@@ -27,6 +31,12 @@ def test_workspace_config_defaults():
     assert cfg.docker.broker_port == 8080
     assert cfg.docker.exec_timeout_seconds == 300
     assert cfg.docker.cleanup_mode == "keep"
+
+
+def test_xml_action_format_is_deprecated():
+    with pytest.warns(DeprecationWarning, match="action_format='xml'"):
+        cfg = ParseConfig(action_format="xml")
+    assert cfg.action_format == "xml"
 
 
 def test_workspace_config_overrides():

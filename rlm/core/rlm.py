@@ -51,7 +51,9 @@ from rlm.utils.exceptions import (
     TimeoutExceededError,
     TokenLimitExceededError,
 )
+from rlm.utils.native_tools import actions_from_tool_calls, build_openai_tools
 from rlm.utils.prompts import (
+    build_native_tool_retry_message,
     build_parse_retry_message,
     build_workspace_initial_user_prompt,
     build_workspace_system_prompt,
@@ -147,6 +149,7 @@ class RLM:
                 max_iterations=max_iterations,
                 backend=backend,
                 backend_kwargs=filter_sensitive_keys(resolved),
+                action_format=self.workspace_config.parse.action_format,
                 environment_type="docker",
                 environment_kwargs={
                     "image": self.workspace_config.docker.image,
@@ -176,7 +179,12 @@ class RLM:
         """
         merged: dict[str, Any] = dict(self.backend_kwargs or {})
         if self.backend in self._OPENAI_COMPAT_BACKENDS:
-            merged.setdefault("enable_thinking", self.workspace_config.lm.enable_thinking)
+            default_thinking = (
+                False
+                if self.workspace_config.parse.action_format == "native"
+                else self.workspace_config.lm.enable_thinking
+            )
+            merged.setdefault("enable_thinking", default_thinking)
         return merged
 
     @contextmanager
@@ -215,6 +223,10 @@ class RLM:
         """Run the workspace loop on ``prompt`` until a final answer or a stop
         condition. Returns a single ``RLMChatCompletion`` whose
         ``response`` is the final answer string.
+
+        New public rollouts must use native tool calls. The legacy XML action
+        format remains only for old-trace visualization and private parser
+        compatibility tests.
 
         ``pre_cleanup_callback`` (optional): a one-shot hook that runs after
         the agent loop returns cleanly, but **before** the container is
@@ -258,6 +270,15 @@ class RLM:
           cleanup (the container still gets torn down), but the exception
           propagates to the caller of ``completion`` after cleanup runs.
         """
+        if self.workspace_config.parse.action_format == "xml":
+            raise ValueError(
+                "Legacy XML tool calling is deprecated for new RLM.completion() "
+                "runs. Use WorkspaceConfig(parse=ParseConfig(action_format='native')) "
+                "or the WorkspaceConfig() default. Existing XML logs can still be "
+                "visualized, and parser compatibility tests should use private "
+                "_run_loop fixtures instead of public completion()."
+            )
+
         with self._spawn_completion_context(prompt) as (lm_handler, env):
             self._wire_recursion(env=env, lm_handler=lm_handler)
             result = self._run_loop(
@@ -318,6 +339,7 @@ class RLM:
             depth=self.depth,
             max_depth=self.max_depth,
             custom_system_prompt=self.custom_system_prompt,
+            action_format=self.workspace_config.parse.action_format,
         )
         initial_user = build_workspace_initial_user_prompt(root_prompt=root_prompt)
         message_history: list[dict[str, Any]] = [
@@ -340,6 +362,7 @@ class RLM:
                 message_history = base_message_history + format_workspace_history(
                     completed_iterations,
                     history_config=self.workspace_config.history,
+                    action_format=self.workspace_config.parse.action_format,
                 )
                 try:
                     iteration = self._completion_turn(
@@ -489,6 +512,49 @@ class RLM:
         retry_messages = list(messages)
 
         for attempt in range(retry_budget + 1):  # +1 = initial try
+            if self.workspace_config.parse.action_format == "native":
+                response = ""
+                reasoning = None
+                try:
+                    result = lm_handler.completion_with_tools(
+                        retry_messages,
+                        tools=build_openai_tools(include_rlm_query=self.depth < self.max_depth),
+                        tool_choice=self.workspace_config.parse.native_tool_choice,
+                    )
+                    response = result.content
+                    reasoning = result.reasoning_content
+                    actions = actions_from_tool_calls(result.tool_calls)
+                    return result.content, result.reasoning_content, actions, attempts
+                except (ActionParseError, ValueError) as exc:
+                    parse_exc = (
+                        exc
+                        if isinstance(exc, ActionParseError)
+                        else ActionParseError(str(exc))
+                    )
+                    attempts.append(
+                        {
+                            "attempt": attempt + 1,
+                            "response": response,
+                            "error": str(parse_exc),
+                            "fragment": parse_exc.fragment,
+                        }
+                    )
+                    if attempt >= retry_budget:
+                        parse_exc.args = (
+                            f"Native tool-call parse failed after {retry_budget} retries: "
+                            f"{parse_exc.args[0]}",
+                        )
+                        parse_exc.parse_attempts = list(attempts)  # type: ignore[attr-defined]
+                        parse_exc.last_response = response  # type: ignore[attr-defined]
+                        parse_exc.last_reasoning = reasoning  # type: ignore[attr-defined]
+                        raise parse_exc from None
+
+                    feedback = build_native_tool_retry_message(
+                        str(parse_exc), parse_exc.fragment
+                    )
+                    retry_messages = retry_messages + [{"role": "user", "content": feedback}]
+                    continue
+
             response, reasoning = lm_handler.completion_with_reasoning(retry_messages)
             try:
                 actions = action_parser.parse(response)
@@ -665,6 +731,30 @@ class RLM:
         lm_handler: LMHandler,
     ) -> str:
         """Out-of-iterations fallback: ask the model for one last answer."""
+        if self.workspace_config.parse.action_format == "native":
+            result = lm_handler.completion_with_tools(
+                list(message_history)
+                + [
+                    {
+                        "role": "user",
+                        "content": (
+                            "You ran out of iterations. Call the final tool now with "
+                            "your best answer based on what you have gathered."
+                        ),
+                    }
+                ],
+                tools=[
+                    tool
+                    for tool in build_openai_tools(include_rlm_query=False)
+                    if tool["function"]["name"] == "final"
+                ],
+                tool_choice={"type": "function", "function": {"name": "final"}},
+            )
+            actions = actions_from_tool_calls(result.tool_calls)
+            for action in actions:
+                if action.tool == "final":
+                    return str(action.args.get("answer", result.content))
+            return result.content
         prompt = list(message_history) + [
             {
                 "role": "user",

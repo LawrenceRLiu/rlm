@@ -64,6 +64,8 @@ CUDA_VISIBLE_DEVICES="${GPU}" HF_HUB_CACHE="${HF_HUB_CACHE}" \
         --max-model-len 32768 \
         --max-num-batched-tokens 8192 \
         --reasoning-parser qwen3 \
+        --enable-auto-tool-choice \
+        --tool-call-parser "${TOOL_CALL_PARSER:-hermes}" \
         "${EXTRA_FLAGS[@]}" \
         > "${LOGFILE}" 2>&1 &
 echo "vllm PID: $!"
