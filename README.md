@@ -207,3 +207,11 @@ You'll have the option to select saved `.jsonl` files
 <p align="center">
   <img src="media/visualizer.png" alt="RLM Visualizer Example" width="800"/>
 </p>
+
+For terminal inspection, use the packaged text viewer:
+
+```bash
+rlm-trace logs/*.jsonl
+rlm-trace logs/run.jsonl --turn 3 --prompt --response --actions --observations
+rlm-trace logs/run.jsonl --turn 3 --all --children --max-chars 0
+```

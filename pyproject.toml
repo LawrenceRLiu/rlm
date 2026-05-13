@@ -40,6 +40,9 @@ Homepage = "https://github.com/alexzhang13/rlm"
 Repository = "https://github.com/alexzhang13/rlm"
 Issues = "https://github.com/alexzhang13/rlm/issues"
 
+[project.scripts]
+rlm-trace = "rlm.trace_viewer:main"
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"

@@ -37,20 +37,20 @@ jq -r 'select(.type=="iteration" and .iteration==5) | .prompt[] | "\(.role):\n\(
 
 | Goal | Use |
 |---|---|
-| "Did this run succeed and what tools did the model use?" | `_setup_runs/trace.py` (one-line-per-turn summary) |
+| "Did this run succeed and what tools did the model use?" | `rlm-trace` (one-line-per-turn summary) |
 | "Show me the model's full XML response for turn 3" | `jq` on the JSONL |
 | "What's the actual content of the file the model wrote?" | `cat` in the workspace dir |
 | "What changed between turn 4 and turn 5?" | `git log --oneline` + `git show <sha>` inside the workspace dir |
-| "Where did the model get stuck or error?" | grep the JSONL for `"error":` non-null, or use the trace script's `ERR=` marker |
+| "Where did the model get stuck or error?" | grep the JSONL for `"error":` non-null, or use `rlm-trace`'s `ERR=` marker |
 | "What was the raw observation after each action?" | JSONL `observations[i].stdout` / `.stderr` |
 | "What did the model-facing prompt contain on turn N?" | JSONL `prompt[]` for that iteration |
 | "I want a UI" | the Next.js visualizer at `visualizer/` |
 
 ## CLI navigation
 
-### One-line-per-turn summary
+### Text viewer
 
-`_setup_runs/trace.py` walks a JSONL and emits a compact per-turn line. Output looks like:
+`rlm-trace` walks one or more JSONL logs and emits a compact per-turn summary:
 
 ```
 === rlm_2026-05-09_17-12-59_48e29be2.jsonl ===
@@ -74,7 +74,25 @@ What each marker means:
 - `changed=[...]` — files the per-turn git snapshot recorded as modified (capped at 3 + `…`).
 - `FINAL` — this turn produced a `final_answer`.
 
-Run on multiple files at once: `python _setup_runs/trace.py _setup_runs/logs/*.jsonl`.
+Run on multiple files at once:
+
+```bash
+rlm-trace _setup_runs/logs/*.jsonl
+```
+
+Drill into a specific turn without opening the browser:
+
+```bash
+rlm-trace logs/run.jsonl --turn 3 --prompt --response --actions --observations
+rlm-trace logs/run.jsonl --turn 3 --all --children --max-chars 0
+```
+
+Useful flags:
+- `--turn N` may be repeated.
+- `--prompt`, `--response`, `--actions`, `--observations`, `--parse-attempts`, and `--snapshot` select sections for a turn.
+- `--all` selects every section.
+- `--children` includes nested `rlm_query` trajectory summaries when they were logged in `observations[].rlm_calls`.
+- `--max-chars N` caps long text blocks; `0` prints full text.
 
 ### Direct JSONL inspection with `jq`
 
@@ -161,7 +179,11 @@ _rlm_artifacts/children/
 
 Only files the child explicitly exported are present — the child's full workspace lives elsewhere (transient by default). The parent's JSONL observation for the `rlm_query` action lists each child's exported artifact under `observations[i].artifacts` and includes a path-mapping table in `observations[i].stdout`.
 
-**Caveat (current scaffold):** `observations[i].rlm_calls` in the JSONL is currently empty even when children ran. Per-child trajectories aren't embedded in the parent log. To trace children, you have to either re-run with extra logging or read the parent's stdout summary and infer.
+When recursion is logged inline, `observations[i].rlm_calls[*].metadata.iterations`
+contains the child trajectory. Use `rlm-trace --children` for a text summary, or
+open the same JSONL in the visualizer for drill-down navigation. Broker-side
+batched calls from inside `python` actions may still surface only as stdout text
+unless their parent observation carries `rlm_calls`.
 
 ### Spilled observations
 
@@ -187,9 +209,7 @@ npm run dev                                       # → http://localhost:3001
 
 Then load any `*.jsonl` from `<log_dir>/` via the in-app picker. The visualizer is a pure client-side renderer — there's no API endpoint; it parses the JSONL in the browser. The TS types in `visualizer/src/lib/types.ts` mirror the Python `to_dict()` schemas 1:1, so any field you can `jq` from the JSONL is also accessible in the UI.
 
-What the visualizer currently shows well: per-turn actions/observations, tool breakdown, parse-attempt list, snapshot diffs.
-
-What it doesn't show (because the producer doesn't emit them): per-child trajectories during recursion (see B4 in `dev/2026-05-09_first_run_traces_gemma-4-31B-it.md`).
+What the visualizer currently shows well: per-turn actions/observations, tool breakdown, parse-attempt list, snapshot diffs, and inline child trajectories when `observations[].rlm_calls` is populated.
 
 ## A worked example
 
@@ -198,7 +218,7 @@ Suppose you want to answer "how did the model recover after the pytest-not-found
 1. Find the run. From the trace summary or the file timestamps:
    `_setup_runs/logs/rlm_2026-05-09_17-12-59_48e29be2.jsonl`.
 2. Locate the error turn:
-   `python _setup_runs/trace.py _setup_runs/logs/rlm_2026-05-09_17-12-59_48e29be2.jsonl` → ERR=1 on turn 2.
+   `rlm-trace _setup_runs/logs/rlm_2026-05-09_17-12-59_48e29be2.jsonl` → ERR=1 on turn 2.
 3. Inspect the failing action:
    `jq -r 'select(.type=="iteration" and .iteration==2) | .actions[0].body' _setup_runs/logs/rlm_2026-05-09_17-12-59_48e29be2.jsonl`
    → `pytest test_sort.py` (the model ran tests before writing them).
@@ -208,13 +228,13 @@ Suppose you want to answer "how did the model recover after the pytest-not-found
 5. (Optional) Walk the workspace:
    `cd ~/.rlm/workspaces/run_1778371979854_d052faa7 && git log --oneline` shows one commit per turn; `git show <turn-3-sha>` shows the recovery commit's effect.
 
-That same flow — "trace.py for the overview, jq for any specific field, `prompt[]` for model-facing replay, workspace+git for the actual file content" — works for any run.
+That same flow — "`rlm-trace` for the overview, jq for any specific field, `prompt[]` for model-facing replay, workspace+git for the actual file content" — works for any run.
 
 ## Summary
 
 | You want to see... | Look at |
 |---|---|
-| pass/fail at a glance | `trace.py` |
+| pass/fail at a glance | `rlm-trace` |
 | every action the model emitted | JSONL `actions[]` via `jq` |
 | every raw observation back from the substrate | JSONL `observations[]` via `jq` |
 | the compact replay the model saw | JSONL `prompt[]` for that turn |
