@@ -1,9 +1,7 @@
 import json
-import re
 import textwrap
 from html import escape
 
-from rlm.core.config import PromptHistoryConfig
 from rlm.core.types import (
     WorkspaceAction,
     WorkspaceIteration,
@@ -43,19 +41,8 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     # How to act
     Each turn, emit one or more ``<action tool="...">...</action>`` elements.
     You may write reasoning prose around them; the runtime extracts only the
-    ``<action>`` blocks. Future turns receive compact receipts for prior
-    actions and observations, not guaranteed verbatim replay of your prose or
-    durable edit bodies. Use workspace files for durable memory and
-    ``read_file`` when you need to inspect file contents. Self-closing
-    ``<action ... />`` is allowed for tools that take no body.
-
-    Before the actions, include one short ``<note>...</note>`` to preserve turn-to-turn
-    intent. Use this to keep a running summary of the task and what you have done
-    and plan to do so you can stay on track. This note MUST be extremely compact,
-    terse, and dense (maximum 2-3 sentences). Use shorthand and abbreviations.
-    Do not put file contents, code blocks, proofs, large outputs, generated
-    artifacts, or action XML inside notes; overlong or content-like notes are omitted from
-    future replay.
+    ``<action>`` blocks. Self-closing ``<action ... />`` is allowed for tools
+    that take no body.
 
     Emit ``<action tool="final"><answer>...</answer></action>`` to terminate
     the run with your final answer. You may also include zero or more
@@ -76,9 +63,10 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
       ``_rlm_artifacts/_observations/`` and the observation is replaced
       with a short summary plus a path. Read the file in the path to get full output.
     - You may not write inside ``_rlm_state/``.
-    - CRITICAL: Your prompt history will be truncated over time to save context length.
-      If you lose track of the specific details of the task, you MUST use ``read_file``
-      to re-read ``_rlm_query_0.txt`` or your own ``_rlm_notes/`` instead of guessing.
+    - If the prompt grows past a token threshold the substrate periodically
+      summarizes the trajectory and resets the visible history; treat the
+      workspace files (and ``_rlm_query_0.txt`` in particular) as the
+      authoritative state and re-read them when in doubt.
     {depth_rule}
     """
 )
@@ -130,8 +118,10 @@ NATIVE_WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     - Per-call output above the configured cap is auto-spilled to
       ``_rlm_artifacts/_observations/`` and replaced with a short summary path.
     - You may not write inside ``_rlm_state/``.
-    - Prompt history is truncated over time. If details are missing, re-read
-      ``_rlm_query_0.txt`` or your own ``_rlm_notes/`` instead of guessing.
+    - If the prompt grows past a token threshold the substrate periodically
+      summarizes the trajectory and resets the visible history; treat the
+      workspace files (and ``_rlm_query_0.txt`` in particular) as the
+      authoritative state and re-read them when in doubt.
     {depth_rule}
     """
 )
@@ -189,7 +179,9 @@ def build_workspace_system_prompt(
         )
     else:
         depth_rule = ""
-    template = NATIVE_WORKSPACE_SYSTEM_PROMPT_TEMPLATE if native else WORKSPACE_SYSTEM_PROMPT_TEMPLATE
+    template = (
+        NATIVE_WORKSPACE_SYSTEM_PROMPT_TEMPLATE if native else WORKSPACE_SYSTEM_PROMPT_TEMPLATE
+    )
     return template.format(
         tool_descriptions=tool_descriptions,
         depth_rule=depth_rule,
@@ -212,9 +204,7 @@ def build_workspace_initial_user_prompt(*, root_prompt: str | None = None) -> st
     return base
 
 
-FILE_BODY_TOOLS = {"write_file", "append_file", "edit_file", "edit"}
 COMMAND_TOOLS = {"python", "shell", "run_python_command", "run_shell_command"}
-NOTE_RE = re.compile(r"<note>(.*?)</note>", re.DOTALL)
 
 NATIVE_TOOL_DESCRIPTIONS: dict[str, str] = {
     "list_directory": (
@@ -266,141 +256,31 @@ NATIVE_TOOL_DESCRIPTIONS: dict[str, str] = {
 }
 
 
-def truncate_for_prompt(text: str, cap: int) -> tuple[str, bool]:
-    """Return ``text`` capped for prompt replay plus whether truncation happened."""
-    if cap < 0 or len(text) <= cap:
-        return text, False
-    return text[:cap], True
-
-
-def action_changed_files(observation: WorkspaceObservation | None) -> bool:
-    if observation is None or not observation.data:
-        return False
-    changed = observation.data.get("changed_paths")
-    removed = observation.data.get("removed_paths")
-    return bool(changed or removed)
-
-
-def compact_action_args(action: WorkspaceAction) -> dict[str, object]:
-    """Return replay-safe arguments without duplicating large payload strings."""
-    args = dict(action.args)
-    for key in ("content", "old_string", "new_string", "code", "command", "prompt"):
-        value = args.pop(key, None)
-        if isinstance(value, str):
-            args[f"{key}_chars"] = len(value)
-            args[f"{key}_lines"] = len(value.splitlines()) if value else 0
-    return args
-
-
-def extract_turn_note(
-    response: str,
-    history_config: PromptHistoryConfig,
-) -> tuple[str | None, str | None]:
-    """Extract the first bounded <note> from a response.
-
-    Returns ``(note, None)`` for a valid note, ``(None, reason)`` for a note
-    that was present but intentionally omitted, and ``(None, None)`` when the
-    response had no note.
-    """
-    cleaned = strip_reasoning_blocks(response)
-    match = NOTE_RE.search(cleaned)
-    if match is None:
-        return None, None
-
-    note = "\n".join(line.strip() for line in match.group(1).strip().splitlines()).strip()
-    if not note:
-        return None, "empty"
-
-    lower = note.lower()
-    if "```" in note or "<action" in lower or "</action" in lower:
-        return None, "content-like"
-    if len(note) > history_config.max_turn_note_chars:
-        return None, "too-long"
-    if len(note.splitlines()) > history_config.max_turn_note_lines:
-        return None, "too-many-lines"
-    return note, None
-
-
-def render_turn_note(
-    iteration: WorkspaceIteration,
-    history_config: PromptHistoryConfig,
-    *,
-    action_format: str = "native",
-) -> str | None:
-    note, omitted_reason = extract_turn_note(iteration.response, history_config)
-    if action_format == "native":
-        if note is not None:
-            return f"TURN_NOTE turn={iteration.iteration}\n{note}"
-        if omitted_reason is not None:
-            return f"TURN_NOTE turn={iteration.iteration} omitted=true reason={omitted_reason}"
-        return None
-
-    if note is not None:
-        return (
-            f'<turn_note turn="{iteration.iteration}">\n{escape(note, quote=False)}\n</turn_note>'
-        )
-    if omitted_reason is not None:
-        return (
-            f'<turn_note turn="{iteration.iteration}" omitted="true" '
-            f'reason="{escape(omitted_reason, quote=True)}" />'
-        )
-    return None
-
-
 def render_action_replay(
     action_id: str,
     action: WorkspaceAction,
     observation: WorkspaceObservation | None,
-    history_config: PromptHistoryConfig,
     *,
     action_format: str = "native",
 ) -> str:
-    """Compact model-facing replay of what the assistant attempted.
+    """Full-fidelity model-facing replay of what the assistant attempted.
 
-    Full raw action bodies stay in ``WorkspaceIteration`` for logging and
-    visualizer use. This renderer intentionally hides ordinary durable edit
-    bodies so the transcript does not become a second filesystem.
+    Action bodies are replayed verbatim; compression is handled by the
+    substrate-level ``CompactionConfig`` once the prompt exceeds its token
+    threshold, not by per-turn hiding.
     """
     status = "error" if observation is not None and observation.error else "ok"
     body = action.body or ""
-    body_lines = len(body.splitlines()) if body else 0
-    body_chars = len(body)
 
     if action_format == "native":
-        compact_args = compact_action_args(action)
-        parts = [
-            f"TOOL_CALL {action_id} tool={action.tool} status={status}"
-        ]
+        parts = [f"TOOL_CALL {action_id} tool={action.tool} status={status}"]
         if action.call_id:
             parts[0] += f" call_id={action.call_id}"
-        if compact_args:
-            parts.append(
-                "args="
-                + json.dumps(compact_args, ensure_ascii=False, sort_keys=True)
-            )
-        if action.tool in FILE_BODY_TOOLS:
-            parts.append(
-                f"payload omitted: {body_chars} chars, {body_lines} lines; "
-                "use read_file to inspect durable contents"
-            )
-        elif action.tool in COMMAND_TOOLS:
-            cap = (
-                history_config.max_mutating_command_body_replay_chars
-                if action_changed_files(observation)
-                else history_config.max_command_body_replay_chars
-            )
-            source, truncated = truncate_for_prompt(body, cap)
-            if source:
-                parts.append("source:")
-                parts.append(source.rstrip())
-            else:
-                parts.append("source omitted: empty")
-            if truncated:
-                parts.append(
-                    f"source truncated for replay: {body_chars} chars total, showing first {cap}"
-                )
-        elif body:
-            parts.append(f"payload length: {body_chars} chars")
+        if action.args:
+            parts.append("args=" + json.dumps(action.args, ensure_ascii=False, sort_keys=True))
+        if body:
+            parts.append("body:")
+            parts.append(body.rstrip())
         if observation is not None and observation.error:
             parts.append(f"error: {observation.error}")
         return "\n".join(parts)
@@ -418,44 +298,10 @@ def render_action_replay(
     if args:
         attrs += f" {args}"
 
-    if action.tool in FILE_BODY_TOOLS:
-        lines = [f"<action_replay {attrs}>"]
-        lines.append(
-            f"[body omitted from replay: {body_chars} chars, {body_lines} lines; "
-            "use read_file to inspect durable contents]"
-        )
-        if observation is not None and observation.error:
-            lines.append(f"[error] {observation.error}")
-        lines.append("</action_replay>")
-        return "\n".join(lines)
-
-    if action.tool in COMMAND_TOOLS:
-        cap = (
-            history_config.max_mutating_command_body_replay_chars
-            if action_changed_files(observation)
-            else history_config.max_command_body_replay_chars
-        )
-        source, truncated = truncate_for_prompt(body, cap)
-        lines = [f"<action_replay {attrs}>"]
-        if source:
-            lines.append("[source]")
-            lines.append(source.rstrip())
-        if truncated:
-            lines.append(
-                f"[source truncated for replay: {body_chars} chars total, showing first {cap}]"
-            )
-        if not source:
-            lines.append("[source omitted: empty body]")
-        if observation is not None and observation.error:
-            lines.append(f"[error] {observation.error}")
-        lines.append("</action_replay>")
-        return "\n".join(lines)
-
-    # Read-only / terminal / query actions have small bodies or no durable
-    # write payload. Keep a compact receipt; observations carry the result.
     lines = [f"<action_replay {attrs}>"]
     if body:
-        lines.append(f"[body: {body_chars} chars]")
+        lines.append("[body]")
+        lines.append(body.rstrip())
     else:
         lines.append("[no body]")
     if observation is not None and observation.error:
@@ -468,54 +314,22 @@ def render_observation(
     action_id: str,
     observation: WorkspaceObservation,
     *,
-    action: WorkspaceAction | None = None,
-    compact: bool = False,
-    history_config: PromptHistoryConfig | None = None,
     action_format: str = "native",
 ) -> str:
-    """Render a single observation for inclusion in the next user message."""
-    if history_config is None:
-        history_config = PromptHistoryConfig()
+    """Render a single observation for inclusion in the next user message.
 
+    Full-fidelity: stdout/stderr/error are replayed verbatim. Per-call
+    spill to ``_rlm_artifacts/_observations/`` upstream of this renderer
+    is the only truncation that applies; substrate-level compaction takes
+    over once the cumulative prompt crosses ``CompactionConfig.threshold_tokens``.
+    """
     if action_format == "native":
         status = "error" if observation.error else "ok"
-        label = "OBSERVATION_RECEIPT" if compact else "OBSERVATION"
-        parts = [f"{label} {action_id} tool={observation.tool} status={status}"]
-        if compact:
-            if observation.error:
-                parts.append(f"error: {observation.error}")
-            if observation.stdout:
-                parts.append(f"stdout omitted from replay: {len(observation.stdout)} chars")
-            if observation.stderr:
-                parts.append(f"stderr omitted from replay: {len(observation.stderr)} chars")
-            if action is not None and action.args:
-                compact_args = compact_action_args(action)
-                if compact_args:
-                    parts.append(
-                        "args="
-                        + json.dumps(compact_args, ensure_ascii=False, sort_keys=True)
-                    )
-            if observation.artifacts:
-                parts.append("artifacts: " + ", ".join(observation.artifacts))
-            if observation.final_answer is not None:
-                parts.append("final answer omitted from replay")
-            return "\n".join(parts)
-
+        parts = [f"OBSERVATION {action_id} tool={observation.tool} status={status}"]
         if observation.error:
             parts.append(f"error: {observation.error}")
         if observation.stdout:
-            stdout = observation.stdout.rstrip()
-            if observation.tool in COMMAND_TOOLS and action_changed_files(observation):
-                cap = history_config.max_mutating_command_stdout_replay_chars
-                stdout, truncated = truncate_for_prompt(stdout, cap)
-                parts.append(stdout.rstrip())
-                if truncated:
-                    parts.append(
-                        f"stdout truncated for replay: {len(observation.stdout)} chars total, "
-                        f"showing first {cap}; rerun or read artifacts/files for details"
-                    )
-            else:
-                parts.append(stdout)
+            parts.append(observation.stdout.rstrip())
         if observation.stderr:
             parts.append("stderr:")
             parts.append(observation.stderr.rstrip())
@@ -527,42 +341,11 @@ def render_observation(
                 parts.append("final artifacts: " + ", ".join(observation.final_artifacts))
         return "\n".join(parts)
 
-    if compact:
-        parts = [f'<observation_receipt action_id="{action_id}" tool="{observation.tool}">']
-        if observation.error:
-            parts.append(f"[error] {observation.error}")
-        else:
-            parts.append("[status] ok")
-        if observation.stdout:
-            parts.append(f"[stdout omitted from replay: {len(observation.stdout)} chars]")
-        if observation.stderr:
-            parts.append(f"[stderr omitted from replay: {len(observation.stderr)} chars]")
-        if action is not None and action.args:
-            args = ", ".join(f"{k}={v}" for k, v in action.args.items())
-            parts.append(f"[args] {args}")
-        if observation.artifacts:
-            parts.append("[artifacts] " + ", ".join(observation.artifacts))
-        if observation.final_answer is not None:
-            parts.append("[final answer omitted from replay]")
-        parts.append("</observation_receipt>")
-        return "\n".join(parts)
-
     parts = [f'<observation action_id="{action_id}" tool="{observation.tool}">']
     if observation.error:
         parts.append(f"[error] {observation.error}")
     if observation.stdout:
-        stdout = observation.stdout.rstrip()
-        if observation.tool in COMMAND_TOOLS and action_changed_files(observation):
-            cap = history_config.max_mutating_command_stdout_replay_chars
-            stdout, truncated = truncate_for_prompt(stdout, cap)
-            parts.append(stdout.rstrip())
-            if truncated:
-                parts.append(
-                    f"[stdout truncated for replay: {len(observation.stdout)} chars total, "
-                    f"showing first {cap}; rerun or read artifacts/files for details]"
-                )
-        else:
-            parts.append(stdout)
+        parts.append(observation.stdout.rstrip())
     if observation.stderr:
         parts.append("[stderr]")
         parts.append(observation.stderr.rstrip())
@@ -579,37 +362,22 @@ def render_observation(
 def format_workspace_iteration(
     iteration: WorkspaceIteration,
     *,
-    history_config: PromptHistoryConfig | None = None,
-    age: int = 0,
     action_format: str = "native",
 ) -> list[dict[str, str]]:
     """Convert a completed ``WorkspaceIteration`` into next-turn messages.
 
-    Returns two messages: a compact assistant-side action replay and a
-    synthetic user message containing the rendered observations plus a one-line
-    snapshot summary. Parse-retry attempts are NOT included here; they live in
-    ``iteration.parse_attempts`` for the visualizer.
+    Returns two messages: an assistant-side action replay and a synthetic
+    user message containing the rendered observations plus a one-line
+    snapshot summary. Parse-retry attempts are NOT included here; they live
+    in ``iteration.parse_attempts`` for the visualizer.
 
-    When a turn had no parsed actions, the assistant ``content`` falls back to
-    the stripped raw response. Google and Alibaba both document multi-turn
-    semantics where the prior turn's thought is dropped on replay; the strip
-    also avoids paying input-token cost for monologue the substrate already
-    discarded.
+    When a turn had no parsed actions, the assistant ``content`` falls back
+    to the stripped raw response. Google and Alibaba both document
+    multi-turn semantics where the prior turn's thought is dropped on
+    replay; the strip also avoids paying input-token cost for monologue the
+    substrate already discarded.
     """
-    if history_config is None:
-        history_config = PromptHistoryConfig()
-
-    compact_observations = age >= history_config.full_observation_turns
-
     action_chunks: list[str] = []
-    turn_note = render_turn_note(
-        iteration,
-        history_config,
-        action_format=action_format,
-    )
-    if turn_note is not None:
-        action_chunks.append(turn_note)
-
     for idx, action in enumerate(iteration.actions):
         action_id = f"t{iteration.iteration}.a{idx + 1}"
         observation = iteration.observations[idx] if idx < len(iteration.observations) else None
@@ -618,25 +386,17 @@ def format_workspace_iteration(
                 action_id=action_id,
                 action=action,
                 observation=observation,
-                history_config=history_config,
                 action_format=action_format,
             )
         )
 
     obs_chunks: list[str] = []
-    # Pair each action with its observation by index. Length should match
-    # except in the unusual case where execution halted early; render what
-    # we have and let the model see the gap.
     for idx, observation in enumerate(iteration.observations):
         action_id = f"t{iteration.iteration}.a{idx + 1}"
-        action = iteration.actions[idx] if idx < len(iteration.actions) else None
         obs_chunks.append(
             render_observation(
                 action_id,
                 observation,
-                action=action,
-                compact=compact_observations,
-                history_config=history_config,
                 action_format=action_format,
             )
         )
@@ -669,21 +429,14 @@ def format_workspace_iteration(
 def format_workspace_history(
     iterations: list[WorkspaceIteration],
     *,
-    history_config: PromptHistoryConfig | None = None,
     action_format: str = "native",
 ) -> list[dict[str, str]]:
     """Render completed iterations for model-facing prompt replay."""
-    if history_config is None:
-        history_config = PromptHistoryConfig()
     messages: list[dict[str, str]] = []
-    total = len(iterations)
-    for idx, iteration in enumerate(iterations):
-        age = total - idx - 1
+    for iteration in iterations:
         messages.extend(
             format_workspace_iteration(
                 iteration,
-                history_config=history_config,
-                age=age,
                 action_format=action_format,
             )
         )
@@ -711,3 +464,75 @@ def build_native_tool_retry_message(error: str, fragment: str | None) -> str:
     if fragment:
         msg += f"\n\nOffending tool-call payload (truncated):\n{fragment[:500]}"
     return msg
+
+
+COMPACTION_SUMMARY_PROMPT = textwrap.dedent(
+    """\
+    The workspace trajectory so far has grown long enough that the substrate
+    is about to compress it. Produce a single self-contained summary that
+    your future self (with no other context) can resume from. The compressed
+    history is irreversible — anything you do not capture here is lost from
+    your visible context (durable files, git snapshots, and
+    ``_rlm_state/provenance.json`` remain on disk).
+
+    Structure your response exactly as follows, in plain prose with the
+    section headers verbatim:
+
+    # Original task
+    Restate the original task **verbatim** from ``_rlm_query_0.txt`` (and
+    any ``_rlm_query_<N>.txt`` context files). Do not paraphrase.
+
+    # Files touched
+    For each workspace file you wrote, appended to, or edited, give one
+    line: ``<path> — <one-line description of its current contents/role>``.
+    Pull this from the provenance information that follows.
+
+    # Concrete results to preserve
+    Any intermediate values, computations, code snippets, or findings that
+    would be expensive to recompute. Be specific (numbers, file:line
+    references, exact strings) rather than abstract.
+
+    # Open questions / uncertainties
+    Anything you noticed but have not resolved.
+
+    # Next action
+    The single next concrete step you would take if resumed right now.
+
+    Do NOT emit any tool calls or ``<action>`` blocks in this summary —
+    only prose. The substrate will resume normal tool-calling after the
+    compression boundary.
+    """
+)
+
+
+def build_compaction_summary_prompt(
+    *,
+    provenance_lines: list[str] | None = None,
+) -> str:
+    """Compose the user-facing summary request that drives a compaction call.
+
+    ``provenance_lines`` is an optional pre-rendered list of
+    ``<path> — <provenance role/turn>`` lines pulled from
+    ``DockerWorkspaceEnv.provenance``. Including them gives the model a
+    deterministic checklist of the files to mention in the "Files touched"
+    section.
+    """
+    prompt = COMPACTION_SUMMARY_PROMPT
+    if provenance_lines:
+        rendered = "\n".join(f"- {line}" for line in provenance_lines)
+        prompt += "\n\n# Provenance snapshot (for your reference)\n" + rendered
+    return prompt
+
+
+def build_compaction_continue_message() -> str:
+    """User-facing kick-off message replayed immediately after the summary.
+
+    Mirrors upstream RLM's [system, initial, summary, continue] shape.
+    """
+    return (
+        "The trajectory above has been compressed into the assistant summary. "
+        "The workspace filesystem is unchanged and remains authoritative. "
+        "Resume the task from the 'Next action' section of your summary; "
+        "re-read ``_rlm_query_0.txt`` or your ``_rlm_notes/`` if you need "
+        "to confirm any detail."
+    )

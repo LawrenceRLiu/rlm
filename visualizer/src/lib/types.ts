@@ -66,6 +66,22 @@ export interface ParseAttempt {
   error: string;
 }
 
+// Substrate-level compaction event. Emitted on the turn the cumulative
+// prompt crosses `CompactionConfig.threshold_tokens`; the model-authored
+// `summary` replaces the pre-compress trajectory in the visible prompt.
+// The full iteration history remains in the JSONL log and in workspace
+// git snapshots; only the model's view is reset.
+export interface CompactionEvent {
+  type: 'compaction';
+  timestamp: string;
+  turn: number;
+  tokens_before: number;
+  threshold_tokens: number;
+  dropped_iterations: number;
+  retained_tail_iterations: number;
+  summary: string;
+}
+
 export interface WorkspaceIteration {
   type?: string;
   iteration: number;

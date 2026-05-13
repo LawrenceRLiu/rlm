@@ -182,6 +182,26 @@ class VerbosePrinter:
         self.console.print()
         self.console.print(panel)
 
+    def print_compaction(self, *, turn: int, tokens_before: int, threshold: int) -> None:
+        if not self.enabled:
+            return
+        title = Text()
+        title.append("⤓ ", style=STYLE_ACCENT)
+        title.append("History compacted", style=Style(color=COLORS["accent"], bold=True))
+        content = Text()
+        content.append(f"Turn: {turn}\n", style=STYLE_MUTED)
+        content.append(f"Tokens before: {tokens_before:,}\n", style=STYLE_TEXT)
+        content.append(f"Threshold: {threshold:,}", style=STYLE_MUTED)
+        panel = Panel(
+            content,
+            title=title,
+            title_align="left",
+            border_style=COLORS["accent"],
+            padding=(0, 2),
+        )
+        self.console.print()
+        self.console.print(panel)
+
     def print_final_answer(self, answer: Any) -> None:
         if not self.enabled:
             return

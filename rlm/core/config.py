@@ -55,33 +55,29 @@ class ObservationConfig:
 
 
 @dataclass
-class PromptHistoryConfig:
-    """Model-facing replay shaping for prior turns.
+class CompactionConfig:
+    """Substrate-level history compression.
 
-    The JSONL logger keeps full-fidelity responses/actions/observations. These
-    knobs only affect what is replayed back into the LM prompt on later turns.
+    When the rendered prompt exceeds ``threshold_tokens``, the substrate calls
+    the LM with a summary prompt and resets the model-facing history to
+    ``[system, initial_user, assistant=summary, user=continue]`` (plus an
+    optional tail of the most recent turns). The full pre-compress trajectory
+    remains accessible via ``_rlm_state`` git snapshots and ``provenance.json``.
+
+    This replaces the older age-based observation compaction, per-turn body
+    caps, and ``<note>`` machinery: until the threshold fires, action bodies
+    and observations stay full-fidelity in the prompt.
     """
 
-    # Number of most-recent completed turns whose observations are replayed in
-    # full. Older observations become receipts so read_file output does not
-    # become permanent transcript memory.
-    full_observation_turns: int = 1
-
-    # Python/shell source is often useful for debugging, but if that action
-    # changed files it may also contain generated artifacts. Use a smaller cap
-    # in that case.
-    max_command_body_replay_chars: int = 4_000
-    max_mutating_command_body_replay_chars: int = 1_200
-
-    # If python/shell changed files, cap stdout more aggressively in prompt
-    # replay. The full stdout remains in the iteration log / spill artifact.
-    max_mutating_command_stdout_replay_chars: int = 2_000
-
-    # Optional <note>...</note> intent anchor replayed across turns. Overlong
-    # or content-like notes are replaced with an omitted-note receipt.
-    # Note: Truncation limits have been set practically infinite per user request.
-    max_turn_note_chars: int = 1_000_000
-    max_turn_note_lines: int = 1_000_000
+    enabled: bool = True
+    # Absolute token threshold, not a fraction of the model's context window.
+    # Defaults to ~64K — roughly an order of magnitude below Qwen3.5-9B's
+    # 262K native context, calibrated to where context-rot literature places
+    # the effective reasoning window for a 9B-class model.
+    threshold_tokens: int = 64_000
+    # Keep this many most-recent completed turns full-fidelity after compress.
+    # 0 matches upstream RLM's [system, initial, summary, continue] exactly.
+    tail_turns_preserved: int = 0
 
 
 @dataclass
@@ -132,7 +128,7 @@ class WorkspaceConfig:
 
     parse: ParseConfig = field(default_factory=ParseConfig)
     observation: ObservationConfig = field(default_factory=ObservationConfig)
-    history: PromptHistoryConfig = field(default_factory=PromptHistoryConfig)
+    compaction: CompactionConfig = field(default_factory=CompactionConfig)
     recursion: RecursionConfig = field(default_factory=RecursionConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
     lm: LMConfig = field(default_factory=LMConfig)

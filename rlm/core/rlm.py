@@ -53,6 +53,8 @@ from rlm.utils.exceptions import (
 )
 from rlm.utils.native_tools import actions_from_tool_calls, build_openai_tools
 from rlm.utils.prompts import (
+    build_compaction_continue_message,
+    build_compaction_summary_prompt,
     build_native_tool_retry_message,
     build_parse_retry_message,
     build_workspace_initial_user_prompt,
@@ -60,6 +62,7 @@ from rlm.utils.prompts import (
     format_workspace_history,
 )
 from rlm.utils.rlm_utils import filter_sensitive_keys
+from rlm.utils.token_utils import count_tokens
 from rlm.workspace_tools import get_spec
 
 
@@ -348,6 +351,9 @@ class RLM:
         ]
         base_message_history = list(message_history)
         completed_iterations: list[WorkspaceIteration] = []
+        # Out-of-band compaction prefix spliced between the initial user turn
+        # and the post-compress tail. Empty until the first compaction fires.
+        post_compress_prefix: list[dict[str, Any]] = []
 
         try:
             for i in range(self.max_iterations):
@@ -359,11 +365,34 @@ class RLM:
                         pass
 
                 env.current_turn = i + 1
-                message_history = base_message_history + format_workspace_history(
-                    completed_iterations,
-                    history_config=self.workspace_config.history,
-                    action_format=self.workspace_config.parse.action_format,
+                message_history = (
+                    base_message_history
+                    + post_compress_prefix
+                    + format_workspace_history(
+                        completed_iterations,
+                        action_format=self.workspace_config.parse.action_format,
+                    )
                 )
+
+                if self.workspace_config.compaction.enabled and self._should_compact(
+                    message_history, lm_handler
+                ):
+                    post_compress_prefix, completed_iterations = self._compact_history(
+                        message_history=message_history,
+                        completed_iterations=completed_iterations,
+                        lm_handler=lm_handler,
+                        env=env,
+                        turn=i + 1,
+                    )
+                    message_history = (
+                        base_message_history
+                        + post_compress_prefix
+                        + format_workspace_history(
+                            completed_iterations,
+                            action_format=self.workspace_config.parse.action_format,
+                        )
+                    )
+
                 try:
                     iteration = self._completion_turn(
                         iteration_idx=i + 1,
@@ -416,9 +445,13 @@ class RLM:
 
         # max_iterations reached without a `final` action: ask the model
         # one last time for an answer based on what it has gathered.
-        message_history = base_message_history + format_workspace_history(
-            completed_iterations,
-            history_config=self.workspace_config.history,
+        message_history = (
+            base_message_history
+            + post_compress_prefix
+            + format_workspace_history(
+                completed_iterations,
+                action_format=self.workspace_config.parse.action_format,
+            )
         )
         final_answer = self._default_answer(message_history, lm_handler)
         return self._build_completion(
@@ -527,9 +560,7 @@ class RLM:
                     return result.content, result.reasoning_content, actions, attempts
                 except (ActionParseError, ValueError) as exc:
                     parse_exc = (
-                        exc
-                        if isinstance(exc, ActionParseError)
-                        else ActionParseError(str(exc))
+                        exc if isinstance(exc, ActionParseError) else ActionParseError(str(exc))
                     )
                     attempts.append(
                         {
@@ -549,9 +580,7 @@ class RLM:
                         parse_exc.last_reasoning = reasoning  # type: ignore[attr-defined]
                         raise parse_exc from None
 
-                    feedback = build_native_tool_retry_message(
-                        str(parse_exc), parse_exc.fragment
-                    )
+                    feedback = build_native_tool_retry_message(str(parse_exc), parse_exc.fragment)
                     retry_messages = retry_messages + [{"role": "user", "content": feedback}]
                     continue
 
@@ -724,6 +753,119 @@ class RLM:
     # =========================================================================
     # Tail behaviors
     # =========================================================================
+
+    # =========================================================================
+    # Compaction
+    # =========================================================================
+
+    def _should_compact(
+        self,
+        message_history: list[dict[str, Any]],
+        lm_handler: LMHandler,
+    ) -> bool:
+        """True when the rendered prompt has crossed the compaction threshold."""
+        threshold = self.workspace_config.compaction.threshold_tokens
+        if threshold <= 0:
+            return False
+        model_name = lm_handler.get_client().model_name
+        return count_tokens(message_history, model_name) >= threshold
+
+    def _compact_history(
+        self,
+        *,
+        message_history: list[dict[str, Any]],
+        completed_iterations: list[WorkspaceIteration],
+        lm_handler: LMHandler,
+        env: DockerWorkspaceEnv,
+        turn: int,
+    ) -> tuple[list[dict[str, Any]], list[WorkspaceIteration]]:
+        """Summarize the trajectory and reset the visible message history.
+
+        Asks the LM (with the current full message_history visible) to write
+        a structured plain-prose summary, then collapses everything pre-tail
+        into ``[assistant=summary, user=continue]``. The N most recent turns
+        are preserved verbatim per ``CompactionConfig.tail_turns_preserved``.
+
+        Returns ``(post_compress_prefix, retained_iterations)``. The caller
+        rebuilds ``message_history`` from ``base + prefix + retained``.
+        """
+        provenance_lines = self._provenance_lines_for_summary(env)
+        summary_user_msg = build_compaction_summary_prompt(provenance_lines=provenance_lines)
+
+        prompt = list(message_history) + [{"role": "user", "content": summary_user_msg}]
+        model_name = lm_handler.get_client().model_name
+        tokens_before = count_tokens(message_history, model_name)
+        summary, _ = lm_handler.completion_with_reasoning(prompt)
+
+        tail_n = max(0, self.workspace_config.compaction.tail_turns_preserved)
+        retained_iterations = list(completed_iterations[-tail_n:]) if tail_n > 0 else []
+
+        post_compress_prefix = [
+            {"role": "assistant", "content": summary},
+            {"role": "user", "content": build_compaction_continue_message()},
+        ]
+
+        if self.logger:
+            self.logger.log_compaction(
+                turn=turn,
+                tokens_before=tokens_before,
+                threshold_tokens=self.workspace_config.compaction.threshold_tokens,
+                summary=summary,
+                dropped_iterations=len(completed_iterations) - len(retained_iterations),
+                retained_tail_iterations=len(retained_iterations),
+            )
+        self.verbose.print_compaction(
+            turn=turn,
+            tokens_before=tokens_before,
+            threshold=self.workspace_config.compaction.threshold_tokens,
+        )
+
+        return post_compress_prefix, retained_iterations
+
+    @staticmethod
+    def _provenance_lines_for_summary(env: DockerWorkspaceEnv) -> list[str]:
+        """Render provenance entries as ``<path> — role/turn`` lines.
+
+        Reserved runtime-state files are skipped. Spilled tool outputs under
+        ``_rlm_artifacts/_observations/`` are collapsed into a single
+        breadcrumb line so the model knows they exist and how to enumerate
+        them, without crowding the checklist on long runs.
+        """
+        reserved_state_paths = {
+            "_rlm_state/provenance.json",
+            "_rlm_state/action_log.jsonl",
+            "_rlm_state/workspace_manifest.json",
+        }
+        lines: list[str] = []
+        spill_paths: list[str] = []
+        spill_turns: list[int] = []
+        for path in sorted(env.provenance.all_paths()):
+            entry = env.provenance.get(path)
+            if entry is None:
+                continue
+            if path in reserved_state_paths:
+                continue
+            if path.startswith("_rlm_artifacts/_observations/"):
+                spill_paths.append(path)
+                spill_turns.append(entry.modified.turn)
+                continue
+            role = entry.modified.role
+            turn = entry.modified.turn
+            lines.append(f"{path} — role={role} turn={turn}")
+
+        if spill_paths:
+            turn_range = (
+                f"turn {spill_turns[0]}"
+                if min(spill_turns) == max(spill_turns)
+                else f"turns {min(spill_turns)}–{max(spill_turns)}"
+            )
+            lines.append(
+                f"_rlm_artifacts/_observations/ — {len(spill_paths)} spilled "
+                f"tool output(s) from {turn_range}; "
+                "list_directory _rlm_artifacts/_observations/ to enumerate, "
+                "read_file to inspect"
+            )
+        return lines
 
     def _default_answer(
         self,

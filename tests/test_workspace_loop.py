@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from rlm.core.config import ParseConfig, PromptHistoryConfig, WorkspaceConfig
+from rlm.core.config import CompactionConfig, ParseConfig, WorkspaceConfig
 from rlm.core.rlm import RLM
 from rlm.core.types import (
     RLMChatCompletion,
@@ -27,7 +27,6 @@ from rlm.utils.exceptions import ActionParseError
 from rlm.utils.prompts import (
     build_workspace_initial_user_prompt,
     build_workspace_system_prompt,
-    format_workspace_history,
     format_workspace_iteration,
 )
 
@@ -74,8 +73,19 @@ class TestWorkspaceSystemPrompt:
 
     def test_xml_system_prompt_is_explicit_compatibility_path(self):
         p = build_workspace_system_prompt(depth=0, max_depth=1, action_format="xml")
-        assert "emit one or more ``<action tool=\"...\">...</action>`` elements" in p
-        assert "one short ``<note>...</note>``" in p
+        assert 'emit one or more ``<action tool="...">...</action>`` elements' in p
+        # The substrate no longer asks for `<note>` blocks; turn-over-turn
+        # memory comes from the workspace files and the periodic
+        # substrate-level summary, not from inline notes.
+        assert "<note>" not in p
+
+    def test_system_prompt_advertises_substrate_compaction(self):
+        """Both system prompts must tell the model that the visible history
+        will be periodically compressed and that files are authoritative."""
+        for fmt in ("native", "xml"):
+            p = build_workspace_system_prompt(depth=0, max_depth=1, action_format=fmt)
+            assert "summarizes the trajectory" in p
+            assert "authoritative" in p
 
     def test_native_action_format_defaults_thinking_off_for_vllm(self):
         cfg = WorkspaceConfig()
@@ -127,7 +137,10 @@ class TestFormatWorkspaceIteration:
         assert "snapshot" in msgs[1]["content"]
         assert "abcdef1" in msgs[1]["content"]
 
-    def test_file_tool_body_is_omitted_from_assistant_replay(self):
+    def test_file_tool_body_is_replayed_verbatim(self):
+        """Pre-compress, durable-edit action bodies stay full-fidelity in the
+        prompt. The substrate-level CompactionConfig handles trimming once
+        the cumulative prompt crosses the token threshold."""
         action = WorkspaceAction(
             tool="write_file",
             args={"path": "draft.md"},
@@ -150,64 +163,16 @@ class TestFormatWorkspaceIteration:
             observations=[obs],
         )
         msgs = format_workspace_iteration(it, action_format="xml")
-        assert "secret draft body" not in msgs[0]["content"]
-        assert "body omitted from replay" in msgs[0]["content"]
+        assert "secret draft body" in msgs[0]["content"]
+        assert "second line" in msgs[0]["content"]
         assert "Wrote 29 chars to draft.md" in msgs[1]["content"]
 
-    def test_short_note_is_replayed_as_turn_note(self):
-        action = WorkspaceAction(tool="list_directory", args={}, body=None, raw="")
-        it = WorkspaceIteration(
-            iteration=3,
-            timestamp="2026-01-01T00:00:00",
-            prompt=[],
-            response=(
-                "<note>Read _rlm_notes/proof.md next and verify the beta derivation.</note>\n"
-                '<action tool="list_directory" />'
-            ),
-            reasoning=None,
-            actions=[action],
-            observations=[WorkspaceObservation(tool="list_directory", stdout="ok")],
-        )
-        msgs = format_workspace_iteration(it, action_format="xml")
-        assert '<turn_note turn="3">' in msgs[0]["content"]
-        assert "verify the beta derivation" in msgs[0]["content"]
+    def test_observations_replayed_full_fidelity_for_all_ages(self):
+        """No age-based receipt compaction anymore — every completed turn's
+        observations are replayed verbatim until substrate-level compaction
+        fires."""
+        from rlm.utils.prompts import format_workspace_history
 
-    def test_overlong_note_is_omitted_from_replay(self):
-        action = WorkspaceAction(tool="list_directory", args={}, body=None, raw="")
-        long_note = "x" * 50
-        it = WorkspaceIteration(
-            iteration=4,
-            timestamp="2026-01-01T00:00:00",
-            prompt=[],
-            response=f'<note>{long_note}</note>\n<action tool="list_directory" />',
-            reasoning=None,
-            actions=[action],
-            observations=[WorkspaceObservation(tool="list_directory", stdout="ok")],
-        )
-        cfg = PromptHistoryConfig(max_turn_note_chars=10)
-        msgs = format_workspace_iteration(it, history_config=cfg, action_format="xml")
-        assert long_note not in msgs[0]["content"]
-        assert '<turn_note turn="4" omitted="true" reason="too-long"' in msgs[0]["content"]
-
-    def test_content_like_note_is_omitted_from_replay(self):
-        action = WorkspaceAction(tool="list_directory", args={}, body=None, raw="")
-        it = WorkspaceIteration(
-            iteration=5,
-            timestamp="2026-01-01T00:00:00",
-            prompt=[],
-            response=(
-                "<note>```python\nprint('large content')\n```</note>\n"
-                '<action tool="list_directory" />'
-            ),
-            reasoning=None,
-            actions=[action],
-            observations=[WorkspaceObservation(tool="list_directory", stdout="ok")],
-        )
-        msgs = format_workspace_iteration(it, action_format="xml")
-        assert "print('large content')" not in msgs[0]["content"]
-        assert 'reason="content-like"' in msgs[0]["content"]
-
-    def test_old_read_observations_compact_to_receipts(self):
         old = WorkspaceIteration(
             iteration=1,
             timestamp="2026-01-01T00:00:00",
@@ -226,37 +191,12 @@ class TestFormatWorkspaceIteration:
             actions=[WorkspaceAction(tool="list_directory", args={"path": "."}, body=None, raw="")],
             observations=[WorkspaceObservation(tool="list_directory", stdout="Directory: .")],
         )
-        msgs = format_workspace_history(
-            [old, new],
-            history_config=PromptHistoryConfig(full_observation_turns=1),
-            action_format="xml",
-        )
-        assert "full file contents" not in msgs[1]["content"]
-        assert "stdout omitted from replay" in msgs[1]["content"]
-        assert "Directory: ." in msgs[3]["content"]
-
-    def test_mutating_command_stdout_is_capped_in_replay(self):
-        action = WorkspaceAction(tool="python", args={}, body="print('x')", raw="")
-        obs = WorkspaceObservation(
-            tool="python",
-            stdout="x" * 50,
-            data={"exit_code": 0, "changed_paths": ["out.txt"], "removed_paths": []},
-            artifacts=["out.txt"],
-        )
-        it = WorkspaceIteration(
-            iteration=1,
-            timestamp="2026-01-01T00:00:00",
-            prompt=[],
-            response="",
-            reasoning=None,
-            actions=[action],
-            observations=[obs],
-        )
-        cfg = PromptHistoryConfig(max_mutating_command_stdout_replay_chars=10)
-        msgs = format_workspace_iteration(it, history_config=cfg, action_format="xml")
-        assert "x" * 10 in msgs[1]["content"]
-        assert "x" * 11 not in msgs[1]["content"]
-        assert "stdout truncated for replay" in msgs[1]["content"]
+        msgs = format_workspace_history([old, new], action_format="xml")
+        # Both old and new stdout are present in the prompt — no receipts.
+        joined = "\n".join(m["content"] for m in msgs)
+        assert "full file contents" in joined
+        assert "Directory: ." in joined
+        assert "omitted from replay" not in joined
 
     def test_native_replay_does_not_emit_xml_tags(self):
         action = WorkspaceAction(
@@ -813,3 +753,157 @@ class TestPreCleanupCallback:
         src = inspect.getsource(rlm_module.RLM)
         # Exactly one invocation of `pre_cleanup_callback` (in `completion`).
         assert src.count("pre_cleanup_callback(env)") == 1
+
+
+# ---------------------------------------------------------------------------
+# Substrate-level compaction
+# ---------------------------------------------------------------------------
+
+
+class TestCompaction:
+    """``_should_compact`` and ``_compact_history`` collapse the visible
+    trajectory into ``[summary, continue]`` once the rendered prompt crosses
+    ``CompactionConfig.threshold_tokens``.
+
+    These tests mock the LM handler and provenance so the compaction path
+    can run without Docker or a real client.
+    """
+
+    def _mock_handler_with_model(self, model_name: str = "fake-model"):
+        handler = MagicMock()
+        handler.get_client = MagicMock(return_value=MagicMock(model_name=model_name))
+        return handler
+
+    def test_should_compact_below_threshold_is_false(self):
+        cfg = WorkspaceConfig(compaction=CompactionConfig(threshold_tokens=10_000))
+        rlm = RLM(backend="openai", backend_kwargs={"model_name": "fake"}, workspace_config=cfg)
+        handler = self._mock_handler_with_model()
+        # A tiny message history won't cross 10K tokens.
+        messages = [{"role": "user", "content": "hi"}]
+        assert rlm._should_compact(messages, handler) is False
+
+    def test_should_compact_above_threshold_is_true(self):
+        cfg = WorkspaceConfig(compaction=CompactionConfig(threshold_tokens=100))
+        rlm = RLM(backend="openai", backend_kwargs={"model_name": "fake"}, workspace_config=cfg)
+        handler = self._mock_handler_with_model()
+        # ~10000 chars ≈ 2500 tokens at the 4-chars-per-token fallback.
+        messages = [{"role": "user", "content": "x" * 10_000}]
+        assert rlm._should_compact(messages, handler) is True
+
+    def test_should_compact_disabled_threshold_zero(self):
+        cfg = WorkspaceConfig(compaction=CompactionConfig(threshold_tokens=0))
+        rlm = RLM(backend="openai", backend_kwargs={"model_name": "fake"}, workspace_config=cfg)
+        handler = self._mock_handler_with_model()
+        messages = [{"role": "user", "content": "x" * 1_000_000}]
+        assert rlm._should_compact(messages, handler) is False
+
+    def test_compact_history_resets_iterations_and_returns_summary_prefix(self):
+        from rlm.logger import RLMLogger
+
+        cfg = WorkspaceConfig(
+            compaction=CompactionConfig(threshold_tokens=100, tail_turns_preserved=0)
+        )
+        logger = RLMLogger(log_dir=None)
+        # Seed the logger with metadata so log_compaction has somewhere to land.
+        rlm = RLM(
+            backend="openai",
+            backend_kwargs={"model_name": "fake"},
+            workspace_config=cfg,
+            logger=logger,
+        )
+
+        handler = self._mock_handler_with_model()
+        handler.completion_with_reasoning = MagicMock(
+            return_value=("SUMMARY: original task=X; files=foo.md; next=Y", None)
+        )
+
+        # Mock env.provenance with two paths.
+        env = MagicMock()
+        env.provenance.all_paths = MagicMock(return_value=["foo.md", "_rlm_query_0.txt"])
+
+        def fake_get(p):
+            entry = MagicMock()
+            entry.modified.role = "assistant" if p == "foo.md" else "user"
+            entry.modified.turn = 1 if p == "foo.md" else 0
+            return entry
+
+        env.provenance.get = MagicMock(side_effect=fake_get)
+
+        completed = [
+            WorkspaceIteration(
+                iteration=k + 1,
+                timestamp="2026-01-01T00:00:00",
+                prompt=[],
+                response="",
+                reasoning=None,
+                actions=[],
+                observations=[],
+            )
+            for k in range(3)
+        ]
+
+        message_history = [{"role": "user", "content": "long" * 1000}]
+        prefix, retained = rlm._compact_history(
+            message_history=message_history,
+            completed_iterations=completed,
+            lm_handler=handler,
+            env=env,
+            turn=4,
+        )
+
+        # Tail of 0 → no iterations retained, all dropped.
+        assert retained == []
+        # Prefix is exactly [assistant=summary, user=continue].
+        assert [m["role"] for m in prefix] == ["assistant", "user"]
+        assert "SUMMARY" in prefix[0]["content"]
+        # Compaction logged.
+        traj_iters = logger._iterations  # type: ignore[attr-defined]
+        compaction_rows = [r for r in traj_iters if r.get("type") == "compaction"]
+        assert len(compaction_rows) == 1
+        assert compaction_rows[0]["turn"] == 4
+        assert compaction_rows[0]["dropped_iterations"] == 3
+        assert compaction_rows[0]["retained_tail_iterations"] == 0
+        # The summary prompt the LM saw must include the original message
+        # history plus the user-side summary request.
+        sent_messages = handler.completion_with_reasoning.call_args[0][0]
+        assert sent_messages[0] == message_history[0]
+        assert sent_messages[-1]["role"] == "user"
+        assert "summary" in sent_messages[-1]["content"].lower()
+
+    def test_compact_history_preserves_tail(self):
+        cfg = WorkspaceConfig(
+            compaction=CompactionConfig(threshold_tokens=100, tail_turns_preserved=2)
+        )
+        rlm = RLM(
+            backend="openai",
+            backend_kwargs={"model_name": "fake"},
+            workspace_config=cfg,
+        )
+
+        handler = self._mock_handler_with_model()
+        handler.completion_with_reasoning = MagicMock(return_value=("SUM", None))
+
+        env = MagicMock()
+        env.provenance.all_paths = MagicMock(return_value=[])
+        env.provenance.get = MagicMock(return_value=None)
+
+        completed = [
+            WorkspaceIteration(
+                iteration=k + 1,
+                timestamp="2026-01-01T00:00:00",
+                prompt=[],
+                response="",
+                reasoning=None,
+                actions=[],
+                observations=[],
+            )
+            for k in range(5)
+        ]
+        _, retained = rlm._compact_history(
+            message_history=[{"role": "user", "content": "x"}],
+            completed_iterations=completed,
+            lm_handler=handler,
+            env=env,
+            turn=10,
+        )
+        assert [it.iteration for it in retained] == [4, 5]

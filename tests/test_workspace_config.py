@@ -3,10 +3,10 @@
 import pytest
 
 from rlm.core.config import (
+    CompactionConfig,
     DockerConfig,
     ObservationConfig,
     ParseConfig,
-    PromptHistoryConfig,
     RecursionConfig,
     WorkspaceConfig,
 )
@@ -20,10 +20,9 @@ def test_workspace_config_defaults():
     assert cfg.observation.max_observation_chars == 16_000
     assert cfg.observation.default_read_file_lines == 500
     assert cfg.observation.max_list_directory_entries == 200
-    assert cfg.history.full_observation_turns == 1
-    assert cfg.history.max_command_body_replay_chars == 4_000
-    assert cfg.history.max_turn_note_chars == 1_000_000
-    assert cfg.history.max_turn_note_lines == 1_000_000
+    assert cfg.compaction.enabled is True
+    assert cfg.compaction.threshold_tokens == 64_000
+    assert cfg.compaction.tail_turns_preserved == 0
     assert cfg.recursion.max_concurrent_subcalls == 5
     assert cfg.recursion.copy_on_spawn_max_file_bytes == 50 * 1024 * 1024
     assert ".git" in cfg.recursion.copy_on_spawn_excludes
@@ -43,14 +42,14 @@ def test_workspace_config_overrides():
     cfg = WorkspaceConfig(
         parse=ParseConfig(max_action_parse_retries=7),
         observation=ObservationConfig(max_observation_chars=32_000),
-        history=PromptHistoryConfig(full_observation_turns=2, max_turn_note_chars=300),
+        compaction=CompactionConfig(threshold_tokens=16_000, tail_turns_preserved=2),
         recursion=RecursionConfig(max_concurrent_subcalls=2),
         docker=DockerConfig(image="custom:latest", exec_timeout_seconds=60),
     )
     assert cfg.parse.max_action_parse_retries == 7
     assert cfg.observation.max_observation_chars == 32_000
-    assert cfg.history.full_observation_turns == 2
-    assert cfg.history.max_turn_note_chars == 300
+    assert cfg.compaction.threshold_tokens == 16_000
+    assert cfg.compaction.tail_turns_preserved == 2
     assert cfg.recursion.max_concurrent_subcalls == 2
     assert cfg.docker.image == "custom:latest"
     assert cfg.docker.exec_timeout_seconds == 60
@@ -61,7 +60,7 @@ def test_workspace_config_subconfigs_independent():
     a = WorkspaceConfig()
     b = WorkspaceConfig()
     assert a.parse is not b.parse
-    assert a.history is not b.history
+    assert a.compaction is not b.compaction
     assert a.recursion.copy_on_spawn_excludes == b.recursion.copy_on_spawn_excludes
 
 
@@ -71,7 +70,7 @@ def test_units_sanity():
     assert isinstance(cfg.observation.default_read_file_lines, int)
     assert isinstance(cfg.recursion.copy_on_spawn_max_file_bytes, int)
     assert isinstance(cfg.observation.max_list_directory_entries, int)
-    assert isinstance(cfg.history.max_command_body_replay_chars, int)
+    assert isinstance(cfg.compaction.threshold_tokens, int)
     # bytes cap is large enough to be unambiguous as bytes (not lines)
     assert cfg.recursion.copy_on_spawn_max_file_bytes > 1024
 
@@ -112,6 +111,13 @@ def test_default_max_concurrent_subcalls_is_five():
     assert cfg.recursion.max_concurrent_subcalls == 5
 
 
+def test_default_compaction_threshold_is_64k():
+    """Locked-in default; tuning happens via override, not by editing this."""
+    cfg = WorkspaceConfig()
+    assert cfg.compaction.threshold_tokens == 64_000
+    assert cfg.compaction.enabled is True
+
+
 # ---------------------------------------------------------------------------
 # Sub-config replacement preserves other defaults
 # ---------------------------------------------------------------------------
@@ -125,7 +131,7 @@ def test_replacing_one_subconfig_does_not_disturb_others():
     # Others fall back to defaults:
     assert cfg.parse.max_action_parse_retries == 3
     assert cfg.observation.max_observation_chars == 16_000
-    assert cfg.history.full_observation_turns == 1
+    assert cfg.compaction.threshold_tokens == 64_000
     assert cfg.recursion.max_concurrent_subcalls == 5
 
 

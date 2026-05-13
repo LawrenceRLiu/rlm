@@ -76,6 +76,42 @@ class RLMLogger:
         """Workspace-substrate alias for ``log()``. See plan Phase 4."""
         self.log(iteration)
 
+    def log_compaction(
+        self,
+        *,
+        turn: int,
+        tokens_before: int,
+        threshold_tokens: int,
+        summary: str,
+        dropped_iterations: int,
+        retained_tail_iterations: int,
+    ) -> None:
+        """Capture a substrate-level compaction event.
+
+        Emitted just before the turn that fired compaction runs. The summary
+        is the model-authored prose that replaces the pre-compress trajectory
+        in the visible prompt; the actual iterations remain in this logger's
+        in-memory list and in the workspace's git snapshots.
+        """
+        entry = {
+            "type": "compaction",
+            "timestamp": datetime.now().isoformat(),
+            "turn": turn,
+            "tokens_before": tokens_before,
+            "threshold_tokens": threshold_tokens,
+            "dropped_iterations": dropped_iterations,
+            "retained_tail_iterations": retained_tail_iterations,
+            "summary": summary,
+        }
+        # Keep compaction rows alongside iterations so the visualizer sees
+        # them in insertion order; the explicit "type" field distinguishes
+        # them from iteration rows.
+        self._iterations.append(entry)
+        if self._save_to_disk and self.log_file_path:
+            with open(self.log_file_path, "a") as f:
+                json.dump(entry, f)
+                f.write("\n")
+
     def clear_iterations(self) -> None:
         """Reset iterations for the next completion (trajectory is per completion)."""
         self._iterations = []
