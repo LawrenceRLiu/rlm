@@ -1,10 +1,10 @@
-Vibe-coded visualizer with [shadcn](https://ui.shadcn.com) for viewing RLM trajectories.
+# RLM Visualizer
 
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+Vibe-coded visualizer with [shadcn](https://ui.shadcn.com) for viewing RLM trajectories.
 
 ## Getting Started
 
-First, run the development server:
+Run commands from this directory:
 
 ```bash
 npm run dev
@@ -18,9 +18,41 @@ bun dev
 
 Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Visualize a Local Rollout Log
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+From the repository root, copy the JSONL rollout into the visualizer's public
+logs directory:
+
+```bash
+mkdir -p visualizer/public/logs
+cp logs/rlm_2026-05-12_15-45-25_2ce0632b.jsonl visualizer/public/logs/
+```
+
+Start the visualizer from `visualizer/`. Use another port if `3000` is already
+busy:
+
+```bash
+cd visualizer
+npm run dev -- -p 3000
+```
+
+Open the log directly with the `log` query parameter:
+
+```text
+http://localhost:3000/?log=rlm_2026-05-12_15-45-25_2ce0632b.jsonl
+```
+
+You can also open `http://localhost:3000` and select the file from the
+Recent Traces list. The app reads that list from `public/logs/*.jsonl`.
+
+## Verify Changes
+
+Before relying on visualizer changes, run:
+
+```bash
+npm run lint
+npm run build
+```
 
 ## Learn More
 

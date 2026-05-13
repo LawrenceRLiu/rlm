@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -24,6 +24,7 @@ export function Dashboard() {
   const [selectedLog, setSelectedLog] = useState<RLMLogFile | null>(null);
   const [demoLogs, setDemoLogs] = useState<DemoLogInfo[]>([]);
   const [loadingDemos, setLoadingDemos] = useState(true);
+  const loadedInitialLog = useRef(false);
 
   // Load demo log previews on mount - fetches latest 10 from API
   useEffect(() => {
@@ -90,6 +91,17 @@ export function Dashboard() {
       alert('Failed to load demo log. Make sure the log files are in the public/logs folder.');
     }
   }, [handleFileLoaded]);
+
+  useEffect(() => {
+    if (loadedInitialLog.current) return;
+
+    const params = new URLSearchParams(window.location.search);
+    const logFile = params.get('log');
+    if (!logFile) return;
+
+    loadedInitialLog.current = true;
+    loadDemoLog(logFile);
+  }, [loadDemoLog]);
 
   if (selectedLog) {
     return (

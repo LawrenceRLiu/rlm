@@ -42,6 +42,12 @@ class AnthropicClient(BaseLM):
         if system:
             kwargs["system"] = system
 
+        for k, v in self.sampling_kwargs.items():
+            if k == "stop":
+                kwargs["stop_sequences"] = v
+            elif k in {"temperature", "top_p", "top_k"}:
+                kwargs[k] = v
+
         response = self.client.messages.create(**kwargs)
         self._track_cost(response, model)
         return response.content[0].text
@@ -58,6 +64,12 @@ class AnthropicClient(BaseLM):
         kwargs = {"model": model, "max_tokens": self.max_tokens, "messages": messages}
         if system:
             kwargs["system"] = system
+
+        for k, v in self.sampling_kwargs.items():
+            if k == "stop":
+                kwargs["stop_sequences"] = v
+            elif k in {"temperature", "top_p", "top_k"}:
+                kwargs[k] = v
 
         response = await self.async_client.messages.create(**kwargs)
         self._track_cost(response, model)

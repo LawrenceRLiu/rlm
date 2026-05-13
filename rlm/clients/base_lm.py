@@ -7,6 +7,14 @@ from rlm.core.types import ModelUsageSummary, UsageSummary
 DEFAULT_TIMEOUT: float = 300.0
 
 
+# Common sampling parameters to pass to completion APIs rather than client constructors
+SAMPLING_PARAM_KEYS = {
+    "temperature", "top_p", "top_k", "max_tokens", "stop",
+    "presence_penalty", "frequency_penalty", "n", "seed", "response_format",
+    "min_p", "repetition_penalty"
+}
+
+
 class BaseLM(ABC):
     """
     Base class for all language model routers / clients. When the RLM makes sub-calls, it currently
@@ -16,6 +24,12 @@ class BaseLM(ABC):
     def __init__(self, model_name: str, timeout: float = DEFAULT_TIMEOUT, **kwargs):
         self.model_name = model_name
         self.timeout = timeout
+        
+        self.sampling_kwargs = {}
+        for key in list(kwargs.keys()):
+            if key in SAMPLING_PARAM_KEYS:
+                self.sampling_kwargs[key] = kwargs.pop(key)
+                
         self.kwargs = kwargs
         # Backend reasoning-channel content from the last completion() call,
         # if the subclass populates it. Defaults to None for backends that

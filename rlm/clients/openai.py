@@ -115,9 +115,14 @@ class OpenAIClient(BaseLM):
             raise ValueError("Model name is required for OpenAI client.")
 
         extra_body = self._build_extra_body()
+        
+        openai_kwargs = dict(self.sampling_kwargs)
+        for k in ["top_k", "min_p", "repetition_penalty"]:
+            if k in openai_kwargs:
+                extra_body[k] = openai_kwargs.pop(k)
 
         response = self.client.chat.completions.create(
-            model=model, messages=messages, extra_body=extra_body
+            model=model, messages=messages, extra_body=extra_body, **openai_kwargs
         )
         self._track_cost(response, model)
         return self._capture_reasoning_and_content(response)
@@ -137,9 +142,14 @@ class OpenAIClient(BaseLM):
             raise ValueError("Model name is required for OpenAI client.")
 
         extra_body = self._build_extra_body()
+        
+        openai_kwargs = dict(self.sampling_kwargs)
+        for k in ["top_k", "min_p", "repetition_penalty"]:
+            if k in openai_kwargs:
+                extra_body[k] = openai_kwargs.pop(k)
 
         response = await self.async_client.chat.completions.create(
-            model=model, messages=messages, extra_body=extra_body
+            model=model, messages=messages, extra_body=extra_body, **openai_kwargs
         )
         self._track_cost(response, model)
         return self._capture_reasoning_and_content(response)

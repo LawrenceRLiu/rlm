@@ -83,9 +83,18 @@ class AzureOpenAIClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for Azure OpenAI client.")
 
+        openai_kwargs = dict(self.sampling_kwargs)
+        extra_body = {}
+        for k in ["top_k", "min_p", "repetition_penalty"]:
+            if k in openai_kwargs:
+                extra_body[k] = openai_kwargs.pop(k)
+        if extra_body:
+            openai_kwargs["extra_body"] = extra_body
+
         response = self.client.chat.completions.create(
             model=model,
             messages=messages,
+            **openai_kwargs
         )
         self._track_cost(response, model)
         return response.choices[0].message.content
@@ -104,9 +113,18 @@ class AzureOpenAIClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for Azure OpenAI client.")
 
+        openai_kwargs = dict(self.sampling_kwargs)
+        extra_body = {}
+        for k in ["top_k", "min_p", "repetition_penalty"]:
+            if k in openai_kwargs:
+                extra_body[k] = openai_kwargs.pop(k)
+        if extra_body:
+            openai_kwargs["extra_body"] = extra_body
+
         response = await self.async_client.chat.completions.create(
             model=model,
             messages=messages,
+            **openai_kwargs
         )
         self._track_cost(response, model)
         return response.choices[0].message.content

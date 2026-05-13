@@ -58,9 +58,18 @@ class GeminiClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for Gemini client.")
 
-        config = None
+        config_kwargs = {}
         if system_instruction:
-            config = types.GenerateContentConfig(system_instruction=system_instruction)
+            config_kwargs["system_instruction"] = system_instruction
+
+        for k, v in self.sampling_kwargs.items():
+            if k == "temperature": config_kwargs["temperature"] = v
+            elif k == "top_p": config_kwargs["top_p"] = v
+            elif k == "top_k": config_kwargs["top_k"] = v
+            elif k == "max_tokens": config_kwargs["max_output_tokens"] = v
+            elif k == "stop": config_kwargs["stop_sequences"] = v
+
+        config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
         response = self.client.models.generate_content(
             model=model,
@@ -80,9 +89,18 @@ class GeminiClient(BaseLM):
         if not model:
             raise ValueError("Model name is required for Gemini client.")
 
-        config = None
+        config_kwargs = {}
         if system_instruction:
-            config = types.GenerateContentConfig(system_instruction=system_instruction)
+            config_kwargs["system_instruction"] = system_instruction
+
+        for k, v in self.sampling_kwargs.items():
+            if k == "temperature": config_kwargs["temperature"] = v
+            elif k == "top_p": config_kwargs["top_p"] = v
+            elif k == "top_k": config_kwargs["top_k"] = v
+            elif k == "max_tokens": config_kwargs["max_output_tokens"] = v
+            elif k == "stop": config_kwargs["stop_sequences"] = v
+
+        config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
         # google-genai SDK supports async via aio interface
         response = await self.client.aio.models.generate_content(

@@ -48,11 +48,13 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     ``read_file`` when you need to inspect file contents. Self-closing
     ``<action ... />`` is allowed for tools that take no body.
 
-    You may include one short ``<note>...</note>`` before your actions to
-    preserve turn-to-turn intent. Use it for the current plan, open questions,
-    and file paths to revisit. Keep it brief. Do not put file contents, code
-    blocks, proofs, large outputs, generated artifacts, or action XML inside
-    notes; overlong or content-like notes are omitted from future replay.
+    Before the actions, include a short note: ``<note>...</note>`` to preserve turn-to-turn
+    intent. Use this to keep a running summary of the task and what you have done
+    and plan to do so you can stay on track. This note MUST be extremely compact,
+    terse, and dense (maximum 2-3 sentences). Use shorthand and abbreviations.
+    Do not put file contents, code blocks, proofs, large outputs, generated
+    artifacts, or action XML inside notes; overlong or content-like notes are omitted from
+    future replay.
 
     Emit ``<action tool="final"><answer>...</answer></action>`` to terminate
     the run with your final answer. You may also include zero or more
@@ -73,6 +75,9 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
       ``_rlm_artifacts/_observations/`` and the observation is replaced
       with a short summary plus a path. Read the file in the path to get full output.
     - You may not write inside ``_rlm_state/``.
+    - CRITICAL: Your prompt history will be truncated over time to save context length.
+      If you lose track of the specific details of the task, you MUST use ``read_file``
+      to re-read ``_rlm_query_0.txt`` or your own ``_rlm_notes/`` instead of guessing.
     {depth_rule}
     """
 )

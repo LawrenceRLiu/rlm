@@ -66,8 +66,9 @@ class PromptHistoryConfig:
 
     # Optional <note>...</note> intent anchor replayed across turns. Overlong
     # or content-like notes are replaced with an omitted-note receipt.
-    max_turn_note_chars: int = 600
-    max_turn_note_lines: int = 6
+    # Note: Truncation limits have been set practically infinite per user request.
+    max_turn_note_chars: int = 1_000_000
+    max_turn_note_lines: int = 1_000_000
 
 
 @dataclass
