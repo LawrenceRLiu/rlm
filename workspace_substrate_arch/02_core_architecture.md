@@ -8,10 +8,28 @@ The RLM loop should become:
 2. Ask the root LM for the next action or final answer.
 3. Parse one or more workspace action blocks.
 4. Execute actions through a workspace environment.
-5. Append compact observations to the message history.
-6. Repeat until final answer or limits.
+5. Log the full-fidelity iteration for humans/evals.
+6. Rebuild the next model-facing history from compact receipts, bounded recent observations, per-turn snapshots, and any valid short turn notes.
+7. Repeat until final answer or limits.
 
-This keeps the current iterative RLM structure intact, but renames the unit of execution from "code block" to "action".
+This keeps the current iterative RLM structure intact, but renames the unit of execution from "code block" to "action". The model-facing prompt history is intentionally lossy: the JSONL trajectory retains raw responses/actions/observations, while the next LM call receives compact replay shaped for workspace-based memory.
+
+## Model-Facing History Replay
+
+The runtime keeps two separate representations of a run:
+
+- **Full trajectory**: `WorkspaceIteration.to_dict()` records the raw LM response, parsed action bodies, observations, parse attempts, snapshots, and final answer for logging, visualization, and benchmark post-mortems.
+- **Prompt replay**: before each new LM call, the runtime rebuilds `message_history` from completed iterations using compact renderers.
+
+Prompt replay follows these rules:
+
+- `write_file`, `append_file`, and `edit_file` bodies are not replayed. The model sees a receipt with tool, path/attrs, success/error, and body length. If it needs the content, it must call `read_file`.
+- `python` and `shell` source is replayed because it is often useful for debugging, but it is capped. If the command changed workspace files, the cap is smaller.
+- `python` and `shell` observations are normally replayed like other observations, but stdout from commands that changed files is capped more aggressively to avoid using `print()` as hidden durable memory.
+- `read_file` and other observations are fully visible only for the most recent completed turns. Older observations degrade into receipts that state status, args, artifacts, and omitted stdout/stderr lengths.
+- A model may emit one short `<note>...</note>` before actions. Valid notes are replayed as `<turn_note turn="N">...</turn_note>`; overlong or content-like notes are replaced with an omitted-note receipt.
+
+This gives the model a small explicit planning anchor while preserving the central workspace-substrate constraint: long-term memory is in files, not in an ever-growing verbatim chat transcript.
 
 ## New Environment Contract
 

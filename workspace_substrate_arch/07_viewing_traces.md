@@ -15,6 +15,24 @@ If you didn't pass `log_dir=...` to `RLMLogger`, the trajectory is in-memory onl
 
 If `DockerConfig.cleanup_mode != "keep"`, workspaces are torn down at end-of-run (`"delete"` removes them, `"tar"` archives them). For tracing you almost always want `cleanup_mode="keep"`.
 
+## Full Log vs Model-Facing Replay
+
+The JSONL log is full fidelity. It records the raw assistant response, parsed action bodies, observations, snapshots, parse attempts, and final answer. This is intentionally more information than the next model turn receives.
+
+The prompt replay seen by the model is compacted:
+
+- `write_file`, `append_file`, and `edit_file` bodies are replaced by action receipts.
+- `python`/`shell` source may be replayed, but it is capped; if the command changed files, the cap is smaller.
+- stdout from mutating `python`/`shell` actions is capped in replay.
+- recent observations are visible, but older observations age into receipts.
+- valid short `<note>...</note>` blocks are replayed as `<turn_note>...</turn_note>`; overlong/content-like notes are omitted.
+
+So `jq` on `response` or `actions[].body` shows what the model originally emitted, not necessarily what later model calls saw. To inspect the model-facing prompt for a turn, use that iteration's `prompt` field:
+
+```bash
+jq -r 'select(.type=="iteration" and .iteration==5) | .prompt[] | "\(.role):\n\(.content)\n---"' logs/rlm_*.jsonl
+```
+
 ## Picking your tool
 
 | Goal | Use |
@@ -24,7 +42,8 @@ If `DockerConfig.cleanup_mode != "keep"`, workspaces are torn down at end-of-run
 | "What's the actual content of the file the model wrote?" | `cat` in the workspace dir |
 | "What changed between turn 4 and turn 5?" | `git log --oneline` + `git show <sha>` inside the workspace dir |
 | "Where did the model get stuck or error?" | grep the JSONL for `"error":` non-null, or use the trace script's `ERR=` marker |
-| "What did the model see as observation after each action?" | JSONL `observations[i].stdout` / `.stderr` |
+| "What was the raw observation after each action?" | JSONL `observations[i].stdout` / `.stderr` |
+| "What did the model-facing prompt contain on turn N?" | JSONL `prompt[]` for that iteration |
 | "I want a UI" | the Next.js visualizer at `visualizer/` |
 
 ## CLI navigation
@@ -82,6 +101,9 @@ jq -r 'select(.type=="iteration" and .iteration==3) | .response' logs/rlm_*.json
 
 # Action body for turn 2's first action (e.g., the python source the model wrote)
 jq -r 'select(.type=="iteration" and .iteration==2) | .actions[0].body' logs/rlm_*.jsonl
+
+# Model-facing prompt messages for turn 5, after receipt/observation aging
+jq -r 'select(.type=="iteration" and .iteration==5) | .prompt[] | "\(.role):\n\(.content)\n---"' logs/rlm_*.jsonl
 ```
 
 ### Workspace inspection (the actual files)
@@ -186,7 +208,7 @@ Suppose you want to answer "how did the model recover after the pytest-not-found
 5. (Optional) Walk the workspace:
    `cd ~/.rlm/workspaces/run_1778371979854_d052faa7 && git log --oneline` shows one commit per turn; `git show <turn-3-sha>` shows the recovery commit's effect.
 
-That same flow — "trace.py for the overview, jq for any specific field, workspace+git for the file content as the model saw it" — works for any run.
+That same flow — "trace.py for the overview, jq for any specific field, `prompt[]` for model-facing replay, workspace+git for the actual file content" — works for any run.
 
 ## Summary
 
@@ -194,7 +216,8 @@ That same flow — "trace.py for the overview, jq for any specific field, worksp
 |---|---|
 | pass/fail at a glance | `trace.py` |
 | every action the model emitted | JSONL `actions[]` via `jq` |
-| every observation back from the substrate | JSONL `observations[]` via `jq` |
+| every raw observation back from the substrate | JSONL `observations[]` via `jq` |
+| the compact replay the model saw | JSONL `prompt[]` for that turn |
 | the actual file contents | the workspace dir under `~/.rlm/workspaces/run_<id>/` |
 | state as of a specific turn | `git show` inside the workspace |
 | spilled tool outputs | `<workspace>/_rlm_artifacts/_observations/` |

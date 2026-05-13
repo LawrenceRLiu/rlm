@@ -22,6 +22,17 @@ The model should not have to remember Python locals. It should inspect files and
 
 **Note** With the `_rlm_` prefix system, I anticipate significantly less chance of "namespace collisions" between user provided files and what RLM needs to use internally. However as a final catch, to prevent unexpected behavior, if there is a clash, then we should immediately throw an error and have the user resolve it.
 
+### Transcript vs Workspace Memory
+
+The chat transcript is not treated as durable memory. The runtime logs raw model responses and action bodies for humans/evals, but the model's next-turn prompt receives only compact replay:
+
+- file-edit action bodies are replaced by receipts;
+- older observations are replaced by receipts;
+- command output from mutating `python`/`shell` actions is capped;
+- a short `<note>` can carry intent, but not large content.
+
+This prevents `write_file` bodies or one-time `read_file` outputs from silently becoming permanent context. If the model needs file contents again, it should explicitly inspect the workspace with `read_file`.
+
 ### File Provenance Metadata
 
 To help the model reason about the workspace without needing to memorize its entire action history, the runtime tracks file provenance. When files are listed or read, they are tagged with `created` and `modified` metadata based on the following roles:
@@ -62,6 +73,17 @@ def process_data():
 </action>
 ```
 
+### Optional Turn Notes
+
+The model may include one short note before its actions:
+
+```workspace
+<note>Next inspect _rlm_notes/proof.md and fix the beta derivation.</note>
+<action tool="read_file" path="_rlm_notes/proof.md" start_line="1" end_line="120" />
+```
+
+The note is not a general scratchpad. It is a bounded intent anchor for the next turns: current plan, open questions, and file paths to revisit. The runtime omits notes that are too long, span too many lines, contain code fences, or contain action XML. Durable findings still belong in workspace files.
+
 ### Execution Semantics
 
 We explicitly classify tools to manage batching safely:
@@ -99,7 +121,7 @@ The workspace provides a set of initial tools to the model. While the model shou
 - **Arguments**:
   - `path` (required): The path to the file.
   - `content` (implicit text content): The text to write to the file.
-- **Behavior**: Writes the provided content directly to the file, replacing anything that was there. Use this for new files or small complete rewrites.
+- **Behavior**: Writes the provided content directly to the file, replacing anything that was there. Use this for new files or small complete rewrites. The body is stored in the full JSONL trajectory but is not replayed verbatim to the model on later turns; later prompt history contains only a receipt. Use `read_file` to inspect what was written.
 - **Example Usage**:
   ```workspace
   <action tool="write_file" path="scripts/run.sh">
@@ -113,7 +135,7 @@ The workspace provides a set of initial tools to the model. While the model shou
 - **Arguments**:
   - `path` (required): The path to the file.
   - `content` (implicit text content): The text to append to the file.
-- **Behavior**: Adds the content to the end of the file. Creates the file if it does not exist.
+- **Behavior**: Adds the content to the end of the file. Creates the file if it does not exist. As with `write_file`, the appended body is logged for traceability but later prompt replay contains only a receipt.
 - **Example Usage**:
   ```workspace
   <action tool="append_file" path="_rlm_notes/scratch.md">
@@ -129,7 +151,7 @@ The workspace provides a set of initial tools to the model. While the model shou
   - `allow_multiple` (optional): Boolean, defaults to `false`. If `true`, replaces all occurrences.
   - `<search>` (child element): The exact substring to find.
   - `<replace>` (child element): The new substring to replace it with.
-- **Behavior**: **Rule:** The `<search>` block must be a unique substring in the file. If it finds 0 or >1 matches, the tool fails and returns an error unless `allow_multiple="true"` is provided.
+- **Behavior**: **Rule:** The `<search>` block must be a unique substring in the file. If it finds 0 or >1 matches, the tool fails and returns an error unless `allow_multiple="true"` is provided. Failed edit observations include the reason (for example, search text not found or multiple matches). Successful edit bodies are logged but later prompt replay contains only a receipt.
 - **Example Usage**:
   ```workspace
   <action tool="edit_file" path="src/processor.py" allow_multiple="false">
@@ -152,20 +174,20 @@ The workspace provides a set of initial tools to the model. While the model shou
   ```
 
 ### 6. `shell`
-- **Description**: Runs a bash command inside the Docker workspace.
+- **Description**: Runs a bash command inside the Docker workspace for inspection, tests, build steps, and diagnostics.
 - **Arguments**:
   - `command` (implicit text content): The bash command to run.
-- **Behavior**: Executes the command, capturing `stdout`, `stderr`, and the exit code.
+- **Behavior**: Executes the command, capturing `stdout`, `stderr`, and the exit code. `shell` is intentionally described as a scratch/validation tool, not the preferred path for ordinary durable edits. The command source may be replayed in later prompts (capped), while stdout from commands that changed files is capped more aggressively.
 - **Example Usage**:
   ```workspace
   <action tool="shell">pytest tests/test_core.py</action>
   ```
 
 ### 7. `python`
-- **Description**: Convenience wrapper for running Python inside Docker.
+- **Description**: Convenience wrapper for running scratch Python inside Docker for computation, parsing, validation, tests, and diagnostics.
 - **Arguments**:
   - `code` (implicit text content): The python script to execute.
-- **Behavior**: Runs the Python code.
+- **Behavior**: Runs the Python code. `python` should not be used as a substitute for simple durable file edits or for printing large generated artifacts. Use file tools for durable edits and `read_file` for inspection. The script source may be replayed in later prompts (capped), while stdout from scripts that changed files is capped more aggressively.
   - **HTTP Broker Requirement:** Because the Python script runs inside an isolated Docker container without API keys, this requires an HTTP Broker running inside the container (polled by the host) to proxy the LLM requests securely.
   - **Batching & Concurrency:** When a script calls `rlm_query_batched` with many prompts, the runtime enforces a top-level hyperparameter (`MAX_CONCURRENT_RLMS`, e.g., N=5). It will spin up N child workspaces at a time, wait for them to finish, and then spin up the next N, accepting the wall-time slowdown to prevent host resource exhaustion.
 - **Example Usage**:

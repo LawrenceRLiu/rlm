@@ -14,15 +14,16 @@ if TYPE_CHECKING:
 SPEC = ToolSpec(
     name="python",
     short_description=(
-        "Run a Python script inside the workspace container. "
+        "Run scratch Python for computation, parsing, validation, tests, and diagnostics. "
+        "Use file tools for ordinary durable edits; avoid printing large generated artifacts. "
         "`llm_query`, `llm_query_batched`, `rlm_query`, `rlm_query_batched` are pre-imported."
     ),
     is_state_mutating=True,
     runs_on="container",
     body_required=True,
     example=(
-        'No attributes. Body is raw Python — do NOT wrap in <code>, <script>, '
-        '<python>, or markdown fences. '
+        "No attributes. Body is raw Python — do NOT wrap in <code>, <script>, "
+        "<python>, or markdown fences. "
         'Example: <action tool="python">\nimport math\nprint(math.pi)\n</action>'
     ),
 )

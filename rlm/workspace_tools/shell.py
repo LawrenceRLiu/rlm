@@ -13,13 +13,16 @@ if TYPE_CHECKING:
 
 SPEC = ToolSpec(
     name="shell",
-    short_description="Run a bash script inside the workspace container.",
+    short_description=(
+        "Run shell commands for inspection, tests, build steps, and diagnostics. "
+        "Use file tools for ordinary durable edits; avoid echo/tee/heredoc file writes."
+    ),
     is_state_mutating=True,
     runs_on="container",
     body_required=True,
     example=(
-        'No attributes. Body is raw bash — do NOT wrap in <code>, <script>, '
-        'or markdown fences. '
+        "No attributes. Body is raw bash — do NOT wrap in <code>, <script>, "
+        "or markdown fences. "
         'Example: <action tool="shell">\nls -la _rlm_artifacts/\n</action>'
     ),
 )

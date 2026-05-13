@@ -55,7 +55,7 @@ from rlm.utils.prompts import (
     build_parse_retry_message,
     build_workspace_initial_user_prompt,
     build_workspace_system_prompt,
-    format_workspace_iteration,
+    format_workspace_history,
 )
 from rlm.utils.rlm_utils import filter_sensitive_keys
 from rlm.workspace_tools import get_spec
@@ -324,6 +324,8 @@ class RLM:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": initial_user},
         ]
+        base_message_history = list(message_history)
+        completed_iterations: list[WorkspaceIteration] = []
 
         try:
             for i in range(self.max_iterations):
@@ -335,6 +337,10 @@ class RLM:
                         pass
 
                 env.current_turn = i + 1
+                message_history = base_message_history + format_workspace_history(
+                    completed_iterations,
+                    history_config=self.workspace_config.history,
+                )
                 try:
                     iteration = self._completion_turn(
                         iteration_idx=i + 1,
@@ -373,8 +379,10 @@ class RLM:
                         time_start=time_start,
                     )
 
-                # Append turn record to history for the next prompt.
-                message_history.extend(format_workspace_iteration(iteration))
+                # Keep canonical full-fidelity iterations in memory, then
+                # rebuild model-facing history each turn with prompt-replay
+                # compaction/receipts applied by age.
+                completed_iterations.append(iteration)
 
         except KeyboardInterrupt:
             self.verbose.print_limit_exceeded("cancelled", "User interrupted execution")
@@ -385,6 +393,10 @@ class RLM:
 
         # max_iterations reached without a `final` action: ask the model
         # one last time for an answer based on what it has gathered.
+        message_history = base_message_history + format_workspace_history(
+            completed_iterations,
+            history_config=self.workspace_config.history,
+        )
         final_answer = self._default_answer(message_history, lm_handler)
         return self._build_completion(
             prompt=prompt,

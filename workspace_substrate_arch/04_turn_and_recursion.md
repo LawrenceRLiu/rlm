@@ -5,17 +5,17 @@
 
 Each RLM turn should have a simple transcript shape:
 
-1. The model receives the task, compact workspace instructions, current workspace summary, and previous observations.
-2. The model returns either a `workspace` action block or a final answer action.
+1. The model receives the task, compact workspace instructions, recent observations, older observation receipts, action receipts, snapshots, and any valid short turn notes.
+2. The model returns optional `<note>...</note>` intent text plus one or more action blocks, or a final answer action.
 3. The runtime parses the block into `WorkspaceAction` objects.
-4. The runtime executes the actions and appends one compact observation message.
-5. The next model turn sees the prior assistant action block and the runtime observation.
+4. The runtime executes the actions and records a full-fidelity iteration in the JSONL trajectory.
+5. The next model turn is rebuilt from compact model-facing replay, not from the raw assistant response.
 
 **Example transcript:**
 
     ====== Turn 1 ======  
     assistant:
-    I need to inspect the context and current notes.
+    <note>Inspect the root task and workspace layout first.</note>
 
     ```workspace
     <action tool="list_directory" path="." />
@@ -36,7 +36,9 @@ Each RLM turn should have a simple transcript shape:
 
     ====== Turn 2 ======
     assistant:
-    [follow-up assistant message with new `workspace` action block or `final` action]
+    [compact replay includes the turn 1 note, action receipts, and observations]
+    <note>Use the task details to choose the next file/tool to inspect.</note>
+    [new `workspace` action block or `final` action]
 
     user/runtime:
     [follow-up observation message]
@@ -50,23 +52,41 @@ Each RLM turn should have a simple transcript shape:
     user/runtime:
     [follow-up observation message]
 
-This transcript gets fed into the next model call, and so on. **IMPORTANT**: We need the model to output something above and below the workspace block. This should naturally be a summary of what the model plans to approach the problem etc, ie it would be able to provided anchoring for the next model call.
+The raw transcript is logged, but it is not fed back verbatim forever. The model-facing replay is intentionally compact. Prior file-edit bodies are hidden behind receipts, recent observations are visible, older observations age into receipts, and snapshots summarize changed files. If the model needs exact file contents again, it must call `read_file`.
+
+For short planning continuity, the model may include one bounded `<note>...</note>` before its actions. A valid note is replayed as:
+
+```workspace
+<turn_note turn="3">
+Read _rlm_notes/proof.md next and verify the beta derivation.
+</turn_note>
+```
+
+The note is for intent only. It should be short and should contain current plan, open questions, or file paths to revisit. It must not contain file contents, code blocks, proofs, large outputs, generated artifacts, or action XML. Overlong/content-like notes are replaced by an omitted-note receipt rather than truncated, so dumping content into a note is not rewarded.
 
 The observation should be compact and bounded. Large outputs (Ie above a certain hyperparameter number of lines/words/charachters) should be written to `_rlm_artifacts/` and summarized with a file path and a note on the length (in lines or characters). This avoids filling the root message history while preserving inspectable state in the workspace. This truncation should operate on a per observation/tool call basis. Ie if the first tool call in the action block returns a large output, that and only that should be truncated, the rest of the tool calls (if they are not as long), should be included fully.
+
+Prompt-history shaping currently has explicit knobs under `PromptHistoryConfig`:
+
+- `full_observation_turns`: how many most-recent completed turns keep full observations in replay;
+- `max_command_body_replay_chars`: cap for replaying `python`/`shell` source;
+- `max_mutating_command_body_replay_chars`: smaller source cap when the command changed files;
+- `max_mutating_command_stdout_replay_chars`: cap for stdout from mutating command actions;
+- `max_turn_note_chars` / `max_turn_note_lines`: bounds for optional turn notes.
 
 The runtime should reject malformed actions loudly with a parse observation that tells the model exactly what schema failed. This is important for small models. **Note** An interesting alternative would be to use constrained decoding to force the model to output a valid json block.
 
 ### Context Compaction
 
-Like the vanilla RLM implementation, the workspace substrate will inevitably accumulate long message histories over many turns. To mitigate this, we implement a context compaction mechanism:
+Like the vanilla RLM implementation, the workspace substrate can still accumulate long message histories over many turns. The current implementation already performs lightweight prompt-history shaping by rebuilding model-facing replay from receipts, aged observations, snapshots, and bounded notes. A heavier summary-based compaction mechanism can still be added later:
 
 1. When the token count of the active `message_history` crosses a configured threshold, the runtime pauses and prompts the model to generate a dense summary of the entire trajectory up to that point.
-2. The active context window is then "restarted" by replacing the prior history with this new summary.
+2. The active context window is then "restarted" by replacing the prior replay receipts with this new summary.
 3. However, unlike the vanilla REPL implementation—which stored the raw history in an ephemeral Python `history` variable—the workspace substrate writes the full, uncompacted action log to a durable file (e.g., `_rlm_state/action_log.jsonl` or `_rlm_notes/trajectory_archive.md`).
 
 This ensures that the model can always use standard file tools (like `read_file`) to recover exact details from earlier in the run if it realizes the summary omitted crucial information, completely avoiding the permanent loss of context.
 
-**Note:** The implementation of this feature can be delayed for a bit. For now we can focus on everything else first.
+**Note:** The current receipt/aged-observation replay is already implemented. The heavier summary-generation variant described above remains future work.
 
 ## Prompt Shape
 

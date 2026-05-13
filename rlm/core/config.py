@@ -42,6 +42,35 @@ class ObservationConfig:
 
 
 @dataclass
+class PromptHistoryConfig:
+    """Model-facing replay shaping for prior turns.
+
+    The JSONL logger keeps full-fidelity responses/actions/observations. These
+    knobs only affect what is replayed back into the LM prompt on later turns.
+    """
+
+    # Number of most-recent completed turns whose observations are replayed in
+    # full. Older observations become receipts so read_file output does not
+    # become permanent transcript memory.
+    full_observation_turns: int = 1
+
+    # Python/shell source is often useful for debugging, but if that action
+    # changed files it may also contain generated artifacts. Use a smaller cap
+    # in that case.
+    max_command_body_replay_chars: int = 4_000
+    max_mutating_command_body_replay_chars: int = 1_200
+
+    # If python/shell changed files, cap stdout more aggressively in prompt
+    # replay. The full stdout remains in the iteration log / spill artifact.
+    max_mutating_command_stdout_replay_chars: int = 2_000
+
+    # Optional <note>...</note> intent anchor replayed across turns. Overlong
+    # or content-like notes are replaced with an omitted-note receipt.
+    max_turn_note_chars: int = 600
+    max_turn_note_lines: int = 6
+
+
+@dataclass
 class RecursionConfig:
     """rlm_query recursion knobs."""
 
@@ -89,6 +118,7 @@ class WorkspaceConfig:
 
     parse: ParseConfig = field(default_factory=ParseConfig)
     observation: ObservationConfig = field(default_factory=ObservationConfig)
+    history: PromptHistoryConfig = field(default_factory=PromptHistoryConfig)
     recursion: RecursionConfig = field(default_factory=RecursionConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
     lm: LMConfig = field(default_factory=LMConfig)

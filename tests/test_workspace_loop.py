@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from rlm.core.config import WorkspaceConfig
+from rlm.core.config import PromptHistoryConfig, WorkspaceConfig
 from rlm.core.rlm import RLM
 from rlm.core.types import (
     RLMChatCompletion,
@@ -27,6 +27,7 @@ from rlm.utils.exceptions import ActionParseError
 from rlm.utils.prompts import (
     build_workspace_initial_user_prompt,
     build_workspace_system_prompt,
+    format_workspace_history,
     format_workspace_iteration,
 )
 
@@ -59,6 +60,13 @@ class TestWorkspaceSystemPrompt:
         assert "_rlm_query_0.txt" in msg
         assert "solve x" in msg
 
+    def test_system_prompt_describes_tool_intent(self):
+        p = build_workspace_system_prompt(depth=0, max_depth=1)
+        assert "# Tool intent" in p
+        assert "Use ``write_file``, ``append_file``, and ``edit_file``" in p
+        assert "Do not use ``python`` or ``shell`` as a substitute" in p
+        assert "one short ``<note>...</note>``" in p
+
 
 # ---------------------------------------------------------------------------
 # Iteration formatter
@@ -84,11 +92,141 @@ class TestFormatWorkspaceIteration:
         )
         msgs = format_workspace_iteration(it)
         assert [m["role"] for m in msgs] == ["assistant", "user"]
-        assert msgs[0]["content"] == "prose with action"
+        assert '<action_replay action_id="t1.a1" tool="read_file"' in msgs[0]["content"]
         assert "t1.a1" in msgs[1]["content"]
         assert "hello" in msgs[1]["content"]
         assert "snapshot" in msgs[1]["content"]
         assert "abcdef1" in msgs[1]["content"]
+
+    def test_file_tool_body_is_omitted_from_assistant_replay(self):
+        action = WorkspaceAction(
+            tool="write_file",
+            args={"path": "draft.md"},
+            body="secret draft body\nsecond line",
+            raw='<action tool="write_file" path="draft.md">secret draft body</action>',
+        )
+        obs = WorkspaceObservation(
+            tool="write_file",
+            stdout="Wrote 29 chars to draft.md",
+            data={"path": "draft.md", "bytes": 29},
+            artifacts=["draft.md"],
+        )
+        it = WorkspaceIteration(
+            iteration=2,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response=action.raw,
+            reasoning=None,
+            actions=[action],
+            observations=[obs],
+        )
+        msgs = format_workspace_iteration(it)
+        assert "secret draft body" not in msgs[0]["content"]
+        assert "body omitted from replay" in msgs[0]["content"]
+        assert "Wrote 29 chars to draft.md" in msgs[1]["content"]
+
+    def test_short_note_is_replayed_as_turn_note(self):
+        action = WorkspaceAction(tool="list_directory", args={}, body=None, raw="")
+        it = WorkspaceIteration(
+            iteration=3,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response=(
+                "<note>Read _rlm_notes/proof.md next and verify the beta derivation.</note>\n"
+                '<action tool="list_directory" />'
+            ),
+            reasoning=None,
+            actions=[action],
+            observations=[WorkspaceObservation(tool="list_directory", stdout="ok")],
+        )
+        msgs = format_workspace_iteration(it)
+        assert '<turn_note turn="3">' in msgs[0]["content"]
+        assert "verify the beta derivation" in msgs[0]["content"]
+
+    def test_overlong_note_is_omitted_from_replay(self):
+        action = WorkspaceAction(tool="list_directory", args={}, body=None, raw="")
+        long_note = "x" * 50
+        it = WorkspaceIteration(
+            iteration=4,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response=f'<note>{long_note}</note>\n<action tool="list_directory" />',
+            reasoning=None,
+            actions=[action],
+            observations=[WorkspaceObservation(tool="list_directory", stdout="ok")],
+        )
+        cfg = PromptHistoryConfig(max_turn_note_chars=10)
+        msgs = format_workspace_iteration(it, history_config=cfg)
+        assert long_note not in msgs[0]["content"]
+        assert '<turn_note turn="4" omitted="true" reason="too-long"' in msgs[0]["content"]
+
+    def test_content_like_note_is_omitted_from_replay(self):
+        action = WorkspaceAction(tool="list_directory", args={}, body=None, raw="")
+        it = WorkspaceIteration(
+            iteration=5,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response=(
+                "<note>```python\nprint('large content')\n```</note>\n"
+                '<action tool="list_directory" />'
+            ),
+            reasoning=None,
+            actions=[action],
+            observations=[WorkspaceObservation(tool="list_directory", stdout="ok")],
+        )
+        msgs = format_workspace_iteration(it)
+        assert "print('large content')" not in msgs[0]["content"]
+        assert 'reason="content-like"' in msgs[0]["content"]
+
+    def test_old_read_observations_compact_to_receipts(self):
+        old = WorkspaceIteration(
+            iteration=1,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="",
+            reasoning=None,
+            actions=[WorkspaceAction(tool="read_file", args={"path": "a.md"}, body=None, raw="")],
+            observations=[WorkspaceObservation(tool="read_file", stdout="full file contents")],
+        )
+        new = WorkspaceIteration(
+            iteration=2,
+            timestamp="2026-01-01T00:00:01",
+            prompt=[],
+            response="",
+            reasoning=None,
+            actions=[WorkspaceAction(tool="list_directory", args={"path": "."}, body=None, raw="")],
+            observations=[WorkspaceObservation(tool="list_directory", stdout="Directory: .")],
+        )
+        msgs = format_workspace_history(
+            [old, new],
+            history_config=PromptHistoryConfig(full_observation_turns=1),
+        )
+        assert "full file contents" not in msgs[1]["content"]
+        assert "stdout omitted from replay" in msgs[1]["content"]
+        assert "Directory: ." in msgs[3]["content"]
+
+    def test_mutating_command_stdout_is_capped_in_replay(self):
+        action = WorkspaceAction(tool="python", args={}, body="print('x')", raw="")
+        obs = WorkspaceObservation(
+            tool="python",
+            stdout="x" * 50,
+            data={"exit_code": 0, "changed_paths": ["out.txt"], "removed_paths": []},
+            artifacts=["out.txt"],
+        )
+        it = WorkspaceIteration(
+            iteration=1,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="",
+            reasoning=None,
+            actions=[action],
+            observations=[obs],
+        )
+        cfg = PromptHistoryConfig(max_mutating_command_stdout_replay_chars=10)
+        msgs = format_workspace_iteration(it, history_config=cfg)
+        assert "x" * 10 in msgs[1]["content"]
+        assert "x" * 11 not in msgs[1]["content"]
+        assert "stdout truncated for replay" in msgs[1]["content"]
 
 
 # ---------------------------------------------------------------------------
