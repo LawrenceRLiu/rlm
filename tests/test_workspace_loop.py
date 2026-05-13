@@ -223,6 +223,83 @@ class TestFormatWorkspaceIteration:
         assert "<action" not in text
         assert "<observation" not in text
 
+    def test_native_replay_does_not_duplicate_body_in_args(self):
+        """The body-bearing arg (write_file.content, run_shell_command.command,
+        run_python_command.code, llm_query/rlm_query.prompt) is mirrored into
+        ``action.body`` by the native parser. The replay must render it once,
+        not twice — duplication doubled the prompt for every write/shell/query
+        and confused the model. See native_tools.body_arg_name."""
+        # write_file: content arg should be stripped from rendered args, but
+        # file_path (the non-body arg) must still appear.
+        action = WorkspaceAction(
+            tool="write_file",
+            args={"file_path": "draft.md", "content": "BODY_PAYLOAD_X"},
+            body="BODY_PAYLOAD_X",
+            raw="{}",
+            call_id="call_w",
+        )
+        it = WorkspaceIteration(
+            iteration=1,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="",
+            reasoning=None,
+            actions=[action],
+            observations=[WorkspaceObservation(tool="write_file", stdout="ok")],
+        )
+        text = "\n".join(m["content"] for m in format_workspace_iteration(it))
+        # body shown exactly once (under "body:") — not also inside args=
+        assert text.count("BODY_PAYLOAD_X") == 1
+        assert "body:" in text
+        assert '"file_path": "draft.md"' in text
+        assert '"content"' not in text
+
+        # run_python_command: code arg should be stripped; timeout retained.
+        action = WorkspaceAction(
+            tool="run_python_command",
+            args={"code": "print('PYBODY')", "timeout": 10},
+            body="print('PYBODY')",
+            raw="{}",
+            call_id="call_p",
+        )
+        it = WorkspaceIteration(
+            iteration=1,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="",
+            reasoning=None,
+            actions=[action],
+            observations=[WorkspaceObservation(tool="run_python_command", stdout="ok")],
+        )
+        text = "\n".join(m["content"] for m in format_workspace_iteration(it))
+        assert text.count("PYBODY") == 1
+        assert '"timeout": 10' in text
+        assert '"code"' not in text
+
+    def test_native_replay_keeps_args_for_bodyless_tools(self):
+        """For tools without a body arg (list_directory, read_file), args
+        must still render verbatim."""
+        action = WorkspaceAction(
+            tool="read_file",
+            args={"path": "a.md", "start_line": 1, "end_line": 5},
+            body=None,
+            raw="{}",
+            call_id="call_r",
+        )
+        it = WorkspaceIteration(
+            iteration=1,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="",
+            reasoning=None,
+            actions=[action],
+            observations=[WorkspaceObservation(tool="read_file", stdout="contents")],
+        )
+        text = "\n".join(m["content"] for m in format_workspace_iteration(it))
+        assert '"path": "a.md"' in text
+        assert '"start_line": 1' in text
+        assert "body:" not in text
+
 
 # ---------------------------------------------------------------------------
 # Parse-and-retry inner loop

@@ -176,13 +176,28 @@ def actions_from_tool_calls(calls: list[LMToolCall]) -> list[WorkspaceAction]:
     return actions
 
 
+_BODY_ARG_BY_TOOL: dict[str, str] = {
+    "write_file": "content",
+    "append_file": "content",
+    "run_shell_command": "command",
+    "run_python_command": "code",
+    "llm_query": "prompt",
+    "rlm_query": "prompt",
+}
+
+
+def body_arg_name(name: str) -> str | None:
+    """Return the args-key whose value is replayed as the action body, if any.
+
+    Single source of truth for the args-vs-body split used both by
+    ``_body_for`` (extraction) and ``render_action_replay`` (deduplication
+    in the prompt — body is shown once, not duplicated inside ``args=``).
+    """
+    return _BODY_ARG_BY_TOOL.get(name)
+
+
 def _body_for(name: str, args: dict[str, Any]) -> str | None:
-    if name in {"write_file", "append_file"}:
-        return str(args.get("content", ""))
-    if name == "run_shell_command":
-        return str(args.get("command", ""))
-    if name == "run_python_command":
-        return str(args.get("code", ""))
-    if name in {"llm_query", "rlm_query"}:
-        return str(args.get("prompt", ""))
-    return None
+    key = body_arg_name(name)
+    if key is None:
+        return None
+    return str(args.get(key, ""))

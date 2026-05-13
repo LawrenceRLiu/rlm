@@ -8,6 +8,7 @@ from rlm.core.types import (
     WorkspaceObservation,
 )
 from rlm.utils.action_parser import strip_reasoning_blocks
+from rlm.utils.native_tools import body_arg_name
 
 WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     """\
@@ -47,6 +48,27 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     Emit ``<action tool="final"><answer>...</answer></action>`` to terminate
     the run with your final answer. You may also include zero or more
     ``<artifact path="..." />`` children to mark files as part of the result.
+
+    # Decomposition with ``llm_query`` and ``rlm_query``
+    You reason better when you offload self-contained sub-*questions* to a
+    fresh context instead of keeping everything in head. When you hit a
+    discrete sub-question whose answer would feed into your reasoning —
+    extracting a fact from a long document, summarising a passage, computing
+    or sanity-checking an intermediate result, verifying a single derivation
+    step — reach for ``llm_query`` (one-shot) or ``rlm_query`` (multi-turn
+    with workspace access). These tools widen your inputs; they are not a
+    substitute for your own planning or for the open-ended structure of the
+    task itself. Decompose specific questions, not the thinking.
+
+    # Returning your answer
+    Return the result inline as the body of ``<answer>`` in ``final``. The
+    workspace is scratch space (``_rlm_notes/`` for thinking, ``_rlm_artifacts/``
+    for intermediates), not a substitute for the answer. Attach
+    ``<artifact path="..." />`` children only when a file genuinely belongs
+    with the answer — i.e. when it is the answer (a built binary, a
+    requested file deliverable, a dataset), or when the answer references it
+    in a way that wouldn't make sense without the file on disk. Notes, drafts,
+    and scratch files do not belong here.
 
     # Available tools
     {tool_descriptions}
@@ -106,6 +128,27 @@ NATIVE_WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
       a script file. Quote paths and use heredocs for large multiline literals.
     - ``write_file.content`` and ``run_python_command.code`` are strings;
       include the exact content/code you want executed or written.
+
+    # Decomposition with ``llm_query`` and ``rlm_query``
+    You reason better when you offload self-contained sub-*questions* to a
+    fresh context instead of keeping everything in head. When you hit a
+    discrete sub-question whose answer would feed into your reasoning —
+    extracting a fact from a long document, summarising a passage, computing
+    or sanity-checking an intermediate result, verifying a single derivation
+    step — reach for ``llm_query`` (one-shot) or ``rlm_query`` (multi-turn
+    with workspace access). These tools widen your inputs; they are not a
+    substitute for your own planning or for the open-ended structure of the
+    task itself. Decompose specific questions, not the thinking.
+
+    # Returning your answer
+    Return the result inline as the ``answer`` argument of the ``final``
+    tool call. The workspace is scratch space (``_rlm_notes/`` for thinking,
+    ``_rlm_artifacts/`` for intermediates), not a substitute for the answer.
+    List paths in the ``artifacts`` argument of ``final`` only when a file
+    genuinely belongs with the answer — i.e. when it is the answer (a built
+    binary, a requested file deliverable, a dataset), or when the answer
+    references it in a way that wouldn't make sense without the file on disk.
+    Notes, drafts, and scratch files do not belong here.
 
     # Available tools
     {tool_descriptions}
@@ -249,9 +292,13 @@ NATIVE_TOOL_DESCRIPTIONS: dict[str, str] = {
         '{"prompt": "Inspect summary files and synthesize the result."}.'
     ),
     "final": (
-        "Terminate the run with the final answer. Arguments: "
-        '{"answer": "42 primes found", "artifacts": ["primes.txt"]}; '
-        "artifacts is optional."
+        "Terminate the run with the final answer. Put the result inline in "
+        '``answer`` (e.g. ``{"answer": "<full proof or result here>"}``); '
+        "the workspace is scratch space, not a substitute for the answer. "
+        "Attach ``artifacts`` only when a file genuinely belongs with the "
+        'answer — when it *is* the answer (e.g. ``{"answer": "see attached", '
+        '"artifacts": ["report.pdf"]}``) or when the answer references it in '
+        "a way that wouldn't make sense without the file."
     ),
 }
 
@@ -276,8 +323,20 @@ def render_action_replay(
         parts = [f"TOOL_CALL {action_id} tool={action.tool} status={status}"]
         if action.call_id:
             parts[0] += f" call_id={action.call_id}"
-        if action.args:
-            parts.append("args=" + json.dumps(action.args, ensure_ascii=False, sort_keys=True))
+        # The body-bearing arg (e.g. write_file.content, run_shell_command.command)
+        # is mirrored into ``action.body`` by the native parser. Rendering both
+        # would replay the same payload twice in the prompt, so we strip the
+        # body arg from the rendered JSON whenever a body is present.
+        body_key = body_arg_name(action.tool) if body else None
+        args_for_replay = (
+            {k: v for k, v in action.args.items() if k != body_key}
+            if body_key is not None
+            else action.args
+        )
+        if args_for_replay:
+            parts.append(
+                "args=" + json.dumps(args_for_replay, ensure_ascii=False, sort_keys=True)
+            )
         if body:
             parts.append("body:")
             parts.append(body.rstrip())

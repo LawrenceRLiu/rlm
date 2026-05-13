@@ -136,6 +136,36 @@ class RLMChatCompletion:
     # ``RLM.completion``. Arbitrary type — caller-defined. None when no
     # callback was supplied (or the callback returned None).
     pre_cleanup_result: Any = None
+    # Workspace-relative paths the model attached to its ``final`` action.
+    # Empty when the model returned the answer inline (the recommended path)
+    # or when the run hit ``max_iterations`` without a ``final``.
+    final_artifacts: list[str] = field(default_factory=list)
+    # Host-absolute path to the workspace directory that produced these
+    # artifacts, when it survives past the completion call (i.e.
+    # ``DockerConfig.cleanup_mode == "keep"``). ``None`` if the workspace
+    # was torn down or its location is otherwise unavailable. Combine with
+    # entries of ``final_artifacts`` to read the files directly: e.g.
+    # ``Path(result.workspace_root) / result.final_artifacts[0]``.
+    workspace_root: str | None = None
+
+    def read_artifact(self, path: str) -> str:
+        """Read a final artifact's text contents.
+
+        Convenience for the common case of inspecting a file the model
+        attached to its ``final`` action. Resolves ``path`` against
+        ``workspace_root``; raises ``RuntimeError`` if the workspace was not
+        kept past the completion. For binary data, read ``workspace_root /
+        path`` directly with ``pathlib``.
+        """
+        if self.workspace_root is None:
+            raise RuntimeError(
+                "Cannot read artifact: workspace_root is None (the workspace "
+                "was torn down after the completion). Set "
+                'DockerConfig(cleanup_mode="keep") to retain it.'
+            )
+        from pathlib import Path
+
+        return (Path(self.workspace_root) / path).read_text(encoding="utf-8")
 
     def to_dict(self):
         out = {
@@ -144,7 +174,10 @@ class RLMChatCompletion:
             "response": self.response,
             "usage_summary": self.usage_summary.to_dict(),
             "execution_time": self.execution_time,
+            "final_artifacts": list(self.final_artifacts),
         }
+        if self.workspace_root is not None:
+            out["workspace_root"] = self.workspace_root
         if self.metadata is not None:
             out["metadata"] = self.metadata
         if self.reasoning_content is not None:
@@ -164,6 +197,8 @@ class RLMChatCompletion:
             metadata=data.get("metadata"),
             reasoning_content=data.get("reasoning_content"),
             pre_cleanup_result=data.get("pre_cleanup_result"),
+            final_artifacts=list(data.get("final_artifacts") or []),
+            workspace_root=data.get("workspace_root"),
         )
 
 

@@ -29,6 +29,12 @@ export interface RLMChatCompletion {
   execution_time: number;
   metadata?: ChildTrajectoryMetadata | null;
   reasoning_content?: string | null;
+  // Workspace-relative paths the model attached to its `final` action.
+  // Empty when the model returned the answer inline (the recommended path).
+  final_artifacts?: string[];
+  // Host-absolute path to the workspace dir when `cleanup_mode == "keep"`,
+  // null otherwise. Combine with `final_artifacts` entries to locate files.
+  workspace_root?: string | null;
 }
 
 export type ProvenanceRole = 'user' | 'assistant' | 'system' | 'child';

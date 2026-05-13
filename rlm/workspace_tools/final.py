@@ -16,8 +16,12 @@ if TYPE_CHECKING:
 SPEC = ToolSpec(
     name="final",
     short_description=(
-        "Terminate the run with a final answer. "
-        'Body: <answer>...</answer> plus zero or more <artifact path="..." />.'
+        "Terminate the run with a final answer. Put the result inline "
+        "inside <answer>...</answer> — the workspace is scratch space, not "
+        'a substitute for the answer. Attach <artifact path="..." /> '
+        "children only when a file genuinely belongs with the answer "
+        "(it *is* the deliverable, or the answer references it in a way "
+        "that wouldn't make sense without the file)."
     ),
     is_state_mutating=False,
     runs_on="host",

@@ -120,6 +120,67 @@ class TestRLMChatCompletion:
         c2 = RLMChatCompletion.from_dict(d)
         assert c2.metadata == trajectory
 
+    def test_final_artifacts_default_empty(self):
+        c = RLMChatCompletion(
+            root_model="gpt-4",
+            prompt="hi",
+            response="hello",
+            usage_summary=UsageSummary(model_usage_summaries={}),
+            execution_time=1.0,
+        )
+        assert c.final_artifacts == []
+        assert c.workspace_root is None
+        d = c.to_dict()
+        # final_artifacts always present (empty list is meaningful for callers);
+        # workspace_root omitted when None.
+        assert d["final_artifacts"] == []
+        assert "workspace_root" not in d
+
+    def test_final_artifacts_roundtrip(self):
+        c = RLMChatCompletion(
+            root_model="gpt-4",
+            prompt="hi",
+            response="see attached",
+            usage_summary=UsageSummary(model_usage_summaries={}),
+            execution_time=1.0,
+            final_artifacts=["report.pdf", "data.csv"],
+            workspace_root="/tmp/rlm_runs/abc123",
+        )
+        d = c.to_dict()
+        assert d["final_artifacts"] == ["report.pdf", "data.csv"]
+        assert d["workspace_root"] == "/tmp/rlm_runs/abc123"
+        c2 = RLMChatCompletion.from_dict(d)
+        assert c2.final_artifacts == ["report.pdf", "data.csv"]
+        assert c2.workspace_root == "/tmp/rlm_runs/abc123"
+
+    def test_read_artifact_raises_without_workspace_root(self):
+        import pytest
+
+        c = RLMChatCompletion(
+            root_model="gpt-4",
+            prompt="hi",
+            response="r",
+            usage_summary=UsageSummary(model_usage_summaries={}),
+            execution_time=1.0,
+            final_artifacts=["x.txt"],
+            workspace_root=None,
+        )
+        with pytest.raises(RuntimeError, match="workspace_root is None"):
+            c.read_artifact("x.txt")
+
+    def test_read_artifact_reads_text(self, tmp_path):
+        (tmp_path / "report.md").write_text("hello\n", encoding="utf-8")
+        c = RLMChatCompletion(
+            root_model="gpt-4",
+            prompt="hi",
+            response="see attached",
+            usage_summary=UsageSummary(model_usage_summaries={}),
+            execution_time=1.0,
+            final_artifacts=["report.md"],
+            workspace_root=str(tmp_path),
+        )
+        assert c.read_artifact("report.md") == "hello\n"
+
 
 class TestWorkspaceIteration:
     """Tests for WorkspaceIteration error field + to_dict shape."""

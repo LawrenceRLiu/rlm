@@ -429,6 +429,7 @@ class RLM:
                         response=iteration.final_answer,
                         lm_handler=lm_handler,
                         time_start=time_start,
+                        env=env,
                     )
 
                 # Keep canonical full-fidelity iterations in memory, then
@@ -459,6 +460,7 @@ class RLM:
             response=final_answer,
             lm_handler=lm_handler,
             time_start=time_start,
+            env=env,
         )
 
     # =========================================================================
@@ -917,11 +919,19 @@ class RLM:
         response: str,
         lm_handler: LMHandler,
         time_start: float,
+        env: DockerWorkspaceEnv | None = None,
     ) -> RLMChatCompletion:
         time_end = time.perf_counter()
         usage = lm_handler.get_usage_summary()
         self.verbose.print_final_answer(response)
         self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
+        # Surface artifacts + workspace location for direct caller access.
+        # ``self._last_final_artifacts`` is set by the success branch of
+        # _run_loop before _build_completion is called; for the
+        # max-iterations fallback path it stays at [] (the default).
+        workspace_root: str | None = None
+        if env is not None and self.workspace_config.docker.cleanup_mode == "keep":
+            workspace_root = str(env.workspace_root)
         return RLMChatCompletion(
             root_model=(self.backend_kwargs or {}).get("model_name", "unknown"),
             prompt=prompt,
@@ -929,6 +939,8 @@ class RLM:
             usage_summary=usage,
             execution_time=time_end - time_start,
             metadata=self.logger.get_trajectory() if self.logger else None,
+            final_artifacts=list(self._last_final_artifacts),
+            workspace_root=workspace_root,
         )
 
     def _fallback_answer(self, message: str | dict[str, Any]) -> str:
