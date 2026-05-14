@@ -347,9 +347,7 @@ def render_action_replay(
             else action.args
         )
         if args_for_replay:
-            parts.append(
-                "args=" + json.dumps(args_for_replay, ensure_ascii=False, sort_keys=True)
-            )
+            parts.append("args=" + json.dumps(args_for_replay, ensure_ascii=False, sort_keys=True))
         if body:
             parts.append("body:")
             parts.append(body.rstrip())
@@ -500,14 +498,30 @@ def format_workspace_iteration(
                 f"\nchanged: {changed}\n</snapshot>"
             )
 
-    user_message = "\n\n".join(obs_chunks) if obs_chunks else "(no observations)"
+    # Preserve the model's free-form narration (pre-first-tool-call prose from
+    # ``message.content`` after the hermes parser strips ``<tool_call>``
+    # blocks). Without this, the assistant turn replayed in subsequent prompts
+    # is tool-calls-only and the model loses continuity of intent. Mirrors
+    # upstream RLM's behavior of re-feeding the full assistant response.
+    narration = strip_reasoning_blocks(iteration.response).strip()
+    if action_chunks:
+        assistant_chunks = ([narration] if narration else []) + action_chunks
+        assistant_content = "\n\n".join(assistant_chunks)
+    else:
+        # No-op turn: ``tool_choice="auto"`` lets the model emit prose with no
+        # tool call. Replay the prose; the user-side nudge below tells the
+        # model the workspace is unchanged and it still needs to act.
+        assistant_content = narration
+
+    if obs_chunks:
+        user_message = "\n\n".join(obs_chunks)
+    elif not action_chunks:
+        user_message = "No tool calls made; workspace unchanged. State your next action."
+    else:
+        user_message = "(no observations)"
+
     return [
-        {
-            "role": "assistant",
-            "content": "\n\n".join(action_chunks)
-            if action_chunks
-            else strip_reasoning_blocks(iteration.response),
-        },
+        {"role": "assistant", "content": assistant_content},
         {"role": "user", "content": user_message},
     ]
 

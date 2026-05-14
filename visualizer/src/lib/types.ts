@@ -119,6 +119,16 @@ export interface WorkspaceIteration {
   // parse-retry exhaustion). When non-null, `actions` and `observations`
   // are empty and `parse_attempts` carries the failed responses.
   error?: string | null;
+  // Per-turn token usage summed across all parse-retry attempts. ``null`` for
+  // backends that don't surface usage on this code path. ``completion_tokens``
+  // far larger than ``reasoning + response`` length is the smoking gun for a
+  // backend parser dropping tokens between the wire and the surfaced fields.
+  lm_usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
+  // Post-chat-template prompt the model literally saw on this turn — the
+  // system+tools envelope vLLM injects (tool descriptions, ``<tool_call>``
+  // wrapping instructions, special tokens) plus the full message history.
+  // Best-effort, populated only for self-hosted vLLM.
+  rendered_prompt?: string | null;
 }
 
 // Run-level metadata persisted in the first JSONL line.

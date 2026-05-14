@@ -237,6 +237,15 @@ class LMCompletionResult:
     content: str
     reasoning_content: str | None = None
     tool_calls: list[LMToolCall] = field(default_factory=list)
+    # Per-call token usage from the backend's ``usage`` field, when available.
+    # Keys: ``prompt_tokens``, ``completion_tokens``, ``total_tokens``. ``None``
+    # for backends that don't surface usage on this code path.
+    usage: dict[str, int] | None = None
+    # Post-chat-template prompt the model actually sees (system+tools envelope
+    # + history + generation cursor, as rendered by vLLM's Jinja template).
+    # Populated best-effort via ``/tokenize`` + ``/detokenize`` for self-hosted
+    # vLLM; ``None`` for public endpoints or on transport error.
+    rendered_prompt: str | None = None
 
 
 @dataclass
@@ -323,6 +332,16 @@ class WorkspaceIteration:
     final_answer: str | None = None
     iteration_time: float | None = None
     error: str | None = None  # set when this turn aborted (e.g. parse-retry exhausted)
+    # Aggregated token usage for the parent LM call(s) in this turn (summed
+    # across parse-retry attempts). Populated for backends that surface
+    # ``usage`` on their completion result. Useful for spotting cases where
+    # the backend generated many tokens but most were dropped by its parser
+    # (e.g. ``completion_tokens`` >> length of ``reasoning + response``).
+    lm_usage: dict[str, int] | None = None
+    # Post-chat-template prompt the model actually sees on this turn — the
+    # system+tools envelope vLLM injects via the chat template plus the
+    # full message history with the generation cursor. Best-effort, vLLM-only.
+    rendered_prompt: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -338,6 +357,8 @@ class WorkspaceIteration:
             "final_answer": self.final_answer,
             "iteration_time": self.iteration_time,
             "error": self.error,
+            "lm_usage": self.lm_usage,
+            "rendered_prompt": self.rendered_prompt,
         }
 
 

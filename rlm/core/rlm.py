@@ -30,6 +30,7 @@ from datetime import datetime
 from typing import Any
 
 from rlm.clients import BaseLM, get_client
+from rlm.clients.openai import set_live_log_path
 from rlm.core.config import WorkspaceConfig
 from rlm.core.lm_handler import LMHandler
 from rlm.core.types import (
@@ -488,16 +489,30 @@ class RLM:
         iter_start = time.perf_counter()
         timestamp = datetime.now().isoformat()
 
+        # When a JSONL trajectory is being written, also tee streaming deltas
+        # to ``<jsonl>.live`` so an operator can ``tail -f`` the in-flight
+        # generation. No-op for non-vLLM backends (see set_live_log_path).
+        live_path: str | None = None
+        if self.logger is not None and getattr(self.logger, "log_file_path", None):
+            live_path = f"{self.logger.log_file_path}.live"
+
         try:
-            response, reasoning, actions, parse_attempts = self._call_lm_with_parse_retry(
-                lm_handler=lm_handler,
-                messages=list(message_history),
-            )
+            with set_live_log_path(live_path):
+                (
+                    response,
+                    reasoning,
+                    actions,
+                    parse_attempts,
+                    lm_usage,
+                    rendered_prompt,
+                ) = self._call_lm_with_parse_retry(
+                    lm_handler=lm_handler,
+                    messages=list(message_history),
+                )
         except ActionParseError as exc:
             # Build a partial iteration so the failed turn is visible in the
-            # log. The exception's `parse_attempts`/`last_response`/
-            # `last_reasoning` attributes are populated by
-            # `_call_lm_with_parse_retry` before raising.
+            # log. The exception's ``last_*`` attributes are populated by
+            # ``_call_lm_with_parse_retry`` before raising.
             partial = WorkspaceIteration(
                 iteration=iteration_idx,
                 timestamp=timestamp,
@@ -511,12 +526,23 @@ class RLM:
                 final_answer=None,
                 iteration_time=time.perf_counter() - iter_start,
                 error=str(exc),
+                lm_usage=getattr(exc, "last_lm_usage", None),
+                rendered_prompt=getattr(exc, "last_rendered_prompt", None),
             )
             exc.iteration = partial  # type: ignore[attr-defined]
             raise
 
-        observations = self._dispatch_actions(env=env, actions=actions)
-        snapshot = env.snapshot(turn=iteration_idx)
+        # No-op turn: ``tool_choice="auto"`` lets the model emit a prose-only
+        # response with no tool calls. Skip dispatch + snapshot — there is
+        # nothing to execute and the workspace is unchanged. The prompt
+        # renderer (``format_workspace_iteration``) injects a nudge for the
+        # next turn so the model knows it still needs to act.
+        if actions:
+            observations = self._dispatch_actions(env=env, actions=actions)
+            snapshot = env.snapshot(turn=iteration_idx)
+        else:
+            observations = []
+            snapshot = None
 
         final_answer: str | None = None
         for obs in observations:
@@ -536,6 +562,8 @@ class RLM:
             snapshot=snapshot,
             final_answer=final_answer,
             iteration_time=time.perf_counter() - iter_start,
+            lm_usage=lm_usage,
+            rendered_prompt=rendered_prompt,
         )
 
     def _call_lm_with_parse_retry(
@@ -543,17 +571,41 @@ class RLM:
         *,
         lm_handler: LMHandler,
         messages: list[dict[str, Any]],
-    ) -> tuple[str, str | None, list[WorkspaceAction], list[dict[str, Any]]]:
+    ) -> tuple[
+        str,
+        str | None,
+        list[WorkspaceAction],
+        list[dict[str, Any]],
+        dict[str, int] | None,
+        str | None,
+    ]:
         """Call the LM until a parseable response is produced or retries exhaust.
 
         Each retry appends a synthetic user feedback message to a *retry-only*
         copy of ``messages``; the main message history is unchanged. Returns
-        ``(response, reasoning, actions, parse_attempts)`` for the iteration
-        record. Raises ``ActionParseError`` if all retries fail.
+        ``(response, reasoning, actions, parse_attempts, lm_usage,
+        rendered_prompt)`` for the iteration record. ``lm_usage`` sums
+        per-call token counts across all attempts (so a turn that retried 3
+        times reports the full cost). ``rendered_prompt`` is the
+        post-chat-template prompt for the *final* attempt — i.e. what the
+        model actually saw to produce the returned response. Raises
+        ``ActionParseError`` if all retries fail.
         """
         retry_budget = self.workspace_config.parse.max_action_parse_retries
         attempts: list[dict[str, Any]] = []
         retry_messages = list(messages)
+        usage_total: dict[str, int] | None = None
+        rendered_prompt: str | None = None
+
+        def _accumulate(usage: dict[str, int] | None) -> None:
+            nonlocal usage_total
+            if usage is None:
+                return
+            if usage_total is None:
+                usage_total = dict(usage)
+                return
+            for k, v in usage.items():
+                usage_total[k] = usage_total.get(k, 0) + v
 
         for attempt in range(retry_budget + 1):  # +1 = initial try
             if self.workspace_config.parse.action_format == "native":
@@ -565,10 +617,19 @@ class RLM:
                         tools=build_openai_tools(include_rlm_query=self.depth < self.max_depth),
                         tool_choice=self.workspace_config.parse.native_tool_choice,
                     )
+                    _accumulate(result.usage)
+                    rendered_prompt = result.rendered_prompt
                     response = result.content
                     reasoning = result.reasoning_content
                     actions = actions_from_tool_calls(result.tool_calls)
-                    return result.content, result.reasoning_content, actions, attempts
+                    return (
+                        result.content,
+                        result.reasoning_content,
+                        actions,
+                        attempts,
+                        usage_total,
+                        rendered_prompt,
+                    )
                 except (ActionParseError, ValueError) as exc:
                     parse_exc = (
                         exc if isinstance(exc, ActionParseError) else ActionParseError(str(exc))
@@ -589,6 +650,8 @@ class RLM:
                         parse_exc.parse_attempts = list(attempts)  # type: ignore[attr-defined]
                         parse_exc.last_response = response  # type: ignore[attr-defined]
                         parse_exc.last_reasoning = reasoning  # type: ignore[attr-defined]
+                        parse_exc.last_lm_usage = usage_total  # type: ignore[attr-defined]
+                        parse_exc.last_rendered_prompt = rendered_prompt  # type: ignore[attr-defined]
                         raise parse_exc from None
 
                     feedback = build_native_tool_retry_message(str(parse_exc), parse_exc.fragment)
@@ -598,7 +661,7 @@ class RLM:
             response, reasoning = lm_handler.completion_with_reasoning(retry_messages)
             try:
                 actions = action_parser.parse(response)
-                return response, reasoning, actions, attempts
+                return response, reasoning, actions, attempts, usage_total, rendered_prompt
             except ActionParseError as exc:
                 attempts.append(
                     {
@@ -615,6 +678,8 @@ class RLM:
                     exc.parse_attempts = list(attempts)  # type: ignore[attr-defined]
                     exc.last_response = response  # type: ignore[attr-defined]
                     exc.last_reasoning = reasoning  # type: ignore[attr-defined]
+                    exc.last_lm_usage = usage_total  # type: ignore[attr-defined]
+                    exc.last_rendered_prompt = rendered_prompt  # type: ignore[attr-defined]
                     raise
 
                 feedback = build_parse_retry_message(str(exc), exc.fragment)

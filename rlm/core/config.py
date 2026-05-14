@@ -22,7 +22,7 @@ class ParseConfig:
 
     max_action_parse_retries: int = 3
     action_format: Literal["xml", "native"] = "native"
-    native_tool_choice: Literal["auto", "required"] = "required"
+    native_tool_choice: Literal["auto", "required"] = "auto"
 
     def __post_init__(self) -> None:
         if self.action_format == "xml":

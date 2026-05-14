@@ -156,8 +156,13 @@ def build_openai_tools(*, include_rlm_query: bool) -> list[dict[str, Any]]:
 
 
 def actions_from_tool_calls(calls: list[LMToolCall]) -> list[WorkspaceAction]:
+    # With ``tool_choice="auto"`` the model may legitimately emit a prose-only
+    # turn (no tool call). The substrate treats this as a no-op turn — the
+    # narration is preserved in ``iteration.response`` and the next prompt
+    # nudges the model to act. Returning an empty list (rather than raising)
+    # keeps the parse-retry loop out of this path.
     if not calls:
-        raise ActionParseError("No native tool calls returned by the model.")
+        return []
     actions: list[WorkspaceAction] = []
     for call in calls:
         if call.name not in _SCHEMAS:

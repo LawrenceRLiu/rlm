@@ -8,6 +8,7 @@ import { ActionCard } from './ActionCard';
 import { SnapshotPanel } from './SnapshotPanel';
 import { ParseRetriesPanel } from './ParseRetriesPanel';
 import { ReasoningCollapsible } from './ReasoningCollapsible';
+import { RenderedPromptCollapsible } from './RenderedPromptCollapsible';
 import { WorkspaceIteration, pairActionsWithObservations } from '@/lib/types';
 
 interface ActionPanelProps {
@@ -181,7 +182,7 @@ export function ActionPanel({ iteration }: ActionPanelProps) {
             </ScrollArea>
           </TabsContent>
 
-          {/* Meta tab: parse retries + reasoning */}
+          {/* Meta tab: parse retries + reasoning + rendered prompt */}
           <TabsContent
             value="meta"
             className="h-full m-0 data-[state=active]:flex data-[state=active]:flex-col"
@@ -190,6 +191,7 @@ export function ActionPanel({ iteration }: ActionPanelProps) {
               <div className="p-4 space-y-4">
                 <ParseRetriesPanel attempts={iteration.parse_attempts} />
                 <ReasoningCollapsible reasoning={iteration.reasoning} />
+                <RenderedPromptCollapsible renderedPrompt={iteration.rendered_prompt} />
               </div>
             </ScrollArea>
           </TabsContent>

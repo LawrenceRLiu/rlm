@@ -490,6 +490,13 @@ def main() -> None:
     parser.add_argument("--presence-penalty", type=float, default=None)
     parser.add_argument("--repetition-penalty", type=float, default=None)
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Per-request generation cap forwarded to the LM backend "
+        "(prevents runaway thinking traces from filling the context window).",
+    )
+    parser.add_argument(
         "--enable-thinking",
         action="store_true",
         help="Force enable_thinking=True (overrides the native-format default of False).",
@@ -554,6 +561,7 @@ def main() -> None:
         ("min_p", args.min_p),
         ("presence_penalty", args.presence_penalty),
         ("repetition_penalty", args.repetition_penalty),
+        ("max_tokens", args.max_tokens),
     ]:
         if val is not None:
             backend_kwargs[key] = val

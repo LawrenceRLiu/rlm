@@ -85,7 +85,7 @@ def _build_cmd(
         "--dtype", "bfloat16",
         "--max-num-seqs", str(max_num_seqs),
         "--limit-mm-per-prompt", '{"image":0,"video":0}',  # VL model; text-only KV layout
-        "--reasoning-parser", "qwen3",                     # <think> → reasoning_content
+        # "--reasoning-parser", "qwen3",                     # <think> → reasoning_content #comment out for now just to check some things
         "--enable-auto-tool-choice",
         "--tool-call-parser", tool_call_parser,
     ]
