@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from rlm.core.config import CompactionConfig, ParseConfig, WorkspaceConfig
+from rlm.core.config import CompactionConfig, LoopGuardConfig, ParseConfig, WorkspaceConfig
 from rlm.core.rlm import RLM
 from rlm.core.types import (
     RLMChatCompletion,
@@ -523,6 +523,93 @@ class TestActionDispatch:
         assert observations[2].final_answer is None
         # Env saw write_file + read_file; final gated out.
         assert env.run_action.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Loop guard
+# ---------------------------------------------------------------------------
+
+
+class TestLoopGuard:
+    def _rlm(self, *, enabled: bool = True) -> RLM:
+        cfg = WorkspaceConfig(
+            loop_guard=LoopGuardConfig(
+                stutter_warning_enabled=enabled,
+                repeated_action_warning_threshold=2,
+            )
+        )
+        return RLM(
+            backend="openai",
+            backend_kwargs={"model_name": "fake"},
+            workspace_config=cfg,
+        )
+
+    def _iteration(
+        self,
+        idx: int,
+        *,
+        path: str = "/app",
+        stdout: str = "Directory: /app\n  [empty directory]",
+        changed_files: list[str] | None = None,
+    ) -> WorkspaceIteration:
+        return WorkspaceIteration(
+            iteration=idx,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="",
+            reasoning=None,
+            actions=[
+                WorkspaceAction(
+                    tool="list_directory",
+                    args={"path": path},
+                    body=None,
+                    raw="{}",
+                )
+            ],
+            observations=[WorkspaceObservation(tool="list_directory", stdout=stdout)],
+            snapshot=WorkspaceSnapshot(
+                turn=idx,
+                commit_sha=f"{idx}" * 40,
+                changed_files=changed_files
+                if changed_files is not None
+                else ["_rlm_state/action_log.jsonl"],
+                workspace_root="/tmp/ws",
+            ),
+        )
+
+    def test_warns_after_repeated_identical_noop_turns(self) -> None:
+        rlm = self._rlm()
+        warning = rlm._stutter_warning_message([self._iteration(1), self._iteration(2)])
+        assert warning is not None
+        assert "repeated the same tool calls" in warning
+        assert "different concrete next step" in warning
+
+    def test_no_warning_when_workspace_changed_meaningfully(self) -> None:
+        rlm = self._rlm()
+        warning = rlm._stutter_warning_message(
+            [
+                self._iteration(1),
+                self._iteration(2, changed_files=["_rlm_state/action_log.jsonl", "app/caffe"]),
+            ]
+        )
+        assert warning is None
+
+    def test_no_warning_when_actions_or_observations_differ(self) -> None:
+        rlm = self._rlm()
+        assert (
+            rlm._stutter_warning_message([self._iteration(1), self._iteration(2, path=".")]) is None
+        )
+        assert (
+            rlm._stutter_warning_message(
+                [self._iteration(1), self._iteration(2, stdout="Directory: /app\n  file")]
+            )
+            is None
+        )
+
+    def test_no_warning_when_disabled(self) -> None:
+        rlm = self._rlm(enabled=False)
+        warning = rlm._stutter_warning_message([self._iteration(1), self._iteration(2)])
+        assert warning is None
 
 
 # ---------------------------------------------------------------------------

@@ -81,6 +81,20 @@ class CompactionConfig:
 
 
 @dataclass
+class LoopGuardConfig:
+    """Trajectory-level nudges that reduce degenerate loops without gating tools."""
+
+    # When enabled, if the model repeats the exact same action batch and gets
+    # the same observations for ``repeated_action_warning_threshold``
+    # consecutive turns without meaningful workspace changes, the substrate
+    # appends a short warning to the next prompt. Actions are not blocked.
+    stutter_warning_enabled: bool = True
+    repeated_action_warning_threshold: int = 2
+    # Paths with these prefixes are substrate bookkeeping, not task progress.
+    stutter_ignored_change_prefixes: tuple[str, ...] = ("_rlm_state/",)
+
+
+@dataclass
 class RecursionConfig:
     """rlm_query recursion knobs."""
 
@@ -158,6 +172,7 @@ class WorkspaceConfig:
     parse: ParseConfig = field(default_factory=ParseConfig)
     observation: ObservationConfig = field(default_factory=ObservationConfig)
     compaction: CompactionConfig = field(default_factory=CompactionConfig)
+    loop_guard: LoopGuardConfig = field(default_factory=LoopGuardConfig)
     recursion: RecursionConfig = field(default_factory=RecursionConfig)
     docker: DockerConfig = field(default_factory=DockerConfig)
     lm: LMConfig = field(default_factory=LMConfig)

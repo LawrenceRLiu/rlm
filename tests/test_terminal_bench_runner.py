@@ -135,6 +135,8 @@ class TestBuildPrompt:
         # Native runs should not be steered toward XML final actions.
         assert '<action tool="final"' not in prompt
         assert "Internet access is enabled for this task." in prompt
+        assert "hidden verifier" in prompt
+        assert "/tests/test.sh" not in prompt
         # Tells the agent how to finish.
         assert "final" in prompt
 

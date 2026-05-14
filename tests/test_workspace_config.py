@@ -5,6 +5,7 @@ import pytest
 from rlm.core.config import (
     CompactionConfig,
     DockerConfig,
+    LoopGuardConfig,
     ObservationConfig,
     ParseConfig,
     RecursionConfig,
@@ -23,6 +24,9 @@ def test_workspace_config_defaults():
     assert cfg.compaction.enabled is True
     assert cfg.compaction.threshold_tokens == 64_000
     assert cfg.compaction.tail_turns_preserved == 0
+    assert cfg.loop_guard.stutter_warning_enabled is True
+    assert cfg.loop_guard.repeated_action_warning_threshold == 2
+    assert cfg.loop_guard.stutter_ignored_change_prefixes == ("_rlm_state/",)
     assert cfg.recursion.max_concurrent_subcalls == 5
     assert cfg.recursion.copy_on_spawn_max_file_bytes == 50 * 1024 * 1024
     assert ".git" in cfg.recursion.copy_on_spawn_excludes
@@ -43,6 +47,7 @@ def test_workspace_config_overrides():
         parse=ParseConfig(max_action_parse_retries=7),
         observation=ObservationConfig(max_observation_chars=32_000),
         compaction=CompactionConfig(threshold_tokens=16_000, tail_turns_preserved=2),
+        loop_guard=LoopGuardConfig(repeated_action_warning_threshold=3),
         recursion=RecursionConfig(max_concurrent_subcalls=2),
         docker=DockerConfig(image="custom:latest", exec_timeout_seconds=60),
     )
@@ -50,6 +55,7 @@ def test_workspace_config_overrides():
     assert cfg.observation.max_observation_chars == 32_000
     assert cfg.compaction.threshold_tokens == 16_000
     assert cfg.compaction.tail_turns_preserved == 2
+    assert cfg.loop_guard.repeated_action_warning_threshold == 3
     assert cfg.recursion.max_concurrent_subcalls == 2
     assert cfg.docker.image == "custom:latest"
     assert cfg.docker.exec_timeout_seconds == 60

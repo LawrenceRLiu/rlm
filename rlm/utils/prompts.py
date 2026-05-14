@@ -10,6 +10,11 @@ from rlm.core.types import (
 from rlm.utils.action_parser import strip_reasoning_blocks
 from rlm.utils.native_tools import body_arg_name
 
+# TODO: Surface this as an observation/prompt-rendering config knob if we need
+# per-benchmark tuning. For now, keep model-facing shell/python artifact lists
+# short while preserving full artifacts in logs and structured observations.
+MAX_RENDERED_ARTIFACT_PATHS = 5
+
 WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     """\
     You are an autonomous reasoning agent operating in a durable workspace.
@@ -401,7 +406,7 @@ def render_observation(
             parts.append("stderr:")
             parts.append(observation.stderr.rstrip())
         if observation.artifacts:
-            parts.append("artifacts: " + ", ".join(observation.artifacts))
+            parts.append("artifacts: " + format_artifact_paths(observation.artifacts))
         if observation.final_answer is not None:
             parts.append(f"final: {observation.final_answer}")
             if observation.final_artifacts:
@@ -417,13 +422,27 @@ def render_observation(
         parts.append("[stderr]")
         parts.append(observation.stderr.rstrip())
     if observation.artifacts:
-        parts.append("[artifacts] " + ", ".join(observation.artifacts))
+        parts.append("[artifacts] " + format_artifact_paths(observation.artifacts))
     if observation.final_answer is not None:
         parts.append(f"[final] {observation.final_answer}")
         if observation.final_artifacts:
             parts.append("[final artifacts] " + ", ".join(observation.final_artifacts))
     parts.append("</observation>")
     return "\n".join(parts)
+
+
+def format_artifact_paths(paths: list[str]) -> str:
+    """Render artifact paths for model-facing prompt replay."""
+    shown = paths[:MAX_RENDERED_ARTIFACT_PATHS]
+    rendered = ", ".join(shown)
+    omitted = len(paths) - len(shown)
+    if omitted <= 0:
+        return rendered
+    return (
+        f"{rendered}, ... "
+        f"[showing {len(shown)} of {len(paths)} paths; {omitted} omitted. "
+        "Use list_directory/read_file to inspect specific files.]"
+    )
 
 
 def format_workspace_iteration(

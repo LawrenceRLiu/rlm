@@ -22,6 +22,7 @@ action.
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -373,6 +374,9 @@ class RLM:
                         action_format=self.workspace_config.parse.action_format,
                     )
                 )
+                stutter_warning = self._stutter_warning_message(completed_iterations)
+                if stutter_warning is not None:
+                    message_history.append({"role": "user", "content": stutter_warning})
 
                 if self.workspace_config.compaction.enabled and self._should_compact(
                     message_history, lm_handler
@@ -392,6 +396,9 @@ class RLM:
                             action_format=self.workspace_config.parse.action_format,
                         )
                     )
+                    stutter_warning = self._stutter_warning_message(completed_iterations)
+                    if stutter_warning is not None:
+                        message_history.append({"role": "user", "content": stutter_warning})
 
                 try:
                     iteration = self._completion_turn(
@@ -662,6 +669,40 @@ class RLM:
             if obs.error is not None and spec.is_state_mutating:
                 halted = True
         return observations
+
+    def _stutter_warning_message(
+        self, completed_iterations: list[WorkspaceIteration]
+    ) -> str | None:
+        cfg = self.workspace_config.loop_guard
+        if not cfg.stutter_warning_enabled:
+            return None
+        threshold = cfg.repeated_action_warning_threshold
+        if threshold < 2 or len(completed_iterations) < threshold:
+            return None
+
+        window = completed_iterations[-threshold:]
+        first_action_sig = _action_batch_signature(window[0])
+        if not first_action_sig:
+            return None
+        first_obs_sig = _observation_batch_signature(window[0])
+        for iteration in window:
+            if _has_meaningful_workspace_changes(
+                iteration,
+                ignored_prefixes=cfg.stutter_ignored_change_prefixes,
+            ):
+                return None
+            if _action_batch_signature(iteration) != first_action_sig:
+                return None
+            if _observation_batch_signature(iteration) != first_obs_sig:
+                return None
+
+        return (
+            "Loop guard: the last "
+            f"{threshold} turns repeated the same tool calls and received the "
+            "same observations, with no task-workspace changes. Use those "
+            "observations and take a different concrete next step; do not "
+            "repeat the same calls again unless something external has changed."
+        )
 
     # =========================================================================
     # Stop-condition checks
@@ -988,6 +1029,49 @@ def _final_artifacts_from_iteration(iteration: WorkspaceIteration) -> list[str]:
         if obs.final_answer is not None:
             return list(obs.final_artifacts)
     return []
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=repr)
+
+
+def _action_batch_signature(iteration: WorkspaceIteration) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (
+            action.tool,
+            _stable_json(action.args),
+            action.body or "",
+        )
+        for action in iteration.actions
+    )
+
+
+def _observation_batch_signature(
+    iteration: WorkspaceIteration,
+) -> tuple[tuple[str, str, str, str, tuple[str, ...]], ...]:
+    return tuple(
+        (
+            obs.tool,
+            obs.error or "",
+            obs.stdout or "",
+            obs.stderr or "",
+            tuple(obs.artifacts),
+        )
+        for obs in iteration.observations
+    )
+
+
+def _has_meaningful_workspace_changes(
+    iteration: WorkspaceIteration,
+    *,
+    ignored_prefixes: tuple[str, ...],
+) -> bool:
+    if iteration.snapshot is None:
+        return True
+    for path in iteration.snapshot.changed_files:
+        if not any(path.startswith(prefix) for prefix in ignored_prefixes):
+            return True
+    return False
 
 
 # Re-export for callers that previously used ``UsageSummary`` from this module.
