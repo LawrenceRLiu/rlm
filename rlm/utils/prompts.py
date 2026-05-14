@@ -1,6 +1,7 @@
 import json
 import textwrap
 from html import escape
+from typing import Any
 
 from rlm.core.types import (
     WorkspaceAction,
@@ -447,20 +448,37 @@ def format_workspace_iteration(
     iteration: WorkspaceIteration,
     *,
     action_format: str = "native",
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Convert a completed ``WorkspaceIteration`` into next-turn messages.
 
-    Returns two messages: an assistant-side action replay and a synthetic
-    user message containing the rendered observations plus a one-line
-    snapshot summary. Parse-retry attempts are NOT included here; they live
-    in ``iteration.parse_attempts`` for the visualizer.
+    For ``action_format == "native"`` (default) we emit OpenAI Chat
+    Completions-shaped messages: an ``assistant`` message carrying any
+    parsed tool calls as structured ``tool_calls`` (not inline text), one
+    ``role: "tool"`` message per observation keyed by ``tool_call_id``, and
+    a trailing ``user`` message for the workspace snapshot summary and/or
+    no-op nudge. This lets the backend chat template (e.g. Qwen3's
+    ``<tool_call><function=...>`` XML) render the assistant's history in
+    the model's *native* tool-call format. Rendering past tool calls as
+    plain text (``TOOL_CALL t<N>.a<M> tool=... args=... body=...``) caused
+    the model to mimic that text pattern on subsequent turns, producing
+    prose that looks like a tool call but lives in ``message.content`` —
+    the tool parser sees no XML and the substrate sees ``actions=[]``.
 
-    When a turn had no parsed actions, the assistant ``content`` falls back
-    to the stripped raw response. Google and Alibaba both document
-    multi-turn semantics where the prior turn's thought is dropped on
-    replay; the strip also avoids paying input-token cost for monologue the
-    substrate already discarded.
+    For the deprecated ``action_format == "xml"`` path we still return a
+    two-message list of ``assistant`` + ``user`` with the plain-text
+    replay. Parse-retry attempts are NOT included here; they live in
+    ``iteration.parse_attempts`` for the visualizer.
+
+    The model's free-form pre-tool-call narration (``iteration.response``
+    after stripping ``<think>...</think>`` and ``<|channel|>`` blocks) is
+    placed in the assistant message's ``content`` field in both paths, so
+    intent carries across turns.
     """
+    narration = strip_reasoning_blocks(iteration.response).strip()
+
+    if action_format == "native":
+        return _format_workspace_iteration_native(iteration, narration)
+
     action_chunks: list[str] = []
     for idx, action in enumerate(iteration.actions):
         action_id = f"t{iteration.iteration}.a{idx + 1}"
@@ -488,29 +506,15 @@ def format_workspace_iteration(
     if iteration.snapshot is not None:
         snap = iteration.snapshot
         changed = ", ".join(snap.changed_files) if snap.changed_files else "(no changes)"
-        if action_format == "native":
-            obs_chunks.append(
-                f"SNAPSHOT turn={snap.turn} commit={snap.commit_sha[:7]}\nchanged: {changed}"
-            )
-        else:
-            obs_chunks.append(
-                f'<snapshot turn="{snap.turn}" commit="{snap.commit_sha[:7]}">'
-                f"\nchanged: {changed}\n</snapshot>"
-            )
+        obs_chunks.append(
+            f'<snapshot turn="{snap.turn}" commit="{snap.commit_sha[:7]}">'
+            f"\nchanged: {changed}\n</snapshot>"
+        )
 
-    # Preserve the model's free-form narration (pre-first-tool-call prose from
-    # ``message.content`` after the hermes parser strips ``<tool_call>``
-    # blocks). Without this, the assistant turn replayed in subsequent prompts
-    # is tool-calls-only and the model loses continuity of intent. Mirrors
-    # upstream RLM's behavior of re-feeding the full assistant response.
-    narration = strip_reasoning_blocks(iteration.response).strip()
     if action_chunks:
         assistant_chunks = ([narration] if narration else []) + action_chunks
         assistant_content = "\n\n".join(assistant_chunks)
     else:
-        # No-op turn: ``tool_choice="auto"`` lets the model emit prose with no
-        # tool call. Replay the prose; the user-side nudge below tells the
-        # model the workspace is unchanged and it still needs to act.
         assistant_content = narration
 
     if obs_chunks:
@@ -526,13 +530,98 @@ def format_workspace_iteration(
     ]
 
 
+def _format_workspace_iteration_native(
+    iteration: WorkspaceIteration,
+    narration: str,
+) -> list[dict[str, Any]]:
+    """Native-tools rendering of a completed iteration.
+
+    Produces ``assistant`` (with structured ``tool_calls``) + one ``tool``
+    message per observation + an optional trailing ``user`` message for
+    snapshot and/or no-op nudge.
+    """
+    tool_calls: list[dict[str, Any]] = []
+    call_ids: list[str] = []
+    for idx, action in enumerate(iteration.actions):
+        action_id = f"t{iteration.iteration}.a{idx + 1}"
+        call_id = action.call_id or action_id
+        call_ids.append(call_id)
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": action.tool,
+                    "arguments": json.dumps(action.args, ensure_ascii=False),
+                },
+            }
+        )
+
+    assistant_msg: dict[str, Any] = {"role": "assistant", "content": narration}
+    if tool_calls:
+        assistant_msg["tool_calls"] = tool_calls
+    messages: list[dict[str, Any]] = [assistant_msg]
+
+    for idx, observation in enumerate(iteration.observations):
+        action_id = f"t{iteration.iteration}.a{idx + 1}"
+        call_id = call_ids[idx] if idx < len(call_ids) else action_id
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": _render_observation_native_body(observation),
+            }
+        )
+
+    extras: list[str] = []
+    if iteration.snapshot is not None:
+        snap = iteration.snapshot
+        changed = ", ".join(snap.changed_files) if snap.changed_files else "(no changes)"
+        extras.append(
+            f"SNAPSHOT turn={snap.turn} commit={snap.commit_sha[:7]}\nchanged: {changed}"
+        )
+    if not tool_calls:
+        extras.append("No tool calls made; workspace unchanged. State your next action.")
+
+    if extras:
+        messages.append({"role": "user", "content": "\n\n".join(extras)})
+
+    return messages
+
+
+def _render_observation_native_body(observation: WorkspaceObservation) -> str:
+    """Plain-text body for a ``role: "tool"`` message.
+
+    No ``OBSERVATION t<N>.a<M>`` correlator header — the ``role: "tool"``
+    envelope plus matching ``tool_call_id`` already provide correlation,
+    and emitting the header invited the same format-mimicry bug the
+    structured-replay refactor is meant to fix.
+    """
+    status = "error" if observation.error else "ok"
+    parts = [f"status={status}"]
+    if observation.error:
+        parts.append(f"error: {observation.error}")
+    if observation.stdout:
+        parts.append(observation.stdout.rstrip())
+    if observation.stderr:
+        parts.append("stderr:")
+        parts.append(observation.stderr.rstrip())
+    if observation.artifacts:
+        parts.append("artifacts: " + format_artifact_paths(observation.artifacts))
+    if observation.final_answer is not None:
+        parts.append(f"final: {observation.final_answer}")
+        if observation.final_artifacts:
+            parts.append("final artifacts: " + ", ".join(observation.final_artifacts))
+    return "\n".join(parts)
+
+
 def format_workspace_history(
     iterations: list[WorkspaceIteration],
     *,
     action_format: str = "native",
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Render completed iterations for model-facing prompt replay."""
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, Any]] = []
     for iteration in iterations:
         messages.extend(
             format_workspace_iteration(

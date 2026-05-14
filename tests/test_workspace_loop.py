@@ -198,7 +198,14 @@ class TestFormatWorkspaceIteration:
         assert "Directory: ." in joined
         assert "omitted from replay" not in joined
 
-    def test_native_replay_does_not_emit_xml_tags(self):
+    def test_native_replay_uses_structured_tool_calls(self):
+        """Native action_format must hand prior tool calls back as OpenAI
+        structured ``tool_calls`` on an ``assistant`` message + matching
+        ``role: "tool"`` messages, never as plain-text ``TOOL_CALL ...``
+        prose. The plain-text form was getting mimicked by the model and
+        producing zero-action turns; see prompts.format_workspace_iteration."""
+        import json
+
         action = WorkspaceAction(
             tool="run_python_command",
             args={"code": "print('x')\n", "timeout": 10},
@@ -211,26 +218,112 @@ class TestFormatWorkspaceIteration:
             iteration=1,
             timestamp="2026-01-01T00:00:00",
             prompt=[],
-            response="",
+            response="here goes",
             reasoning=None,
             actions=[action],
             observations=[obs],
         )
         msgs = format_workspace_iteration(it)
-        text = "\n".join(msg["content"] for msg in msgs)
-        assert "TOOL_CALL t1.a1 tool=run_python_command" in text
-        assert "OBSERVATION t1.a1 tool=run_python_command" in text
-        assert "<action" not in text
-        assert "<observation" not in text
+        assert [m["role"] for m in msgs] == ["assistant", "tool"]
 
-    def test_native_replay_does_not_duplicate_body_in_args(self):
+        assistant = msgs[0]
+        assert assistant["content"] == "here goes"
+        assert len(assistant["tool_calls"]) == 1
+        call = assistant["tool_calls"][0]
+        assert call["id"] == "call_1"
+        assert call["type"] == "function"
+        assert call["function"]["name"] == "run_python_command"
+        # The body-bearing arg ("code") round-trips inside the structured
+        # arguments JSON. The chat template will render it natively.
+        assert json.loads(call["function"]["arguments"]) == {
+            "code": "print('x')\n",
+            "timeout": 10,
+        }
+
+        tool_msg = msgs[1]
+        assert tool_msg["tool_call_id"] == "call_1"
+        assert "status=ok" in tool_msg["content"]
+        assert "x" in tool_msg["content"]
+
+        # Plain-text mimicry sources are gone everywhere.
+        joined_text = "\n".join(
+            m.get("content", "") for m in msgs if isinstance(m.get("content"), str)
+        )
+        assert "TOOL_CALL t1.a1" not in joined_text
+        assert "OBSERVATION t1.a1" not in joined_text
+        assert "<action" not in joined_text
+        assert "<observation" not in joined_text
+
+    def test_native_replay_falls_back_to_action_id_when_call_id_missing(self):
+        action = WorkspaceAction(
+            tool="read_file",
+            args={"path": "a.md"},
+            body=None,
+            raw="{}",
+            call_id=None,
+        )
+        it = WorkspaceIteration(
+            iteration=3,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="",
+            reasoning=None,
+            actions=[action],
+            observations=[WorkspaceObservation(tool="read_file", stdout="hi")],
+        )
+        msgs = format_workspace_iteration(it)
+        assert msgs[0]["tool_calls"][0]["id"] == "t3.a1"
+        assert msgs[1]["tool_call_id"] == "t3.a1"
+
+    def test_native_replay_snapshot_emitted_as_trailing_user_message(self):
+        action = WorkspaceAction(
+            tool="read_file", args={"path": "a"}, body=None, raw="", call_id="c1"
+        )
+        snap = WorkspaceSnapshot(
+            turn=4, commit_sha="deadbeef1234", changed_files=["a", "b"], workspace_root="/w"
+        )
+        it = WorkspaceIteration(
+            iteration=4,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="",
+            reasoning=None,
+            actions=[action],
+            observations=[WorkspaceObservation(tool="read_file", stdout="ok")],
+            snapshot=snap,
+        )
+        msgs = format_workspace_iteration(it)
+        assert [m["role"] for m in msgs] == ["assistant", "tool", "user"]
+        assert "SNAPSHOT turn=4 commit=deadbee" in msgs[-1]["content"]
+        assert "a, b" in msgs[-1]["content"]
+
+    def test_native_replay_no_actions_emits_nudge(self):
+        """No-op turn (``tool_choice="auto"`` allows prose-only): assistant
+        message carries narration, trailing user message nudges the model
+        to act, and no ``tool_calls`` field is emitted."""
+        it = WorkspaceIteration(
+            iteration=2,
+            timestamp="2026-01-01T00:00:00",
+            prompt=[],
+            response="just thinking out loud",
+            reasoning=None,
+            actions=[],
+            observations=[],
+        )
+        msgs = format_workspace_iteration(it)
+        assert [m["role"] for m in msgs] == ["assistant", "user"]
+        assert msgs[0]["content"] == "just thinking out loud"
+        assert "tool_calls" not in msgs[0]
+        assert "No tool calls made" in msgs[1]["content"]
+
+    def test_native_replay_preserves_body_in_arguments_payload(self):
         """The body-bearing arg (write_file.content, run_shell_command.command,
-        run_python_command.code, llm_query/rlm_query.prompt) is mirrored into
-        ``action.body`` by the native parser. The replay must render it once,
-        not twice — duplication doubled the prompt for every write/shell/query
-        and confused the model. See native_tools.body_arg_name."""
-        # write_file: content arg should be stripped from rendered args, but
-        # file_path (the non-body arg) must still appear.
+        run_python_command.code, llm_query/rlm_query.prompt) is sent back as
+        part of the structured ``arguments`` JSON, not split out into a
+        separate ``body:`` text section. The chat template controls how it
+        gets rendered to the model — our job is just to round-trip args."""
+        import json
+
         action = WorkspaceAction(
             tool="write_file",
             args={"file_path": "draft.md", "content": "BODY_PAYLOAD_X"},
@@ -247,58 +340,15 @@ class TestFormatWorkspaceIteration:
             actions=[action],
             observations=[WorkspaceObservation(tool="write_file", stdout="ok")],
         )
-        text = "\n".join(m["content"] for m in format_workspace_iteration(it))
-        # body shown exactly once (under "body:") — not also inside args=
-        assert text.count("BODY_PAYLOAD_X") == 1
-        assert "body:" in text
-        assert '"file_path": "draft.md"' in text
-        assert '"content"' not in text
-
-        # run_python_command: code arg should be stripped; timeout retained.
-        action = WorkspaceAction(
-            tool="run_python_command",
-            args={"code": "print('PYBODY')", "timeout": 10},
-            body="print('PYBODY')",
-            raw="{}",
-            call_id="call_p",
+        msgs = format_workspace_iteration(it)
+        args = json.loads(msgs[0]["tool_calls"][0]["function"]["arguments"])
+        assert args == {"file_path": "draft.md", "content": "BODY_PAYLOAD_X"}
+        # No plain-text "body:" section anywhere — the structured rendering
+        # supersedes it.
+        joined = "\n".join(
+            m.get("content", "") for m in msgs if isinstance(m.get("content"), str)
         )
-        it = WorkspaceIteration(
-            iteration=1,
-            timestamp="2026-01-01T00:00:00",
-            prompt=[],
-            response="",
-            reasoning=None,
-            actions=[action],
-            observations=[WorkspaceObservation(tool="run_python_command", stdout="ok")],
-        )
-        text = "\n".join(m["content"] for m in format_workspace_iteration(it))
-        assert text.count("PYBODY") == 1
-        assert '"timeout": 10' in text
-        assert '"code"' not in text
-
-    def test_native_replay_keeps_args_for_bodyless_tools(self):
-        """For tools without a body arg (list_directory, read_file), args
-        must still render verbatim."""
-        action = WorkspaceAction(
-            tool="read_file",
-            args={"path": "a.md", "start_line": 1, "end_line": 5},
-            body=None,
-            raw="{}",
-            call_id="call_r",
-        )
-        it = WorkspaceIteration(
-            iteration=1,
-            timestamp="2026-01-01T00:00:00",
-            prompt=[],
-            response="",
-            reasoning=None,
-            actions=[action],
-            observations=[WorkspaceObservation(tool="read_file", stdout="contents")],
-        )
-        text = "\n".join(m["content"] for m in format_workspace_iteration(it))
-        assert '"path": "a.md"' in text
-        assert '"start_line": 1' in text
-        assert "body:" not in text
+        assert "body:" not in joined
 
 
 # ---------------------------------------------------------------------------
