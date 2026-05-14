@@ -150,8 +150,13 @@ class ProvenanceStore:
     # -- helpers -----------------------------------------------------------
     @staticmethod
     def _normalize(path: str) -> str:
-        # Store paths workspace-relative, with forward slashes, no leading "./".
+        # Store paths workspace-relative, with forward slashes, no leading
+        # "/" or "./". Tools accept container-absolute paths under bind roots
+        # (for example "/app/out.txt"), but provenance lookups from directory
+        # walks use workspace-relative keys ("app/out.txt").
         s = str(path).replace("\\", "/")
+        if s.startswith("/"):
+            s = s.lstrip("/")
         if s.startswith("./"):
             s = s[2:]
         return s

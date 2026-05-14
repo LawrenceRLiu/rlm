@@ -18,8 +18,8 @@ SPEC = ToolSpec(
     runs_on="host",
     body_required=False,
     example=(
-        'Required attr: path (workspace-relative; absolute paths rejected). '
-        'Optional: start_line, end_line. '
+        "Required attr: path (workspace-relative; absolute paths rejected). "
+        "Optional: start_line, end_line. "
         'Example: <action tool="read_file" path="notes.md" start_line="1" end_line="50"/>'
     ),
 )
@@ -109,7 +109,7 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
     modified = prov.modified.role if prov else "user"
     header = (
         f"[File: {rel} | Lines: {start_line}-{end_line}/{total} | "
-        f"Created: {created} | Modified: {modified}]"
+        f"Created: {created} | Last modified: {modified}]"
     )
     return WorkspaceObservation(
         tool=SPEC.name,

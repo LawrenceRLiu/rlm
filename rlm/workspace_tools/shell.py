@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from shlex import quote as sh_quote
 from typing import TYPE_CHECKING
 
 from rlm.core.types import WorkspaceAction, WorkspaceObservation
@@ -56,8 +55,8 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
             error="Background shell commands are not supported yet; set is_background=false.",
             execution_time=time.perf_counter() - start,
         )
-    # cwd: accept either ``directory`` (legacy) or ``cwd``; default = image
-    # WORKDIR (set at container start to docker.container_cwd, typically /app).
+    # cwd: accept either ``directory`` (legacy) or ``cwd``; default = docker
+    # container_cwd, which is normally the workspace root (/).
     cwd_arg = action.args.get("cwd") or action.args.get("directory")
     container_cwd: str | None = None
     if cwd_arg not in (None, ""):

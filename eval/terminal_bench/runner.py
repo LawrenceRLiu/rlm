@@ -64,6 +64,7 @@ class TaskSpec:
     task_dir: Path
     agent_timeout_sec: float
     verifier_timeout_sec: float
+    allow_internet: bool
     workdir: str  # target directory inside the container
 
     @classmethod
@@ -71,16 +72,20 @@ class TaskSpec:
         meta = tomllib.loads((task_dir / "task.toml").read_text(encoding="utf-8"))
         agent_timeout = float(meta.get("agent", {}).get("timeout_sec", 120.0))
         verifier_timeout = float(meta.get("verifier", {}).get("timeout_sec", 120.0))
+        env_meta = meta.get("environment", {})
         # WORKDIR is set either via [environment].workdir (Harbor extension)
         # or via the task's Dockerfile. We read it from task.toml when
         # available; otherwise default to /app which is the convention in the
         # Harbor examples we surveyed.
-        workdir = meta.get("environment", {}).get("workdir", "/app")
+        workdir = env_meta.get("workdir", "/app")
+        # Harbor defaults to internet access unless the task disables it.
+        allow_internet = bool(env_meta.get("allow_internet", True))
         return cls(
             task_id=task_dir.name,
             task_dir=task_dir,
             agent_timeout_sec=agent_timeout,
             verifier_timeout_sec=verifier_timeout,
+            allow_internet=allow_internet,
             workdir=workdir,
         )
 
@@ -142,26 +147,30 @@ def build_prompt(task: TaskSpec) -> str:
         f"container after you finish.\n"
         "\n"
         "Workspace layout (everything-at-root, bind-mounted into the container):\n"
-        f"- `/app` — task workdir; the grader evaluates this. Default cwd for "
-        "`shell` and `python` actions, default `PYTHONPATH` for `python`.\n"
+        "- `/` — default cwd for shell and python actions; contains the bind-mounted "
+        "task and substrate directories below.\n"
+        f"- `{task.workdir}` — task workdir; the grader evaluates this.\n"
+        "- `/app` — task files are mounted here; python actions include `/app` "
+        "on `PYTHONPATH`.\n"
         "- `/_rlm_notes` — scratchpad for notes you want to persist across turns.\n"
         "- `/_rlm_artifacts` — outputs/spillovers (substrate-managed; you can read).\n"
         "- `/_rlm_state` — substrate state (read-only from your perspective).\n"
         "\n"
         "Tools:\n"
-        "- File tools (`read_file`, `write_file`, `edit_file`, `append_file`, "
+        "- File tools (`read_file`, `write_file`, `edit`, `append_file`, "
         "`list_directory`) accept either workspace-relative (`app/output.txt`) "
         "or container-absolute (`/app/output.txt`) paths — both work.\n"
-        "- `shell` and `python` run in `/app` by default. Pass `cwd=` to "
-        "override.\n"
+        "- Shell and python actions run in `/` by default. Pass `directory=` "
+        "for shell or `cwd=` for python to override.\n"
+        f"- Internet access is {'enabled' if task.allow_internet else 'disabled'} "
+        "for this task.\n"
         "\n"
         "Important rules:\n"
         "- Before emitting `final`, if you wrote code that should be tested, "
         "run the task's test suite (`bash /tests/test.sh` or the project's "
         "own test runner if present) and observe it pass. Smoke tests are "
         "not sufficient evidence of success.\n"
-        '- When done, emit `<action tool="final"><answer>done'
-        "</answer></action>`.\n"
+        "- When done, call the `final` tool with `answer` set to `done`.\n"
         "\n"
         "Task:\n"
         f"{instruction}\n"
@@ -256,6 +265,7 @@ def run_task(
         "image": composite_tag,
         "cleanup_mode": "delete",
         "exec_timeout_seconds": int(task.agent_timeout_sec),
+        "allow_internet": task.allow_internet,
     }
     if workspace_root_base is not None:
         docker_kwargs["workspace_root_base"] = workspace_root_base

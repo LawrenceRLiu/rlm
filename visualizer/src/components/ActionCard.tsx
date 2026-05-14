@@ -10,7 +10,7 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible';
 import { cn } from '@/lib/utils';
-import { ActionObservationPair } from '@/lib/types';
+import { ActionObservationPair, observationHasError } from '@/lib/types';
 import { CodeWithLineNumbers } from './CodeWithLineNumbers';
 import { useDrillDepth, useDrillStack } from './DrillStack';
 
@@ -94,7 +94,7 @@ export function ActionCard({ pair }: ActionCardProps) {
   const drillDepth = useDrillDepth();
   const style = toolStyle(action.tool);
 
-  const hasError = !!observation?.error || !!observation?.stderr;
+  const hasError = observationHasError(observation);
   const hasStdout = !!observation?.stdout && observation.stdout.length > 0;
   const subCallCount = observation?.rlm_calls?.length ?? 0;
   const artifactCount = observation?.artifacts?.length ?? 0;

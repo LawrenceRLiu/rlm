@@ -78,6 +78,7 @@ class TestTaskSpec:
         assert spec.agent_timeout_sec == 120.0
         assert spec.verifier_timeout_sec == 120.0
         assert spec.workdir == "/app"
+        assert spec.allow_internet is True
 
     def test_workdir_override_from_environment_section(self, tmp_path: Path) -> None:
         task_dir = _write_task_dir(
@@ -87,6 +88,15 @@ class TestTaskSpec:
         )
         spec = TaskSpec.from_dir(task_dir)
         assert spec.workdir == "/custom-workdir"
+
+    def test_allow_internet_override_from_environment_section(self, tmp_path: Path) -> None:
+        task_dir = _write_task_dir(
+            tmp_path,
+            "internet",
+            toml="[task]\nname='x'\n[environment]\nallow_internet = false\n",
+        )
+        spec = TaskSpec.from_dir(task_dir)
+        assert spec.allow_internet is False
 
 
 # ---------------------------------------------------------------------------
@@ -115,12 +125,28 @@ class TestBuildPrompt:
         spec = TaskSpec.from_dir(task_dir)
         prompt = build_prompt(spec)
         # The custom workdir is referenced in the framing (both in the
-        # rule and in the example shell command).
+        # rule and in the workspace layout).
         assert "/custom-workdir" in prompt
-        # Reminds the agent the host-side file tools target /workspace.
-        assert "/workspace" in prompt
+        # The runner no longer advertises the removed /workspace shadow layout.
+        assert "/workspace" not in prompt
+        # Default cwd is the container root, not /app.
+        assert "run in `/` by default" in prompt
+        assert "run in `/app` by default" not in prompt
+        # Native runs should not be steered toward XML final actions.
+        assert '<action tool="final"' not in prompt
+        assert "Internet access is enabled for this task." in prompt
         # Tells the agent how to finish.
         assert "final" in prompt
+
+    def test_advertises_disabled_internet(self, tmp_path: Path) -> None:
+        task_dir = _write_task_dir(
+            tmp_path,
+            "p",
+            toml="[task]\nname='x'\n[environment]\nallow_internet=false\n",
+        )
+        spec = TaskSpec.from_dir(task_dir)
+        prompt = build_prompt(spec)
+        assert "Internet access is disabled for this task." in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +479,27 @@ class TestRunTask:
         assert rlm_kwargs["workspace_config"].docker.exec_timeout_seconds == 42
         # cleanup_mode is forced to "delete" for batch runs.
         assert rlm_kwargs["workspace_config"].docker.cleanup_mode == "delete"
+
+    def test_passes_allow_internet_into_workspace_config(self, tmp_path: Path) -> None:
+        task_dir = _write_task_dir(
+            tmp_path,
+            "net",
+            toml="[task]\nname='x'\n[environment]\nallow_internet=false\n",
+        )
+        spec = TaskSpec.from_dir(task_dir)
+        rlm_instance = MagicMock()
+        rlm_instance.completion.return_value = _stub_completion()
+        with patch.object(runner_mod, "build_task_image", return_value="t"):
+            with patch.object(runner_mod, "RLM", return_value=rlm_instance) as mock_rlm:
+                run_task(
+                    spec,
+                    backend="openai",
+                    backend_kwargs={"model_name": "fake"},
+                    max_iterations=5,
+                    output_dir=tmp_path / "results",
+                )
+                rlm_kwargs = mock_rlm.call_args.kwargs
+        assert rlm_kwargs["workspace_config"].docker.allow_internet is False
 
 
 # ---------------------------------------------------------------------------

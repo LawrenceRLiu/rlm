@@ -59,9 +59,9 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
                 execution_time=time.perf_counter() - start,
             )
 
-    # Optional cwd override: defaults to image WORKDIR (= docker.container_cwd,
-    # typically /app). Accepts workspace-relative or container-absolute under
-    # one of the bind-mount roots.
+    # Optional cwd override: defaults to docker.container_cwd, which is
+    # normally the workspace root (/). Accepts workspace-relative or
+    # container-absolute paths under one of the bind-mount roots.
     cwd_arg = action.args.get("cwd")
     container_cwd: str | None = None
     if cwd_arg not in (None, ""):

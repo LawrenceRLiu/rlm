@@ -18,10 +18,11 @@ SPEC = ToolSpec(
     runs_on="host",
     body_required=False,
     example=(
-        'No required attrs. Optional: path (workspace-relative; defaults to workspace root). '
+        "No required attrs. Optional: path (workspace-relative; defaults to workspace root). "
         'Example: <action tool="list_directory" path="_rlm_artifacts/"/>'
     ),
 )
+
 
 def _to_absolute(rel: str) -> str:
     """Canonical container-absolute form for a workspace-relative path.
@@ -108,7 +109,7 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
         lines.append(
             f"  {kind_tag} {display.ljust(name_col_width)}  "
             f"{size_part:>8}  "
-            f"created={e['created_role']}  modified={e['modified_role']}"
+            f"created={e['created_role']}  last_modified={e['modified_role']}"
         )
     if not entries and not truncated:
         lines.append("  [empty directory]")

@@ -74,7 +74,7 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
             "description": {"type": "string", "description": "Short human-readable purpose."},
             "directory": {
                 "type": "string",
-                "description": "Workspace-relative directory to run in. Defaults to '.'.",
+                "description": "Workspace-relative directory to run in. Defaults to workspace root (/).",
             },
             "timeout": {"type": "integer", "description": "Timeout in seconds."},
             "is_background": {
@@ -97,6 +97,10 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
             },
             "description": {"type": "string", "description": "Short human-readable purpose."},
             "timeout": {"type": "integer", "description": "Timeout in seconds."},
+            "cwd": {
+                "type": "string",
+                "description": "Workspace-relative directory to run in. Defaults to workspace root (/).",
+            },
         },
         "required": ["code"],
         "additionalProperties": False,

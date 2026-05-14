@@ -16,12 +16,16 @@ SPEC = ToolSpec(
     short_description=(
         "Run Python code inside the workspace container. "
         "`llm_query`, `llm_query_batched`, `rlm_query`, and `rlm_query_batched` "
-        "are pre-imported for programmatic loops over files and batched model calls."
+        "are pre-imported for programmatic loops over files and batched model calls. "
+        "Optional: cwd, timeout, description."
     ),
     is_state_mutating=True,
     runs_on="container",
     body_required=False,
-    example='Native args: {"code": "from pathlib import Path\\nprint(Path(\\\".\\\").resolve())"}',
+    example=(
+        'Native args: {"code": "from pathlib import Path\\nprint(Path(\\".\\").resolve())", '
+        '"cwd": ".", "timeout": 300}'
+    ),
 )
 
 

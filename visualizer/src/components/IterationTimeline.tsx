@@ -4,7 +4,7 @@ import { useRef, useEffect } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area';
 import { cn } from '@/lib/utils';
-import { WorkspaceIteration } from '@/lib/types';
+import { WorkspaceIteration, observationHasError } from '@/lib/types';
 
 interface IterationTimelineProps {
   iterations: WorkspaceIteration[];
@@ -17,7 +17,7 @@ function getIterationStats(iteration: WorkspaceIteration) {
   let hasError = false;
 
   for (const obs of iteration.observations) {
-    if (obs.error || (obs.stderr && obs.stderr.length > 0)) hasError = true;
+    if (observationHasError(obs)) hasError = true;
     if (obs.rlm_calls) totalSubCalls += obs.rlm_calls.length;
   }
 

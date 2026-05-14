@@ -60,6 +60,20 @@ export interface WorkspaceObservation {
   error: string | null;
 }
 
+export function observationHasError(obs: WorkspaceObservation | null | undefined): boolean {
+  if (!obs) return false;
+  if (obs.error != null && obs.error.length > 0) return true;
+
+  const exitCode = obs.data?.exit_code;
+  if (typeof exitCode === 'number') return exitCode !== 0;
+  if (typeof exitCode === 'string' && exitCode.trim().length > 0) {
+    const parsed = Number(exitCode);
+    return Number.isNaN(parsed) || parsed !== 0;
+  }
+
+  return false;
+}
+
 export interface WorkspaceSnapshot {
   turn: number;
   commit_sha: string;

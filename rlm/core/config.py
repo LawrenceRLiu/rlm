@@ -130,6 +130,11 @@ class DockerConfig:
     # PYTHONPATH forced on every ``python`` action so imports rooted at the
     # task directory just work without explicit sys.path mangling.
     container_pythonpath: str = "/app"
+    # Whether the workspace container may initiate outbound internet
+    # connections. When false, DockerWorkspaceEnv installs a host firewall
+    # rule that rejects new forwarded packets from this container while
+    # keeping the broker's host-published control port reachable.
+    allow_internet: bool = True
 
 
 @dataclass

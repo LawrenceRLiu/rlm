@@ -1,9 +1,9 @@
 import {
   WorkspaceIteration,
-  WorkspaceObservation,
   RLMLogFile,
   LogMetadata,
   RLMConfigMetadata,
+  observationHasError,
 } from './types';
 
 function getDefaultConfig(): RLMConfigMetadata {
@@ -107,12 +107,6 @@ export function extractContextPreview(iterations: WorkspaceIteration[]): string 
   }
   const oneLine = q.replace(/\s+/g, ' ').trim();
   return oneLine.length > 120 ? oneLine.slice(0, 120) + '...' : oneLine;
-}
-
-function observationHasError(obs: WorkspaceObservation): boolean {
-  if (obs.error) return true;
-  if (obs.stderr && obs.stderr.length > 0) return true;
-  return false;
 }
 
 export function computeMetadata(iterations: WorkspaceIteration[]): LogMetadata {

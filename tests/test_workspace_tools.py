@@ -13,11 +13,13 @@ created via ``make_thin_env(tmp_path)``.
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from rlm.core.config import ObservationConfig, WorkspaceConfig
+from rlm.core.config import DockerConfig, ObservationConfig, WorkspaceConfig
 from rlm.core.types import WorkspaceAction
+from rlm.environments import docker_workspace as docker_workspace_mod
 from rlm.workspace_tools.append_file import execute as append_file_execute
 from rlm.workspace_tools.edit import execute as edit_execute
 from rlm.workspace_tools.edit_file import execute as edit_file_execute
@@ -110,7 +112,7 @@ class TestReadFile:
         env.provenance.save()
         obs = read_file_execute(env, _action("read_file", path="seed.txt"))
         assert "Created: user" in obs.stdout
-        assert "Modified: user" in obs.stdout
+        assert "Last modified: user" in obs.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +216,19 @@ class TestAppendFile:
         prov = env.provenance.get("out.txt")
         assert prov is not None
         assert prov.modified.role == "assistant"
+
+    def test_absolute_path_provenance_matches_directory_listing(self, tmp_path: Path) -> None:
+        env = make_thin_env(tmp_path)
+        append_file_execute(env, _action("append_file", body="x", path="/app/SMILES"))
+        prov = env.provenance.get("app/SMILES")
+        assert prov is not None
+        assert prov.created.role == "assistant"
+        assert prov.modified.role == "assistant"
+
+        obs = list_directory_execute(env, _action("list_directory", path="/app"))
+        assert obs.error is None
+        assert "/app/SMILES" in obs.stdout
+        assert "created=assistant  last_modified=assistant" in obs.stdout
 
     def test_reserved_path_blocked(self, tmp_path: Path) -> None:
         env = make_thin_env(tmp_path)
@@ -389,6 +404,47 @@ class TestListDirectory:
         obs = list_directory_execute(env, _action("list_directory", path="f.txt"))
         assert obs.error is not None
         assert "Not a directory" in obs.error
+
+    def test_uses_last_modified_label(self, tmp_path: Path) -> None:
+        env = make_thin_env(tmp_path)
+        (env.workspace_root / "x.txt").write_text("x", encoding="utf-8")
+        obs = list_directory_execute(env, _action("list_directory"))
+        assert "last_modified=" in obs.stdout
+        assert "  modified=" not in obs.stdout
+
+
+# ---------------------------------------------------------------------------
+# Docker network policy helpers
+# ---------------------------------------------------------------------------
+
+
+class TestDockerNetworkPolicy:
+    def test_no_internet_uses_docker_network_none(self, tmp_path: Path) -> None:
+        cfg = WorkspaceConfig(docker=DockerConfig(allow_internet=False, image="task:latest"))
+        env = make_thin_env(tmp_path, workspace_config=cfg)
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            del kwargs
+            calls.append(cmd)
+            if cmd[:3] == ["docker", "run", "-d"]:
+                return MagicMock(returncode=0, stdout="abcdef123456\n", stderr="")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with patch.object(docker_workspace_mod.subprocess, "run", side_effect=fake_run):
+            with patch.object(
+                env, "_select_broker_exec_python", return_value="/opt/broker/bin/python"
+            ):
+                with patch.object(env, "_wait_for_broker_ready"):
+                    env._start_container()
+
+        run_cmd = calls[0]
+        assert "--network" in run_cmd
+        assert "none" in run_cmd
+        assert "-p" not in run_cmd
+        assert "--add-host=host.docker.internal:host-gateway" not in run_cmd
+        assert env._broker_host_port is None
+        assert env._broker_exec_python == "/opt/broker/bin/python"
 
 
 # ---------------------------------------------------------------------------

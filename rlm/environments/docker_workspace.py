@@ -132,6 +132,7 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
 
         self._container_id: str | None = None
         self._broker_host_port: int | None = None
+        self._broker_exec_python: str | None = None
         self._poller_thread: threading.Thread | None = None
         self._poller_stop = threading.Event()
         self._action_seq_per_turn: dict[int, int] = {}
@@ -195,7 +196,7 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
             for subdir in WORKSPACE_LAYOUT:
                 root = f"/{subdir}"
                 if norm == root or norm.startswith(root + "/"):
-                    inner = norm[len(root):].lstrip("/")
+                    inner = norm[len(root) :].lstrip("/")
                     full = (self.workspace_root / subdir / inner).resolve()
                     # Defense in depth — even after the prefix match, confirm
                     # we land somewhere under workspace_root before returning.
@@ -231,17 +232,13 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
         try:
             rel = host_resolved.relative_to(ws_resolved)
         except ValueError as e:
-            raise ValueError(
-                f"Host path is not under workspace_root: {host_path}"
-            ) from e
+            raise ValueError(f"Host path is not under workspace_root: {host_path}") from e
         rel_str = str(rel).replace("\\", "/")
         for subdir in WORKSPACE_LAYOUT:
             if rel_str == subdir or rel_str.startswith(subdir + "/"):
-                inner = rel_str[len(subdir):].lstrip("/")
+                inner = rel_str[len(subdir) :].lstrip("/")
                 return f"/{subdir}/{inner}" if inner else f"/{subdir}"
-        raise ValueError(
-            f"Path is under workspace_root but outside any bind mount: {rel_str!r}"
-        )
+        raise ValueError(f"Path is under workspace_root but outside any bind mount: {rel_str!r}")
 
     def snapshot_paths_for_provenance(self, excludes: tuple[str, ...]) -> dict[str, int]:
         """Path -> size walk of the workspace, used to bracket ``shell``/``python``."""
@@ -263,13 +260,17 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
     def setup(self) -> None:
         if self._is_setup:
             return
-        self._create_workspace_dirs()
-        self._seed_app_from_image()
-        self._seed_provenance_and_manifest()
-        self._git_init()
-        self._start_container()
-        self._start_poller()
-        self._is_setup = True
+        try:
+            self._create_workspace_dirs()
+            self._seed_app_from_image()
+            self._seed_provenance_and_manifest()
+            self._git_init()
+            self._start_container()
+            self._start_poller()
+            self._is_setup = True
+        except Exception:
+            self.cleanup()
+            raise
 
     def _create_workspace_dirs(self) -> None:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
@@ -304,9 +305,7 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
             text=True,
         )
         if create.returncode != 0:
-            raise RuntimeError(
-                f"docker create failed for image {image!r}: {create.stderr.strip()}"
-            )
+            raise RuntimeError(f"docker create failed for image {image!r}: {create.stderr.strip()}")
         tmp_id = create.stdout.strip()
         try:
             cp = subprocess.run(
@@ -318,15 +317,12 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
                 # No /app in image → leave empty subdir. The model can still
                 # use /app as scratch. Log and move on; not fatal.
                 log.info(
-                    "Image %r has no /app to seed (docker cp: %s); leaving "
-                    "host app/ empty.",
+                    "Image %r has no /app to seed (docker cp: %s); leaving host app/ empty.",
                     image,
                     cp.stderr.strip(),
                 )
         finally:
-            subprocess.run(
-                ["docker", "rm", "-f", tmp_id], capture_output=True, text=True
-            )
+            subprocess.run(["docker", "rm", "-f", tmp_id], capture_output=True, text=True)
 
     def _seed_provenance_and_manifest(self) -> None:
         self.provenance.load()
@@ -335,9 +331,7 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
         # _rlm_* dirs are substrate-managed (system).
         self.provenance.record_seed("app", role="user", action_id=None, turn=0)
         for substrate_dir in ("_rlm_notes", "_rlm_artifacts", RESERVED_STATE_DIR):
-            self.provenance.record_seed(
-                substrate_dir, role="system", action_id=None, turn=0
-            )
+            self.provenance.record_seed(substrate_dir, role="system", action_id=None, turn=0)
         # Root task and any pre-existing user-context files → user.
         # State files → system. Files seeded from the image into app/ are
         # treated as user input (they are the task's starter material).
@@ -356,9 +350,7 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
             for path in app_host.rglob("*"):
                 if path.is_file():
                     rel = str(path.relative_to(self.workspace_root)).replace("\\", "/")
-                    self.provenance.record_seed(
-                        rel, role="user", action_id=None, turn=0
-                    )
+                    self.provenance.record_seed(rel, role="user", action_id=None, turn=0)
         self.provenance.save()
         manifest = {
             "run_id": self.run_id,
@@ -398,14 +390,18 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
     def _start_container(self) -> None:
         dcfg = self.workspace_config.docker
         broker_port = dcfg.broker_port
-        # Bind the broker's container port to a random free host port. We
-        # publish to 127.0.0.1 only so it's not exposed on external interfaces.
+        # In normal mode, bind the broker's container port to a random free
+        # host port. We publish to 127.0.0.1 only so it's not exposed on
+        # external interfaces. In no-internet mode, use Docker's network
+        # namespace isolation and talk to the broker through docker exec.
         cmd: list[str] = [
             "docker",
             "run",
             "-d",
             "--rm",
         ]
+        if not dcfg.allow_internet:
+            cmd.extend(["--network", "none"])
         # Multi-bind-mount: each layout subdir is mounted at /<name> in the
         # container. The image-seed dance has already populated host /app
         # with the image's baked contents, so the bind mount is non-shadowing.
@@ -416,48 +412,119 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
         # works; overriding it here would break broker startup. The model-
         # facing PYTHONPATH (container_pythonpath, default /app) is applied
         # per-action via `docker exec -e`, not on the container as a whole.
-        cmd.extend(
-            [
-                "-w",
-                dcfg.container_cwd,
-                "-p",
-                f"127.0.0.1::{broker_port}",
-                "--add-host=host.docker.internal:host-gateway",
-                "-e",
-                f"RLM_BROKER_PORT={broker_port}",
-                dcfg.image,
-            ]
-        )
+        cmd.extend(["-w", dcfg.container_cwd])
+        if dcfg.allow_internet:
+            cmd.extend(
+                [
+                    "-p",
+                    f"127.0.0.1::{broker_port}",
+                    "--add-host=host.docker.internal:host-gateway",
+                ]
+            )
+        cmd.extend(["-e", f"RLM_BROKER_PORT={broker_port}", dcfg.image])
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to start workspace container: {result.stderr.strip()}")
         self._container_id = result.stdout.strip()
 
-        # Look up the host port assigned to the container's broker_port.
-        port_result = subprocess.run(
-            ["docker", "port", self._container_id, str(broker_port)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        # Output looks like "127.0.0.1:54321\n0.0.0.0:54321\n"; take the first.
-        first_line = port_result.stdout.strip().splitlines()[0]
-        self._broker_host_port = int(first_line.rsplit(":", 1)[1])
+        if dcfg.allow_internet:
+            # Look up the host port assigned to the container's broker_port.
+            port_result = subprocess.run(
+                ["docker", "port", self._container_id, str(broker_port)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            # Output looks like "127.0.0.1:54321\n0.0.0.0:54321\n"; take the first.
+            first_line = port_result.stdout.strip().splitlines()[0]
+            self._broker_host_port = int(first_line.rsplit(":", 1)[1])
+        else:
+            self._broker_host_port = None
+            self._broker_exec_python = self._select_broker_exec_python()
         self._wait_for_broker_ready()
 
     def _wait_for_broker_ready(self, timeout: float = 15.0) -> None:
         deadline = time.monotonic() + timeout
-        url = f"http://127.0.0.1:{self._broker_host_port}/health"
         last_err: Exception | None = None
         while time.monotonic() < deadline:
             try:
-                r = requests.get(url, timeout=1.0)
-                if r.status_code == 200:
-                    return
-            except (OSError, requests.ConnectionError, requests.Timeout) as e:
+                if self._broker_host_port is not None:
+                    url = f"http://127.0.0.1:{self._broker_host_port}/health"
+                    r = requests.get(url, timeout=1.0)
+                    if r.status_code != 200:
+                        time.sleep(0.1)
+                        continue
+                else:
+                    self._broker_exec_request("GET", "/health", timeout=1.0)
+                return
+            except (OSError, requests.ConnectionError, requests.Timeout, RuntimeError) as e:
                 last_err = e
             time.sleep(0.1)
         raise RuntimeError(f"Workspace broker did not become ready within {timeout}s: {last_err!r}")
+
+    def _select_broker_exec_python(self) -> str:
+        """Choose a Python interpreter for docker-exec broker HTTP calls."""
+        if self._container_id is None:
+            raise RuntimeError("Container is not running; cannot select broker Python")
+        candidates = ["/opt/broker/bin/python", "python3", "python"]
+        for candidate in candidates:
+            probe = subprocess.run(
+                ["docker", "exec", self._container_id, candidate, "-c", "pass"],
+                capture_output=True,
+                text=True,
+            )
+            if probe.returncode == 0:
+                return candidate
+        raise RuntimeError(
+            "Could not find a Python interpreter inside the workspace container "
+            "for no-internet broker polling."
+        )
+
+    def _broker_exec_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        if self._container_id is None:
+            raise RuntimeError("Container is not running; cannot reach broker")
+        if self._broker_exec_python is None:
+            self._broker_exec_python = self._select_broker_exec_python()
+        broker_port = self.workspace_config.docker.broker_port
+        request_payload = {
+            "method": method,
+            "url": f"http://localhost:{broker_port}{path}",
+            "json": payload,
+            "timeout": timeout,
+        }
+        code = r"""
+import json
+import sys
+import urllib.request
+
+cfg = json.loads(sys.stdin.read())
+body = cfg.get("json")
+data = None if body is None else json.dumps(body).encode("utf-8")
+headers = {"Content-Type": "application/json"} if data is not None else {}
+req = urllib.request.Request(cfg["url"], data=data, headers=headers, method=cfg["method"])
+with urllib.request.urlopen(req, timeout=cfg["timeout"]) as resp:
+    sys.stdout.write(resp.read().decode("utf-8"))
+"""
+        proc = subprocess.run(
+            ["docker", "exec", "-i", self._container_id, self._broker_exec_python, "-c", code],
+            input=json.dumps(request_payload),
+            capture_output=True,
+            text=True,
+            timeout=max(1.0, timeout + 1.0),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or "docker-exec broker request failed")
+        try:
+            return json.loads(proc.stdout or "{}")
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Broker returned non-JSON response: {proc.stdout[:500]!r}") from e
 
     def _start_poller(self) -> None:
         self._poller_stop.clear()
@@ -469,20 +536,26 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
 
     def _poller_loop(self) -> None:
         interval = self.workspace_config.docker.poll_interval_ms / 1000.0
-        pending_url = f"http://127.0.0.1:{self._broker_host_port}/pending"
         while not self._poller_stop.is_set():
             try:
-                r = requests.get(pending_url, timeout=2.0)
-                if r.status_code == 200:
-                    requests_list = r.json().get("requests", [])
-                    for req in requests_list:
-                        # Each request handled in its own thread so a slow LM
-                        # call doesn't starve siblings.
-                        threading.Thread(
-                            target=self._handle_broker_request,
-                            args=(req,),
-                            daemon=True,
-                        ).start()
+                if self._broker_host_port is not None:
+                    pending_url = f"http://127.0.0.1:{self._broker_host_port}/pending"
+                    r = requests.get(pending_url, timeout=2.0)
+                    if r.status_code != 200:
+                        self._poller_stop.wait(interval)
+                        continue
+                    pending = r.json()
+                else:
+                    pending = self._broker_exec_request("GET", "/pending", timeout=2.0)
+                requests_list = pending.get("requests", [])
+                for req in requests_list:
+                    # Each request handled in its own thread so a slow LM
+                    # call doesn't starve siblings.
+                    threading.Thread(
+                        target=self._handle_broker_request,
+                        args=(req,),
+                        daemon=True,
+                    ).start()
             except (requests.ConnectionError, requests.Timeout):
                 pass  # container restarting / shutting down — keep polling
             except Exception:
@@ -585,10 +658,13 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
     def _respond_to_broker(self, req_id: str | None, response: dict[str, Any]) -> None:
         if not req_id:
             return
-        url = f"http://127.0.0.1:{self._broker_host_port}/respond"
         payload = {"id": req_id, **response}
         try:
-            requests.post(url, json=payload, timeout=5.0)
+            if self._broker_host_port is not None:
+                url = f"http://127.0.0.1:{self._broker_host_port}/respond"
+                requests.post(url, json=payload, timeout=5.0)
+            else:
+                self._broker_exec_request("POST", "/respond", payload=payload, timeout=5.0)
         except Exception:
             log.exception("Failed to post broker response for %s", req_id)
 
@@ -835,6 +911,7 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
                 capture_output=True,
             )
             self._container_id = None
+            self._broker_exec_python = None
         # Bound any pathological orphan ledger entries (fire-and-forget broker
         # calls in user scripts) to a single run lifetime.
         with self._broker_ledger_lock:

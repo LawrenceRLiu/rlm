@@ -23,6 +23,13 @@ def test_native_tool_schema_omits_rlm_query_at_max_depth() -> None:
     assert "llm_query" in names
 
 
+def test_run_python_command_schema_accepts_cwd() -> None:
+    tools = build_openai_tools(include_rlm_query=True)
+    py_tool = next(t for t in tools if t["function"]["name"] == "run_python_command")
+    props = py_tool["function"]["parameters"]["properties"]
+    assert "cwd" in props
+
+
 def test_actions_from_tool_calls_preserves_call_id_and_large_string_args() -> None:
     actions = actions_from_tool_calls(
         [
