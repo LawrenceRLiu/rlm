@@ -308,6 +308,11 @@ class OpenAIClient(BaseLM):
         if not self._is_self_hosted_vllm:
             return None
         base = str(self.client.base_url).rstrip("/")
+        # vLLM mounts /tokenize and /detokenize at the server root, NOT under
+        # /v1. The OpenAI SDK base_url ends with /v1, so strip that suffix
+        # before appending — otherwise every render 404s silently.
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")]
         payload: dict[str, Any] = {
             "model": self.model_name,
             "messages": messages,
