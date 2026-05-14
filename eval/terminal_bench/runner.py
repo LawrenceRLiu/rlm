@@ -130,10 +130,10 @@ def build_task_image(task: TaskSpec) -> str:
 def build_prompt(task: TaskSpec) -> str:
     """Compose the agent's user prompt from instruction.md plus framing.
 
-    The substrate's bind-mount is fixed at ``/workspace`` (the host-side
-    workspace dir), which shadows whatever was at ``/workspace`` in the
-    base image. Harbor tasks expect their solution at ``task.workdir``
-    (typically ``/app``), so we instruct the agent explicitly.
+    Sibling layout: ``/app`` is a bind mount from the host workspace,
+    pre-seeded with the image's baked ``/app`` contents. All file tools and
+    shell/python tools operate on it transparently — no path translation
+    required. The grader evaluates ``/app`` after the run.
     """
     instruction = (task.task_dir / "instruction.md").read_text(encoding="utf-8").strip()
     return (
@@ -141,13 +141,26 @@ def build_prompt(task: TaskSpec) -> str:
         f"The grader will evaluate the state of `{task.workdir}` inside this "
         f"container after you finish.\n"
         "\n"
+        "Workspace layout (everything-at-root, bind-mounted into the container):\n"
+        f"- `/app` — task workdir; the grader evaluates this. Default cwd for "
+        "`shell` and `python` actions, default `PYTHONPATH` for `python`.\n"
+        "- `/_rlm_notes` — scratchpad for notes you want to persist across turns.\n"
+        "- `/_rlm_artifacts` — outputs/spillovers (substrate-managed; you can read).\n"
+        "- `/_rlm_state` — substrate state (read-only from your perspective).\n"
+        "\n"
+        "Tools:\n"
+        "- File tools (`read_file`, `write_file`, `edit_file`, `append_file`, "
+        "`list_directory`) accept either workspace-relative (`app/output.txt`) "
+        "or container-absolute (`/app/output.txt`) paths — both work.\n"
+        "- `shell` and `python` run in `/app` by default. Pass `cwd=` to "
+        "override.\n"
+        "\n"
         "Important rules:\n"
-        f"- Do your work in `{task.workdir}` using the `shell` tool "
-        "(e.g. `cd " + task.workdir + " && ...`).\n"
-        "- The `read_file` / `write_file` / `edit_file` tools operate on "
-        "`/workspace`, which is NOT the grader's target. Use `shell` for "
-        "anything the grader will inspect.\n"
-        '- When you are done, emit `<action tool="final"><answer>done'
+        "- Before emitting `final`, if you wrote code that should be tested, "
+        "run the task's test suite (`bash /tests/test.sh` or the project's "
+        "own test runner if present) and observe it pass. Smoke tests are "
+        "not sufficient evidence of success.\n"
+        '- When done, emit `<action tool="final"><answer>done'
         "</answer></action>`.\n"
         "\n"
         "Task:\n"
@@ -230,6 +243,7 @@ def run_task(
     backend_kwargs: dict,
     max_iterations: int,
     output_dir: Path,
+    workspace_root_base: str | None = None,
 ) -> TaskResult:
     log.info("=== Task: %s ===", task.task_id)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -238,13 +252,14 @@ def run_task(
 
     composite_tag = build_task_image(task)
 
-    workspace_cfg = WorkspaceConfig(
-        docker=DockerConfig(
-            image=composite_tag,
-            cleanup_mode="delete",
-            exec_timeout_seconds=int(task.agent_timeout_sec),
-        )
-    )
+    docker_kwargs: dict[str, Any] = {
+        "image": composite_tag,
+        "cleanup_mode": "delete",
+        "exec_timeout_seconds": int(task.agent_timeout_sec),
+    }
+    if workspace_root_base is not None:
+        docker_kwargs["workspace_root_base"] = workspace_root_base
+    workspace_cfg = WorkspaceConfig(docker=DockerConfig(**docker_kwargs))
     rlm = RLM(
         backend=backend,
         backend_kwargs=backend_kwargs,
@@ -278,7 +293,7 @@ def run_task(
     grade = completion.pre_cleanup_result or {}
     turns = None
     if completion.metadata is not None:
-        iters = getattr(completion.metadata, "iterations", None)
+        iters = completion.metadata.get("iterations")
         if iters is not None:
             turns = len(iters)
 
@@ -376,6 +391,7 @@ def _process_one(
     max_iterations: int,
     output_dir: Path,
     rmi_after: bool,
+    workspace_root_base: str | None = None,
 ) -> TaskResult:
     """Worker entry: run a single task end-to-end and persist its result.json.
 
@@ -389,6 +405,7 @@ def _process_one(
             backend_kwargs=backend_kwargs,
             max_iterations=max_iterations,
             output_dir=output_dir,
+            workspace_root_base=workspace_root_base,
         )
     except Exception as exc:  # safety net; run_task already catches the agent path
         log.exception("Task %s crashed outside run_task", task.task_id)
@@ -458,6 +475,23 @@ def main() -> None:
     parser.add_argument("--base-url", default="http://127.0.0.1:8000/v1")
     parser.add_argument("--api-key", default="EMPTY")
     parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--min-p", type=float, default=None)
+    parser.add_argument("--presence-penalty", type=float, default=None)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
+    parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        help="Force enable_thinking=True (overrides the native-format default of False).",
+    )
+    parser.add_argument(
+        "--workspace-root-base",
+        type=str,
+        default=None,
+        help="Override DockerConfig.workspace_root_base (host dir holding per-task workspaces).",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -505,6 +539,18 @@ def main() -> None:
         "base_url": args.base_url,
         "api_key": args.api_key,
     }
+    for key, val in [
+        ("temperature", args.temperature),
+        ("top_p", args.top_p),
+        ("top_k", args.top_k),
+        ("min_p", args.min_p),
+        ("presence_penalty", args.presence_penalty),
+        ("repetition_penalty", args.repetition_penalty),
+    ]:
+        if val is not None:
+            backend_kwargs[key] = val
+    if args.enable_thinking:
+        backend_kwargs["enable_thinking"] = True
     summary_path = args.output_dir / "summary.jsonl"
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -520,6 +566,7 @@ def main() -> None:
                     max_iterations=args.max_iterations,
                     output_dir=args.output_dir,
                     rmi_after=args.rmi_after,
+                    workspace_root_base=args.workspace_root_base,
                 ): t
                 for t in sharded
             }
@@ -536,6 +583,7 @@ def main() -> None:
                 max_iterations=args.max_iterations,
                 output_dir=args.output_dir,
                 rmi_after=args.rmi_after,
+                workspace_root_base=args.workspace_root_base,
             )
             results.append(r)
             append_summary_line(summary_path, r)

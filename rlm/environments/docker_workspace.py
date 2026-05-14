@@ -1,28 +1,39 @@
 """
 Docker-backed workspace environment.
 
+Sibling layout
+--------------
+Each workspace_root has four bind-mounted subdirs:
+
+  ``<workspace_root>/app/``             → ``/app``
+  ``<workspace_root>/_rlm_state/``      → ``/_rlm_state``
+  ``<workspace_root>/_rlm_artifacts/``  → ``/_rlm_artifacts``
+  ``<workspace_root>/_rlm_notes/``      → ``/_rlm_notes``
+
+``/app`` is the canonical task workdir — shell/python tools default to it,
+and graders (e.g. Terminal-Bench Harbor) evaluate it. Before starting the
+container we extract the image's baked ``/app`` contents to the host
+subdir via ``docker create`` + ``docker cp`` (the "image-seed dance"),
+because the bind mount otherwise shadows whatever the image put there.
+
 End-to-end responsibilities:
 
-- Provision a workspace directory at ``<docker.workspace_root_base>/<run_id>/``
-  with the reserved layout (``_rlm_query_0.txt``, ``_rlm_notes/``,
-  ``_rlm_artifacts/``, ``_rlm_state/``) and seed ``provenance.json``.
-- ``git init`` the workspace and commit a "turn 0" baseline. Per-turn
-  ``snapshot()`` calls produce one git commit per turn.
-- Start a container running the workspace image (default ``rlm-workspace:0.1.0``)
-  with ``-v <ws>:/workspace -p 0:<broker_port>``. The container's broker
-  binds 0.0.0.0:8080; the host poller drains ``/pending`` and forwards LM
-  requests to the on-host ``LMHandler`` via ``send_lm_request``.
-- Dispatch ``WorkspaceAction``s through the tool registry. Per-call
-  observation bodies above ``observation.max_observation_chars`` are spilled
-  to ``_rlm_artifacts/_observations/<id>.txt`` and replaced with a summary.
-- Maintain the ``provenance.json`` sidecar via direct per-tool updates (set
-  by the tool modules themselves); ``shell``/``python`` use
-  ``snapshot_paths_for_provenance`` + ``diff_paths_for_provenance`` to find
-  paths they touched without knowing them in advance.
+- Provision a workspace at ``<docker.workspace_root_base>/<run_id>/`` with
+  the four sibling subdirs and seed ``provenance.json``.
+- ``git init`` at workspace root and commit a "turn 0" baseline.
+- Seed ``/app`` from the image, then start the container with
+  ``-v`` per subdir, ``-w /app`` (overridable), ``-e PYTHONPATH=/app``,
+  and a port-published broker.
+- Host poller drains ``/pending`` and forwards LM requests to the on-host
+  ``LMHandler`` via ``send_lm_request``.
+- Dispatch ``WorkspaceAction``s through the tool registry. Observation
+  bodies above ``observation.max_observation_chars`` spill to
+  ``_rlm_artifacts/_observations/<id>.txt`` and the body is replaced with
+  a summary line.
 
-The env is designed to be reusable as a child workspace for ``rlm_query``:
-when ``workspace_root`` is supplied, no run_id-derived path is computed and
-the caller is expected to have already populated the directory (copy-on-spawn).
+The env is reusable as a child workspace for ``rlm_query``: when
+``workspace_root`` is supplied, the run_id-derived path is skipped and the
+caller is expected to have populated the directory (copy-on-spawn).
 """
 
 from __future__ import annotations
@@ -56,6 +67,19 @@ log = logging.getLogger(__name__)
 
 # Reserved name prefix the model is forbidden to write to (state lives here).
 RESERVED_STATE_DIR = "_rlm_state"
+
+# Sibling-layout subdirs of workspace_root. Each is bind-mounted into the
+# container at ``/<name>``. Order matters for resolve_workspace_path's
+# prefix matching: longer prefixes must come before shorter ones if any
+# share a prefix (none currently do, but the loop respects this ordering).
+WORKSPACE_LAYOUT: tuple[str, ...] = ("app", "_rlm_state", "_rlm_artifacts", "_rlm_notes")
+
+# Subdir under _rlm_state where shell/python tempfiles are staged. Excluded
+# from provenance diffs because _rlm_state is excluded wholesale.
+_TMP_REL_DIR = "_rlm_state/_tmp"
+
+# Observation spill destination (inside _rlm_artifacts, visible to the model).
+_OBS_REL_DIR = "_rlm_artifacts/_observations"
 
 
 @dataclass
@@ -131,22 +155,93 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
     # =========================================================================
 
     def is_reserved_path(self, rel: str) -> bool:
-        """``True`` for paths the model is forbidden to write (``_rlm_state/...``)."""
+        """``True`` for paths the model is forbidden to write (``_rlm_state/...``).
+
+        Accepts both workspace-relative (``_rlm_state/foo``) and
+        container-absolute (``/_rlm_state/foo``) forms.
+        """
         norm = str(rel).replace("\\", "/").lstrip("./")
+        # Strip a single leading slash so container-absolute paths normalize
+        # to the same form as workspace-relative.
+        if norm.startswith("/"):
+            norm = norm.lstrip("/")
         return norm == RESERVED_STATE_DIR or norm.startswith(RESERVED_STATE_DIR + "/")
 
     def resolve_workspace_path(self, rel: str) -> Path:
-        """Join ``rel`` to ``workspace_root``, blocking absolute paths and traversal."""
-        rel_path = Path(rel)
-        if rel_path.is_absolute():
-            raise ValueError(f"Path must be workspace-relative: {rel!r}")
-        full = (self.workspace_root / rel_path).resolve()
+        """Resolve ``rel`` to its host-side path.
+
+        Accepts:
+          - **Workspace root aliases** ``""``, ``"."``, ``"/"`` → host
+            ``workspace_root``.
+          - **Container-absolute** paths under one of the four bind-mount
+            roots (``/app``, ``/_rlm_state``, ``/_rlm_artifacts``,
+            ``/_rlm_notes``). Translated to the host bind source.
+          - **Workspace-relative** paths (e.g. ``app/output.txt``,
+            ``_rlm_notes/n.md``). Joined to ``workspace_root``.
+
+        Rejects:
+          - Other absolute paths (escape attempt).
+          - Workspace-relative paths that escape ``workspace_root`` via ``..``.
+        """
+        norm = str(rel).replace("\\", "/")
         ws_resolved = self.workspace_root.resolve()
+
+        # Workspace root aliases.
+        if norm in ("", ".", "/"):
+            return ws_resolved
+
+        # Container-absolute under a bind-mount root → host bind source.
+        if norm.startswith("/"):
+            for subdir in WORKSPACE_LAYOUT:
+                root = f"/{subdir}"
+                if norm == root or norm.startswith(root + "/"):
+                    inner = norm[len(root):].lstrip("/")
+                    full = (self.workspace_root / subdir / inner).resolve()
+                    # Defense in depth — even after the prefix match, confirm
+                    # we land somewhere under workspace_root before returning.
+                    try:
+                        full.relative_to(ws_resolved)
+                    except ValueError as e:
+                        raise ValueError(f"Path escapes workspace: {rel!r}") from e
+                    return full
+            raise ValueError(
+                f"Absolute path not under a bind-mounted root: {rel!r}. "
+                f"Allowed roots: /app, /_rlm_state, /_rlm_artifacts, /_rlm_notes."
+            )
+
+        # Workspace-relative — join to workspace_root, enforce no-escape.
+        full = (self.workspace_root / norm).resolve()
         try:
             full.relative_to(ws_resolved)
         except ValueError as e:
             raise ValueError(f"Path escapes workspace: {rel!r}") from e
         return full
+
+    def host_to_container_path(self, host_path: Path) -> str:
+        """Translate a host-side path under ``workspace_root`` to its
+        container-visible counterpart (``/app/...`` etc.).
+
+        Returns the bind-mount-relative path if ``host_path`` lives under one
+        of the four layout subdirs. Raises ``ValueError`` otherwise — the
+        caller is asking for a container path for something that is not
+        bind-mounted.
+        """
+        host_resolved = host_path.resolve()
+        ws_resolved = self.workspace_root.resolve()
+        try:
+            rel = host_resolved.relative_to(ws_resolved)
+        except ValueError as e:
+            raise ValueError(
+                f"Host path is not under workspace_root: {host_path}"
+            ) from e
+        rel_str = str(rel).replace("\\", "/")
+        for subdir in WORKSPACE_LAYOUT:
+            if rel_str == subdir or rel_str.startswith(subdir + "/"):
+                inner = rel_str[len(subdir):].lstrip("/")
+                return f"/{subdir}/{inner}" if inner else f"/{subdir}"
+        raise ValueError(
+            f"Path is under workspace_root but outside any bind mount: {rel_str!r}"
+        )
 
     def snapshot_paths_for_provenance(self, excludes: tuple[str, ...]) -> dict[str, int]:
         """Path -> size walk of the workspace, used to bracket ``shell``/``python``."""
@@ -169,6 +264,7 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
         if self._is_setup:
             return
         self._create_workspace_dirs()
+        self._seed_app_from_image()
         self._seed_provenance_and_manifest()
         self._git_init()
         self._start_container()
@@ -177,25 +273,92 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
 
     def _create_workspace_dirs(self) -> None:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
-        (self.workspace_root / "_rlm_notes").mkdir(exist_ok=True)
-        (self.workspace_root / "_rlm_artifacts").mkdir(exist_ok=True)
-        (self.workspace_root / "_rlm_artifacts" / "_observations").mkdir(exist_ok=True)
-        (self.workspace_root / RESERVED_STATE_DIR).mkdir(exist_ok=True)
+        for subdir in WORKSPACE_LAYOUT:
+            (self.workspace_root / subdir).mkdir(exist_ok=True)
+        (self.workspace_root / _OBS_REL_DIR).mkdir(parents=True, exist_ok=True)
+        (self.workspace_root / _TMP_REL_DIR).mkdir(parents=True, exist_ok=True)
         # _rlm_query_0.txt is created at load_context() time; until then we
-        # leave a placeholder so list_directory has something to show.
-        root_task = self.workspace_root / "_rlm_query_0.txt"
+        # leave a placeholder in _rlm_state so list_directory has something
+        # to show and the file is out of the grader's /app target.
+        root_task = self.workspace_root / RESERVED_STATE_DIR / "_rlm_query_0.txt"
         if not root_task.exists():
             root_task.write_text("", encoding="utf-8")
 
+    def _seed_app_from_image(self) -> None:
+        """Extract the image's baked ``/app`` contents into the host bind
+        source so the bind mount doesn't shadow them at runtime.
+
+        If the host ``app/`` subdir is already populated (e.g. for a
+        copy-on-spawned child workspace), skip — the parent's seed is
+        already there. If the image has no ``/app``, the cp will fail
+        cleanly and we leave the empty dir in place.
+        """
+        app_host = self.workspace_root / "app"
+        # Already populated → child workspace path; do not re-seed.
+        if any(app_host.iterdir()):
+            return
+        image = self.workspace_config.docker.image
+        create = subprocess.run(
+            ["docker", "create", image],
+            capture_output=True,
+            text=True,
+        )
+        if create.returncode != 0:
+            raise RuntimeError(
+                f"docker create failed for image {image!r}: {create.stderr.strip()}"
+            )
+        tmp_id = create.stdout.strip()
+        try:
+            cp = subprocess.run(
+                ["docker", "cp", f"{tmp_id}:/app/.", str(app_host)],
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode != 0:
+                # No /app in image → leave empty subdir. The model can still
+                # use /app as scratch. Log and move on; not fatal.
+                log.info(
+                    "Image %r has no /app to seed (docker cp: %s); leaving "
+                    "host app/ empty.",
+                    image,
+                    cp.stderr.strip(),
+                )
+        finally:
+            subprocess.run(
+                ["docker", "rm", "-f", tmp_id], capture_output=True, text=True
+            )
+
     def _seed_provenance_and_manifest(self) -> None:
         self.provenance.load()
-        # Root task and any pre-existing user-context files at workspace root
-        # → user. State files → system.
-        self.provenance.record_seed("_rlm_query_0.txt", role="user", action_id=None, turn=0)
+        # Stamp the four sibling roots so list_directory of workspace root
+        # surfaces accurate ownership: app/ is task surface (user), the three
+        # _rlm_* dirs are substrate-managed (system).
+        self.provenance.record_seed("app", role="user", action_id=None, turn=0)
+        for substrate_dir in ("_rlm_notes", "_rlm_artifacts", RESERVED_STATE_DIR):
+            self.provenance.record_seed(
+                substrate_dir, role="system", action_id=None, turn=0
+            )
+        # Root task and any pre-existing user-context files → user.
+        # State files → system. Files seeded from the image into app/ are
+        # treated as user input (they are the task's starter material).
+        self.provenance.record_seed(
+            f"{RESERVED_STATE_DIR}/_rlm_query_0.txt", role="user", action_id=None, turn=0
+        )
         for state_file in ("provenance.json", "action_log.jsonl", "workspace_manifest.json"):
             self.provenance.record_seed(
                 f"{RESERVED_STATE_DIR}/{state_file}", role="system", action_id=None, turn=0
             )
+        # Stamp every seeded /app file as user-provenance so list_directory
+        # shows it accurately. ``rglob`` is acceptable here because this
+        # runs once at setup() — not per-action.
+        app_host = self.workspace_root / "app"
+        if app_host.exists():
+            for path in app_host.rglob("*"):
+                if path.is_file():
+                    rel = str(path.relative_to(self.workspace_root)).replace("\\", "/")
+                    self.provenance.record_seed(
+                        rel, role="user", action_id=None, turn=0
+                    )
         self.provenance.save()
         manifest = {
             "run_id": self.run_id,
@@ -233,25 +396,38 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
     # =========================================================================
 
     def _start_container(self) -> None:
-        broker_port = self.workspace_config.docker.broker_port
+        dcfg = self.workspace_config.docker
+        broker_port = dcfg.broker_port
         # Bind the broker's container port to a random free host port. We
         # publish to 127.0.0.1 only so it's not exposed on external interfaces.
-        cmd = [
+        cmd: list[str] = [
             "docker",
             "run",
             "-d",
             "--rm",
-            "-v",
-            f"{self.workspace_root}:/workspace",
-            "-w",
-            "/workspace",
-            "-p",
-            f"127.0.0.1::{broker_port}",
-            "--add-host=host.docker.internal:host-gateway",
-            "-e",
-            f"RLM_BROKER_PORT={broker_port}",
-            self.workspace_config.docker.image,
         ]
+        # Multi-bind-mount: each layout subdir is mounted at /<name> in the
+        # container. The image-seed dance has already populated host /app
+        # with the image's baked contents, so the bind mount is non-shadowing.
+        for subdir in WORKSPACE_LAYOUT:
+            cmd.extend(["-v", f"{self.workspace_root / subdir}:/{subdir}"])
+        # Note: we DO NOT pass -e PYTHONPATH at run time. The broker image bakes
+        # PYTHONPATH=/opt/rlm_workspace so `python -m rlm_workspace.broker`
+        # works; overriding it here would break broker startup. The model-
+        # facing PYTHONPATH (container_pythonpath, default /app) is applied
+        # per-action via `docker exec -e`, not on the container as a whole.
+        cmd.extend(
+            [
+                "-w",
+                dcfg.container_cwd,
+                "-p",
+                f"127.0.0.1::{broker_port}",
+                "--add-host=host.docker.internal:host-gateway",
+                "-e",
+                f"RLM_BROKER_PORT={broker_port}",
+                dcfg.image,
+            ]
+        )
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"Failed to start workspace container: {result.stderr.strip()}")
@@ -420,10 +596,38 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
     # Container exec (used by shell / python tools)
     # =========================================================================
 
-    def exec_in_container(self, cmd: list[str], timeout: int) -> ExecResult:
+    def exec_in_container(
+        self,
+        cmd: list[str],
+        timeout: int,
+        cwd: str | None = None,
+    ) -> ExecResult:
+        """Run ``cmd`` inside the running container.
+
+        ``cwd`` overrides the image WORKDIR for this call — passed to
+        ``docker exec -w``. When None, the image's WORKDIR applies (set
+        at ``docker run`` time to ``DockerConfig.container_cwd``, default
+        ``/app``).
+
+        ``PYTHONPATH`` is set on every exec to ``DockerConfig.container_pythonpath``
+        — env vars on the run-time container do not propagate to ``docker
+        exec`` by default, so we forward it explicitly.
+        """
         if self._container_id is None:
             raise RuntimeError("Container is not running; call setup() first")
-        full_cmd = ["docker", "exec", self._container_id, *cmd]
+        dcfg = self.workspace_config.docker
+        # Compose PYTHONPATH = <model-facing dir>:<broker package dir>. The
+        # broker image bakes ``rlm_workspace`` at ``/opt/rlm_workspace``;
+        # ``docker exec -e`` does not inherit the image's ENV, so we must
+        # forward it explicitly or every ``python`` action loses access to
+        # the pre-imported ``llm_query`` / ``rlm_query`` helpers.
+        pythonpath = f"{dcfg.container_pythonpath}:/opt/rlm_workspace"
+        exec_cmd: list[str] = ["docker", "exec", "-e", f"PYTHONPATH={pythonpath}"]
+        if cwd is not None:
+            exec_cmd.extend(["-w", cwd])
+        exec_cmd.append(self._container_id)
+        exec_cmd.extend(cmd)
+        full_cmd = exec_cmd
         start = time.perf_counter()
         try:
             proc = subprocess.run(
@@ -467,17 +671,16 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
         else:
             chunks = [self._coerce_chunk(context_payload)]
 
-        # setup() seeded _rlm_query_0.txt as an empty placeholder. Treat the
-        # empty slot 0 as the start; otherwise append to the next free slot.
+        # setup() seeded _rlm_state/_rlm_query_0.txt as an empty placeholder.
+        # Treat the empty slot 0 as the start; otherwise append to next free.
         start = 0 if self._is_empty_slot(0) else self._existing_query_slots()
 
         for offset, chunk in enumerate(chunks):
             slot = start + offset
-            path = self.workspace_root / f"_rlm_query_{slot}.txt"
+            rel = f"{RESERVED_STATE_DIR}/_rlm_query_{slot}.txt"
+            path = self.workspace_root / rel
             path.write_text(chunk, encoding="utf-8")
-            self.provenance.record_seed(
-                f"_rlm_query_{slot}.txt", role="user", action_id=None, turn=0
-            )
+            self.provenance.record_seed(rel, role="user", action_id=None, turn=0)
         self.provenance.save()
 
     @staticmethod
@@ -487,14 +690,15 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
         return json.dumps(chunk, indent=2)
 
     def _existing_query_slots(self) -> int:
-        """Highest filled ``_rlm_query_<N>.txt`` slot + 1; 0 if none."""
+        """Highest filled ``_rlm_state/_rlm_query_<N>.txt`` slot + 1; 0 if none."""
+        state_dir = self.workspace_root / RESERVED_STATE_DIR
         i = 0
-        while (self.workspace_root / f"_rlm_query_{i}.txt").exists():
+        while (state_dir / f"_rlm_query_{i}.txt").exists():
             i += 1
         return i
 
     def _is_empty_slot(self, slot: int) -> bool:
-        path = self.workspace_root / f"_rlm_query_{slot}.txt"
+        path = self.workspace_root / RESERVED_STATE_DIR / f"_rlm_query_{slot}.txt"
         try:
             return path.stat().st_size == 0
         except OSError:
@@ -568,7 +772,7 @@ class DockerWorkspaceEnv(BaseWorkspaceEnv):
         if body_len <= cap:
             return obs
         spill_id = self.current_action_id or uuid.uuid4().hex[:12]
-        spill_rel = f"_rlm_artifacts/_observations/{spill_id}.txt"
+        spill_rel = f"{_OBS_REL_DIR}/{spill_id}.txt"
         spill_path = self.workspace_root / spill_rel
         spill_path.parent.mkdir(parents=True, exist_ok=True)
         spill_path.write_text(

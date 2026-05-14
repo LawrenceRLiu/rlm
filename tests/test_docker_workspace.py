@@ -60,14 +60,17 @@ def test_setup_creates_layout_and_seeds_provenance(tmp_path: Path) -> None:
     env = _make_env(tmp_path)
     try:
         env.setup()
-        assert (env.workspace_root / "_rlm_query_0.txt").exists()
+        # Sibling layout: four bind-mount subdirs at workspace_root level.
+        assert (env.workspace_root / "app").is_dir()
         assert (env.workspace_root / "_rlm_notes").is_dir()
         assert (env.workspace_root / "_rlm_artifacts").is_dir()
+        assert (env.workspace_root / "_rlm_state").is_dir()
+        assert (env.workspace_root / "_rlm_state" / "_rlm_query_0.txt").exists()
         assert (env.workspace_root / "_rlm_state" / "provenance.json").exists()
         assert (env.workspace_root / ".git").is_dir()
         # Provenance seeded for root task (user) and state files (system).
         env.provenance.load()
-        prov = env.provenance.get("_rlm_query_0.txt")
+        prov = env.provenance.get("_rlm_state/_rlm_query_0.txt")
         assert prov is not None
         assert prov.created.role == "user"
     finally:
@@ -117,7 +120,7 @@ def test_shell_action_records_system_provenance(tmp_path: Path) -> None:
         action = WorkspaceAction(
             tool="shell",
             args={},
-            body="echo touched > _rlm_notes/shell_out.txt && echo done",
+            body="echo touched > /_rlm_notes/shell_out.txt && echo done",
             raw='<action tool="shell">...</action>',
         )
         obs = env.run_action(action)
@@ -170,7 +173,7 @@ def test_python_action_records_system_provenance_for_writes(tmp_path: Path) -> N
             args={},
             body=(
                 "from pathlib import Path\n"
-                "Path('_rlm_notes/py_out.txt').write_text('hi from python')\n"
+                "Path('/_rlm_notes/py_out.txt').write_text('hi from python')\n"
             ),
             raw="",
         )
@@ -289,10 +292,11 @@ def test_load_context_writes_query_slots(tmp_path: Path) -> None:
     try:
         env.setup()
         env.load_context("the root task")
-        assert (env.workspace_root / "_rlm_query_0.txt").read_text() == "the root task"
+        state = env.workspace_root / "_rlm_state"
+        assert (state / "_rlm_query_0.txt").read_text() == "the root task"
         env.load_context(["chunk a", "chunk b"])
-        assert (env.workspace_root / "_rlm_query_1.txt").read_text() == "chunk a"
-        assert (env.workspace_root / "_rlm_query_2.txt").read_text() == "chunk b"
+        assert (state / "_rlm_query_1.txt").read_text() == "chunk a"
+        assert (state / "_rlm_query_2.txt").read_text() == "chunk b"
     finally:
         env.cleanup()
 

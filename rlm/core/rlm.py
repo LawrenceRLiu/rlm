@@ -430,6 +430,7 @@ class RLM:
                         lm_handler=lm_handler,
                         time_start=time_start,
                         env=env,
+                        total_iterations=i + 1,
                     )
 
                 # Keep canonical full-fidelity iterations in memory, then
@@ -461,6 +462,7 @@ class RLM:
             lm_handler=lm_handler,
             time_start=time_start,
             env=env,
+            total_iterations=self.max_iterations,
         )
 
     # =========================================================================
@@ -920,11 +922,17 @@ class RLM:
         lm_handler: LMHandler,
         time_start: float,
         env: DockerWorkspaceEnv | None = None,
+        total_iterations: int,
     ) -> RLMChatCompletion:
         time_end = time.perf_counter()
         usage = lm_handler.get_usage_summary()
         self.verbose.print_final_answer(response)
-        self.verbose.print_summary(self.max_iterations, time_end - time_start, usage.to_dict())
+        self.verbose.print_summary(
+            total_iterations,
+            time_end - time_start,
+            usage.to_dict(),
+            max_iterations=self.max_iterations,
+        )
         # Surface artifacts + workspace location for direct caller access.
         # ``self._last_final_artifacts`` is set by the success branch of
         # _run_loop before _build_completion is called; for the

@@ -98,7 +98,23 @@ class RecursionConfig:
 
 @dataclass
 class DockerConfig:
-    """Docker workspace knobs."""
+    """Docker workspace knobs.
+
+    Sibling-layout invariants
+    -------------------------
+    The workspace bind-mounts four host subdirs into the container at root:
+
+      ``<workspace_root>/app/``             → ``/app``
+      ``<workspace_root>/_rlm_state/``      → ``/_rlm_state``
+      ``<workspace_root>/_rlm_artifacts/``  → ``/_rlm_artifacts``
+      ``<workspace_root>/_rlm_notes/``      → ``/_rlm_notes``
+
+    ``/app`` is seeded from the image's baked ``/app`` contents on startup
+    (image-seed dance: ``docker create`` + ``docker cp``) so grader-expected
+    files survive the bind mount. This layout exists so Terminal-Bench
+    workloads — which assume work happens in ``/app`` — work without
+    per-tool path translation.
+    """
 
     image: str = "rlm-workspace:0.1.0"
     workspace_root_base: str = "~/.rlm/workspaces"
@@ -106,6 +122,14 @@ class DockerConfig:
     poll_interval_ms: int = 100
     exec_timeout_seconds: int = 300
     cleanup_mode: Literal["keep", "tar", "delete"] = "keep"
+    # Default working directory inside the container for shell/python exec.
+    # Defaults to ``/`` so paths are uniform across all tools (workspace-rooted
+    # / container-absolute under the bind-mount roots). Tools accept an
+    # optional ``cwd`` arg to override per-call.
+    container_cwd: str = "/"
+    # PYTHONPATH forced on every ``python`` action so imports rooted at the
+    # task directory just work without explicit sys.path mangling.
+    container_pythonpath: str = "/app"
 
 
 @dataclass

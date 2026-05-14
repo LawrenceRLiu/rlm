@@ -370,6 +370,13 @@ class TestListDirectory:
         assert len(obs.data["entries"]) == 3
         assert "truncated at 3 entries" in obs.stdout
 
+    def test_empty_directory_is_explicit(self, tmp_path: Path) -> None:
+        env = make_thin_env(tmp_path)
+        obs = list_directory_execute(env, _action("list_directory", path="_rlm_notes"))
+        assert obs.error is None
+        assert obs.data["entries"] == []
+        assert "[empty directory]" in obs.stdout
+
     def test_missing_dir_errors(self, tmp_path: Path) -> None:
         env = make_thin_env(tmp_path)
         obs = list_directory_execute(env, _action("list_directory", path="nope"))
@@ -497,9 +504,23 @@ class TestObservationSpill:
 
 class TestPathResolution:
     def test_absolute_path_rejected(self, tmp_path: Path) -> None:
+        """Absolute paths that are NOT under a bind-mount root (/app,
+        /_rlm_state, /_rlm_artifacts, /_rlm_notes) are rejected."""
         env = make_thin_env(tmp_path)
-        with pytest.raises(ValueError, match="workspace-relative"):
+        with pytest.raises(ValueError, match="not under a bind-mounted root"):
             env.resolve_workspace_path("/etc/passwd")
+
+    def test_absolute_app_path_accepted(self, tmp_path: Path) -> None:
+        """Sibling-layout: /app/... is a valid container-absolute path that
+        translates to the host-side app/ bind source."""
+        env = make_thin_env(tmp_path)
+        p = env.resolve_workspace_path("/app/output.txt")
+        assert p == (env.workspace_root / "app" / "output.txt").resolve()
+
+    def test_absolute_rlm_notes_path_accepted(self, tmp_path: Path) -> None:
+        env = make_thin_env(tmp_path)
+        p = env.resolve_workspace_path("/_rlm_notes/n.md")
+        assert p == (env.workspace_root / "_rlm_notes" / "n.md").resolve()
 
     def test_dotdot_traversal_rejected(self, tmp_path: Path) -> None:
         env = make_thin_env(tmp_path)
@@ -522,8 +543,9 @@ class TestPathResolution:
         assert not env.is_reserved_path("_rlm_query_0.txt")
 
     def test_run_action_converts_absolute_path_to_observation(self, tmp_path: Path) -> None:
-        """A model emitting an absolute path (e.g. ``/workspace/foo.txt``) must
-        get an observation it can read on the next turn, not abort the run.
+        """A model emitting an absolute path that's NOT under a bind-mount
+        root (e.g. ``/workspace/foo.txt``, the old shadow path) must get an
+        observation it can read on the next turn, not abort the run.
         Regression for Qwen3.5-9B 3d 2026-05-10 where this killed the loop."""
         env = make_thin_env(tmp_path)
         action = WorkspaceAction(
@@ -534,7 +556,7 @@ class TestPathResolution:
         )
         obs = env.run_action(action)
         assert obs.error is not None
-        assert "workspace-relative" in obs.error
+        assert "not under a bind-mounted root" in obs.error
         assert obs.tool == "write_file"
 
     def test_run_action_converts_traversal_path_to_observation(self, tmp_path: Path) -> None:

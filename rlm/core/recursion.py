@@ -172,9 +172,11 @@ class RecursionHandler:
             _seed_user_provenance(child_env)
 
             # 5. Overwrite root task with the child's task string.
-            (child_env.workspace_root / "_rlm_query_0.txt").write_text(child_task, encoding="utf-8")
+            #    Sibling layout moved root-task slot to _rlm_state/.
+            child_task_rel = "_rlm_state/_rlm_query_0.txt"
+            (child_env.workspace_root / child_task_rel).write_text(child_task, encoding="utf-8")
             child_env.provenance.record_seed(
-                "_rlm_query_0.txt", role="user", action_id=None, turn=0
+                child_task_rel, role="user", action_id=None, turn=0
             )
             child_env.provenance.save()
 

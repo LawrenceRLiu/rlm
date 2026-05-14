@@ -23,7 +23,14 @@ SPEC = ToolSpec(
     ),
 )
 
-_DEFAULT_IGNORES = {".git", "__pycache__", "node_modules", ".venv"}
+def _to_absolute(rel: str) -> str:
+    """Canonical container-absolute form for a workspace-relative path.
+
+    ``""`` / ``"."`` → ``"/"``; anything else gets a leading slash.
+    """
+    if rel in ("", "."):
+        return "/"
+    return "/" + rel.lstrip("/")
 
 
 def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObservation:
@@ -43,11 +50,24 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
             execution_time=time.perf_counter() - start,
         )
 
+    # Canonicalise the header regardless of how the model addressed the dir
+    # (``.``, ``app``, ``/app`` all render as ``/app``) so the model converges
+    # on the absolute form it sees in the output.
+    target_rel = str(target.relative_to(env.workspace_root.resolve())).replace("\\", "/")
+    target_abs = _to_absolute(target_rel)
+
     cap = env.workspace_config.observation.max_list_directory_entries
+    # Single source of truth: reuse the copy-on-spawn exclude list. Multi-
+    # segment entries (e.g. "_rlm_state/snapshots") are filtered out because
+    # this is a shallow listing — at the basename level only top-level
+    # directory names matter.
+    ignore_basenames = {
+        e for e in env.workspace_config.recursion.copy_on_spawn_excludes if "/" not in e
+    }
     entries: list[dict] = []
     truncated = False
     for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name)):
-        if child.name in _DEFAULT_IGNORES:
+        if child.name in ignore_basenames:
             continue
         if len(entries) >= cap:
             truncated = True
@@ -74,15 +94,24 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
             }
         )
 
-    lines = [f"Directory: {raw}"]
+    # Column widths: line up the role columns regardless of name length.
+    name_col_width = (
+        max(len(_to_absolute(e["path"])) + (1 if e["kind"] == "dir" else 0) for e in entries)
+        if entries
+        else 0
+    )
+    lines = [f"Directory: {target_abs}"]
     for e in entries:
-        if e["kind"] == "dir":
-            lines.append(f"  [dir]  {e['name']}/  ({e['created_role']}/{e['modified_role']})")
-        else:
-            lines.append(
-                f"  [file] {e['name']}  ({e['size']} bytes, "
-                f"{e['created_role']}/{e['modified_role']})"
-            )
+        display = _to_absolute(e["path"]) + ("/" if e["kind"] == "dir" else "")
+        kind_tag = "[dir] " if e["kind"] == "dir" else "[file]"
+        size_part = "" if e["kind"] == "dir" else f"{e['size']}B"
+        lines.append(
+            f"  {kind_tag} {display.ljust(name_col_width)}  "
+            f"{size_part:>8}  "
+            f"created={e['created_role']}  modified={e['modified_role']}"
+        )
+    if not entries and not truncated:
+        lines.append("  [empty directory]")
     if truncated:
         lines.append(f"... [truncated at {cap} entries]")
 

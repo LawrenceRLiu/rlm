@@ -225,6 +225,7 @@ class VerbosePrinter:
         total_iterations: int,
         total_time: float,
         usage_summary: dict[str, Any] | None = None,
+        max_iterations: int | None = None,
     ) -> None:
         if not self.enabled:
             return
@@ -236,7 +237,12 @@ class VerbosePrinter:
         )
         summary_table.add_column("metric", style=STYLE_MUTED)
         summary_table.add_column("value", style=STYLE_ACCENT)
-        summary_table.add_row("Iterations", str(total_iterations))
+        iterations = (
+            f"{total_iterations}/{max_iterations}"
+            if max_iterations is not None
+            else str(total_iterations)
+        )
+        summary_table.add_row("Iterations", iterations)
         summary_table.add_row("Total Time", f"{total_time:.2f}s")
 
         if usage_summary:

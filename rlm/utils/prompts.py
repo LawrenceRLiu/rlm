@@ -19,19 +19,23 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     the workspace by emitting one or more ``<action>`` elements per turn;
     each action runs and returns an observation that you'll see next turn.
 
-    # Workspace layout
-    - ``_rlm_query_0.txt`` — the root task you must solve. Read it first.
-    - ``_rlm_query_<N>.txt`` — additional user-supplied context, when present.
-    - ``_rlm_notes/`` — scratch notes you write for yourself.
-    - ``_rlm_artifacts/`` — artifacts and outputs (incl. spilled tool output
-      under ``_rlm_artifacts/_observations/`` when an observation exceeded
-      the per-call cap).
-    - ``_rlm_state/`` — reserved runtime state. You may not write here.
+    # Workspace
+    Begin by reading ``/_rlm_state/_rlm_query_0.txt`` (and any
+    ``/_rlm_state/_rlm_query_<N>.txt`` context files) to understand the
+    task. Then list the workspace root to see what files and directories
+    are available; the task and its files have already been placed there
+    for you. ``list_directory`` shows the role that created and last
+    modified each entry (``user`` vs ``system`` vs ``assistant``), which
+    helps you tell task material apart from substrate scaffolding.
 
     # Tool intent
     Use ``write_file``, ``append_file``, and ``edit_file`` for durable
     workspace edits. Use ``python`` and ``shell`` for scratch computation,
     inspection, validation, tests, parsing, and complex one-off transforms.
+    Use ``/_rlm_notes/`` for scratch notes you want to persist across turns
+    and ``/_rlm_artifacts/`` for durable outputs you may want to return
+    with your final answer. ``/_rlm_state/`` is substrate-owned — you may
+    read it but not write inside it.
     Do not use ``python`` or ``shell`` as a substitute for simple durable file
     edits such as echoing text into files, opening a file only to write
     generated prose/code, or printing an entire generated artifact to stdout.
@@ -84,11 +88,11 @@ WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     - Per-call output above the configured cap is auto-spilled to
       ``_rlm_artifacts/_observations/`` and the observation is replaced
       with a short summary plus a path. Read the file in the path to get full output.
-    - You may not write inside ``_rlm_state/``.
+    - You may not write inside ``/_rlm_state/``.
     - If the prompt grows past a token threshold the substrate periodically
       summarizes the trajectory and resets the visible history; treat the
-      workspace files (and ``_rlm_query_0.txt`` in particular) as the
-      authoritative state and re-read them when in doubt.
+      workspace files (and ``/_rlm_state/_rlm_query_0.txt`` in particular)
+      as the authoritative state and re-read them when in doubt.
     {depth_rule}
     """
 )
@@ -102,23 +106,26 @@ NATIVE_WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
     provided native tool calls to act; do not print XML, JSON wrappers, or
     markdown code fences as a substitute for tool calls.
 
-    # Workspace layout
-    - ``_rlm_query_0.txt`` — the root task you must solve. Read it first.
-    - ``_rlm_query_<N>.txt`` — additional user-supplied context, when present.
-    - ``_rlm_notes/`` — scratch notes you write for yourself.
-    - ``_rlm_artifacts/`` — artifacts and outputs (incl. spilled tool output
-      under ``_rlm_artifacts/_observations/`` when an observation exceeded
-      the per-call cap).
-    - ``_rlm_state/`` — reserved runtime state. You may not write here.
+    # Workspace
+    Begin by reading ``/_rlm_state/_rlm_query_0.txt`` (and any
+    ``/_rlm_state/_rlm_query_<N>.txt`` context files) to understand the
+    task. Then list the workspace root to see what files and directories
+    are available; the task and its files have already been placed there
+    for you. ``list_directory`` shows the role that created and last
+    modified each entry (``user`` vs ``system`` vs ``assistant``), which
+    helps you tell task material apart from substrate scaffolding.
 
     # Tool intent
     Use ``write_file``, ``append_file``, and ``edit`` for durable workspace
     edits. Use ``run_python_command`` and ``run_shell_command`` for scratch
     computation, inspection, validation, tests, parsing, and complex one-off
-    transforms. In ``run_python_command``, the helper functions ``llm_query``,
-    ``llm_query_batched``, ``rlm_query``, and ``rlm_query_batched`` are
-    already imported, so use Python for loops over documents and batched
-    model calls.
+    transforms. Use ``/_rlm_notes/`` for scratch notes you want to persist
+    across turns and ``/_rlm_artifacts/`` for durable outputs you may want
+    to return with your final answer. ``/_rlm_state/`` is substrate-owned
+    — you may read it but not write inside it. In ``run_python_command``,
+    the helper functions ``llm_query``, ``llm_query_batched``, ``rlm_query``,
+    and ``rlm_query_batched`` are already imported, so use Python for loops
+    over documents and batched model calls.
 
     # Whitespace-sensitive tools
     - ``edit.old_string`` is exact literal text. Whitespace, indentation, and
@@ -160,11 +167,11 @@ NATIVE_WORKSPACE_SYSTEM_PROMPT_TEMPLATE = textwrap.dedent(
       ``final`` in the same batch.
     - Per-call output above the configured cap is auto-spilled to
       ``_rlm_artifacts/_observations/`` and replaced with a short summary path.
-    - You may not write inside ``_rlm_state/``.
+    - You may not write inside ``/_rlm_state/``.
     - If the prompt grows past a token threshold the substrate periodically
       summarizes the trajectory and resets the visible history; treat the
-      workspace files (and ``_rlm_query_0.txt`` in particular) as the
-      authoritative state and re-read them when in doubt.
+      workspace files (and ``/_rlm_state/_rlm_query_0.txt`` in particular)
+      as the authoritative state and re-read them when in doubt.
     {depth_rule}
     """
 )
@@ -234,13 +241,14 @@ def build_workspace_system_prompt(
 def build_workspace_initial_user_prompt(*, root_prompt: str | None = None) -> str:
     """First user turn for the workspace loop.
 
-    The root task itself lives at ``_rlm_query_0.txt`` inside the workspace;
-    the model reads it via ``read_file``. ``root_prompt`` is an optional
-    short pointer the user can pass to bias the very first turn.
+    The root task lives at ``/_rlm_state/_rlm_query_0.txt`` inside the
+    container workspace; the model reads it via ``read_file``. ``root_prompt``
+    is an optional short pointer the user can pass to bias the very first turn.
     """
     base = (
-        "Begin by reading ``_rlm_query_0.txt`` (and any ``_rlm_query_<N>.txt`` "
-        "context files) to understand the task. Plan, then act."
+        "Begin by reading ``/_rlm_state/_rlm_query_0.txt`` (and any "
+        "``/_rlm_state/_rlm_query_<N>.txt`` context files) to understand the "
+        "task. Plan, then act."
     )
     if root_prompt:
         base += f'\n\nUser-provided pointer (preview of the task): "{root_prompt}"'
@@ -538,8 +546,9 @@ COMPACTION_SUMMARY_PROMPT = textwrap.dedent(
     section headers verbatim:
 
     # Original task
-    Restate the original task **verbatim** from ``_rlm_query_0.txt`` (and
-    any ``_rlm_query_<N>.txt`` context files). Do not paraphrase.
+    Restate the original task **verbatim** from
+    ``/_rlm_state/_rlm_query_0.txt`` (and any
+    ``/_rlm_state/_rlm_query_<N>.txt`` context files). Do not paraphrase.
 
     # Files touched
     For each workspace file you wrote, appended to, or edited, give one
@@ -592,6 +601,6 @@ def build_compaction_continue_message() -> str:
         "The trajectory above has been compressed into the assistant summary. "
         "The workspace filesystem is unchanged and remains authoritative. "
         "Resume the task from the 'Next action' section of your summary; "
-        "re-read ``_rlm_query_0.txt`` or your ``_rlm_notes/`` if you need "
-        "to confirm any detail."
+        "re-read ``/_rlm_state/_rlm_query_0.txt`` or your ``/_rlm_notes/`` "
+        "if you need to confirm any detail."
     )

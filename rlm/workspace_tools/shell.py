@@ -16,20 +16,24 @@ SPEC = ToolSpec(
     name="shell",
     short_description=(
         "Run shell commands for inspection, tests, build steps, and diagnostics. "
+        "Default working dir is the workspace root (``/``); the bind-mounted "
+        "task and substrate dirs (``/app``, ``/_rlm_state``, ``/_rlm_artifacts``, "
+        "``/_rlm_notes``) are visible directly underneath. Pass ``directory=`` "
+        "to override the cwd. "
         "Use file tools for ordinary durable edits; avoid echo/tee/heredoc file writes."
     ),
     is_state_mutating=True,
     runs_on="container",
     body_required=True,
     example=(
-        "No attributes. Body is raw bash — do NOT wrap in <code>, <script>, "
-        "or markdown fences. "
-        'Example: <action tool="shell">\nls -la _rlm_artifacts/\n</action>'
+        "No attributes required. Body is raw bash — do NOT wrap in <code>, "
+        "<script>, or markdown fences. "
+        'Example: <action tool="shell">\nls -la /app\n</action>'
     ),
 )
 
 # Tempfile location relative to workspace root. Lives under _rlm_state so it
-# is excluded from provenance diffing.
+# is excluded from provenance diffing. Container sees it at /_rlm_state/_tmp/.
 _TMP_REL_DIR = "_rlm_state/_tmp"
 
 
@@ -52,17 +56,33 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
             error="Background shell commands are not supported yet; set is_background=false.",
             execution_time=time.perf_counter() - start,
         )
-    directory = action.args.get("directory")
-    if directory not in (None, ""):
-        workdir = env.resolve_workspace_path(str(directory))
-        if not workdir.exists() or not workdir.is_dir():
+    # cwd: accept either ``directory`` (legacy) or ``cwd``; default = image
+    # WORKDIR (set at container start to docker.container_cwd, typically /app).
+    cwd_arg = action.args.get("cwd") or action.args.get("directory")
+    container_cwd: str | None = None
+    if cwd_arg not in (None, ""):
+        try:
+            host_workdir = env.resolve_workspace_path(str(cwd_arg))
+        except ValueError as e:
             return WorkspaceObservation(
                 tool=action.tool,
-                error=f"directory does not exist or is not a directory: {directory}",
+                error=str(e),
                 execution_time=time.perf_counter() - start,
             )
-        rel = workdir.relative_to(env.workspace_root).as_posix()
-        body = f"cd {sh_quote('/workspace' if rel == '.' else '/workspace/' + rel)}\n{body}"
+        if not host_workdir.exists() or not host_workdir.is_dir():
+            return WorkspaceObservation(
+                tool=action.tool,
+                error=f"directory does not exist or is not a directory: {cwd_arg}",
+                execution_time=time.perf_counter() - start,
+            )
+        try:
+            container_cwd = env.host_to_container_path(host_workdir)
+        except ValueError as e:
+            return WorkspaceObservation(
+                tool=action.tool,
+                error=f"directory is not visible inside the container: {e}",
+                execution_time=time.perf_counter() - start,
+            )
 
     action_id = env.current_action_id or "unknown"
     rel_tmp = f"{_TMP_REL_DIR}/shell_{action_id}.sh"
@@ -74,8 +94,9 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
     before = env.snapshot_paths_for_provenance(excludes)
 
     result = env.exec_in_container(
-        ["bash", f"/workspace/{rel_tmp}"],
+        ["bash", f"/{rel_tmp}"],
         timeout=timeout,
+        cwd=container_cwd,
     )
 
     after = env.snapshot_paths_for_provenance(excludes)

@@ -12,8 +12,10 @@ class TestDefaultTimeout:
     """Tests for the default timeout constant."""
 
     def test_default_timeout_value(self):
-        """Default timeout should be 300 seconds."""
-        assert DEFAULT_TIMEOUT == 300.0
+        """Default timeout is effectively unlimited (24h) so long compute-bound
+        generations against local vLLM aren't artificially cut off. See
+        DEFAULT_TIMEOUT comment in base_lm.py for rationale."""
+        assert DEFAULT_TIMEOUT == 86400.0
 
     def test_base_lm_stores_timeout(self):
         """BaseLM should store timeout in instance."""

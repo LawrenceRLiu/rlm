@@ -15,6 +15,9 @@ SPEC = ToolSpec(
     name="python",
     short_description=(
         "Run scratch Python for computation, parsing, validation, tests, and diagnostics. "
+        "Default working dir is the workspace root (``/``); ``PYTHONPATH`` includes "
+        "``/app`` so the task's package layout imports cleanly. Pass ``cwd=`` to "
+        "override the working directory. "
         "Use file tools for ordinary durable edits; avoid printing large generated artifacts. "
         "`llm_query`, `llm_query_batched`, `rlm_query`, `rlm_query_batched` are pre-imported."
     ),
@@ -22,8 +25,8 @@ SPEC = ToolSpec(
     runs_on="container",
     body_required=True,
     example=(
-        "No attributes. Body is raw Python — do NOT wrap in <code>, <script>, "
-        "<python>, or markdown fences. "
+        "No attributes required. Body is raw Python — do NOT wrap in <code>, "
+        "<script>, <python>, or markdown fences. "
         'Example: <action tool="python">\nimport math\nprint(math.pi)\n</action>'
     ),
 )
@@ -56,6 +59,35 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
                 execution_time=time.perf_counter() - start,
             )
 
+    # Optional cwd override: defaults to image WORKDIR (= docker.container_cwd,
+    # typically /app). Accepts workspace-relative or container-absolute under
+    # one of the bind-mount roots.
+    cwd_arg = action.args.get("cwd")
+    container_cwd: str | None = None
+    if cwd_arg not in (None, ""):
+        try:
+            host_workdir = env.resolve_workspace_path(str(cwd_arg))
+        except ValueError as e:
+            return WorkspaceObservation(
+                tool=action.tool,
+                error=str(e),
+                execution_time=time.perf_counter() - start,
+            )
+        if not host_workdir.exists() or not host_workdir.is_dir():
+            return WorkspaceObservation(
+                tool=action.tool,
+                error=f"cwd does not exist or is not a directory: {cwd_arg}",
+                execution_time=time.perf_counter() - start,
+            )
+        try:
+            container_cwd = env.host_to_container_path(host_workdir)
+        except ValueError as e:
+            return WorkspaceObservation(
+                tool=action.tool,
+                error=f"cwd is not visible inside the container: {e}",
+                execution_time=time.perf_counter() - start,
+            )
+
     action_id = env.current_action_id or "unknown"
     rel_tmp = f"{_TMP_REL_DIR}/python_{action_id}.py"
     tmp_path = env.workspace_root / rel_tmp
@@ -65,11 +97,11 @@ def execute(env: DockerWorkspaceEnv, action: WorkspaceAction) -> WorkspaceObserv
     excludes = env.workspace_config.recursion.copy_on_spawn_excludes
     before = env.snapshot_paths_for_provenance(excludes)
 
-    # Container has the workspace mounted at /workspace; reference the script
-    # via its in-container path.
+    # _rlm_state is bind-mounted at /_rlm_state in the container.
     result = env.exec_in_container(
-        ["python", f"/workspace/{rel_tmp}"],
+        ["python", f"/{rel_tmp}"],
         timeout=timeout,
+        cwd=container_cwd,
     )
 
     after = env.snapshot_paths_for_provenance(excludes)

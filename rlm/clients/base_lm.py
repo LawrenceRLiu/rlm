@@ -3,8 +3,12 @@ from typing import Any
 
 from rlm.core.types import LMCompletionResult, ModelUsageSummary, UsageSummary
 
-# Default timeout for LM API calls (in seconds)
-DEFAULT_TIMEOUT: float = 300.0
+# Default timeout for LM API calls (in seconds). Set effectively unlimited
+# (24h) so long compute-bound generations against a local vLLM never trip a
+# client-side cap. If the server stalls genuinely, the run hangs — that is
+# the intended trade-off: do not silently lose work for slow-but-progressing
+# generations.
+DEFAULT_TIMEOUT: float = 86400.0
 
 
 # Common sampling parameters to pass to completion APIs rather than client constructors

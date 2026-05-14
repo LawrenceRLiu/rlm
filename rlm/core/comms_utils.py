@@ -176,7 +176,7 @@ def socket_recv(sock: socket.socket) -> dict:
     return json.loads(payload.decode("utf-8"))
 
 
-def socket_request(address: tuple[str, int], data: dict, timeout: int = 300) -> dict:
+def socket_request(address: tuple[str, int], data: dict, timeout: int = 86400) -> dict:
     """Send a request and receive a response over a new socket connection.
 
     Opens a new TCP connection, sends the request, waits for response, then closes.
@@ -184,7 +184,9 @@ def socket_request(address: tuple[str, int], data: dict, timeout: int = 300) -> 
     Args:
         address: (host, port) tuple to connect to.
         data: Dictionary to send as JSON.
-        timeout: Socket timeout in seconds (default 300).
+        timeout: Socket timeout in seconds (default 86400 = effectively
+            unlimited; deep recursive rlm_query calls can take >1h, and we
+            trust the upstream LM server to either respond or crash loudly).
 
     Returns:
         Response dictionary.
@@ -202,7 +204,7 @@ def socket_request(address: tuple[str, int], data: dict, timeout: int = 300) -> 
 
 
 def send_lm_request(
-    address: tuple[str, int], request: LMRequest, timeout: int = 300, depth: int | None = None
+    address: tuple[str, int], request: LMRequest, timeout: int = 86400, depth: int | None = None
 ) -> LMResponse:
     """Send an LM request and return typed response.
 
@@ -228,7 +230,7 @@ def send_lm_request_batched(
     address: tuple[str, int],
     prompts: list[str | dict[str, Any]],
     model: str | None = None,
-    timeout: int = 300,
+    timeout: int = 86400,
     depth: int = 0,
 ) -> list[LMResponse]:
     """Send a batched LM request and return a list of typed responses.
